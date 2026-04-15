@@ -43,6 +43,12 @@ class Param{
         // Phase 3C (a): multiplier on the predicted-delay-vs-slack overshoot
         // term added to CostCompare. 0 = behavior identical to pre-3C.
         double SLACK_OVERSHOOT_WEIGHT;
+        // Method D Stage A: slack redistribution mode.
+        //   0 = off (redistributedSlackD = raw D-pin slack; zero behavior change)
+        //   1 = uniform split across both endpoints of every path
+        //   2 = displacement-freedom-proportional split (w_i = max(slack_i, eps))
+        // Step 1 only computes + logs; banking still reads raw slack.
+        int SLACK_REDIST_MODE;
 };
 
 double SquareEuclideanDistance(const Coor &p1, const Coor &p2);

@@ -140,9 +140,18 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
         // Phase 3C (a): slack-aware soft penalty. Uses the D-pin slack of the
         // to-be-banked FFs; banks whose displacement eats into negative slack
         // are extra-penalized, but nothing is hard-rejected.
+        // Method D Stage A — Step 2: when SLACK_REDIST_MODE > 0, read the
+        // path-aware redistributed budget instead of the raw D-pin slack. For
+        // 1-bit FFs (banking input) this is always populated by
+        // Manager::computeSlackRedistribution(). Multi-bit inputs fall back to
+        // the raw min-pin slack.
         if(slackW > 0){
             double slackD;
-            if(ff->getClusterFF().size() <= 1){
+            const bool useRedist = (mgr.param.SLACK_REDIST_MODE > 0)
+                                   && (ff->getClusterFF().size() <= 1);
+            if(useRedist){
+                slackD = ff->getRedistributedSlackD();
+            } else if(ff->getClusterFF().size() <= 1){
                 slackD = ff->getTimingSlack("D");
             } else {
                 slackD = DBL_MAX;

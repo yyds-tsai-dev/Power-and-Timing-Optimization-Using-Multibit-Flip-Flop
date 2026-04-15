@@ -19,7 +19,8 @@ FF::FF() :
     originalQpinDelay(0),
     physicalFF(nullptr),
     slot(0),
-    fixed(true){
+    fixed(true),
+    redistributedSlackD(0){
 }
 
 FF::FF(int size) : Instance(), clusterFF(size, nullptr){
@@ -43,6 +44,7 @@ FF::FF(int size) : Instance(), clusterFF(size, nullptr){
     physicalFF = nullptr;
     slot = -1;
     fixed = true;
+    redistributedSlackD = 0;
 }
 
 FF::~FF(){}
@@ -139,6 +141,14 @@ void FF::setOriginalCoor(const Coor& coorD, const Coor& coorQ){
 
 void FF::setOriginalQpinDelay(double in){
     this->originalQpinDelay = in;
+}
+
+void FF::setRedistributedSlackD(double s){
+    this->redistributedSlackD = s;
+}
+
+double FF::getRedistributedSlackD()const{
+    return redistributedSlackD;
 }
 
 // Getter

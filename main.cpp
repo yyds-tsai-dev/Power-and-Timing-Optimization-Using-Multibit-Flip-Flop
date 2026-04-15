@@ -25,6 +25,9 @@ int main(int argc, char *argv[]){
     auto _all_s = std::chrono::high_resolution_clock::now();
 
     Manager mgr;
+    // Optional env-driven knobs for Step 1 experimentation.
+    if(const char* e = std::getenv("SLACK_REDIST_MODE")) mgr.param.SLACK_REDIST_MODE = std::atoi(e);
+    if(const char* e = std::getenv("SLACK_OVERSHOOT_WEIGHT")) mgr.param.SLACK_OVERSHOOT_WEIGHT = std::atof(e);
     STAGE("parse",             mgr.parse(argv[1]));
     STAGE("libScoring",        mgr.libScoring());
     mgr.getOverallCost(cost_verbose, 0);
@@ -39,6 +42,8 @@ int main(int argc, char *argv[]){
     STAGE("preLegalize",       mgr.preLegalize());
     mgr.getOverallCost(cost_verbose, 0);
     mgr.dumpVisual("PreLegalize.out");
+
+    STAGE("slackRedist",       mgr.computeSlackRedistribution());
 
     STAGE("banking",           mgr.banking());
     mgr.getOverallCost(cost_verbose, 0);

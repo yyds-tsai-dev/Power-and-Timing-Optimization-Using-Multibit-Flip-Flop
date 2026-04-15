@@ -63,6 +63,12 @@ private:
 
     // ######################################### Fixed flag ########################################################
     bool fixed;
+
+    // ######################################### Method D Stage A ##################################################
+    // Redistributed D-pin slack budget. When SLACK_REDIST_MODE == 0 this stays
+    // equal to the raw D-pin slack (or 0 until computeSlackRedistribution runs).
+    // Step 1 populates + logs only; banking still reads raw slack.
+    double redistributedSlackD;
 public:
     FF();
     explicit FF(int size);
@@ -87,6 +93,7 @@ public:
     void setClusterSize(int);
     void setFixed(bool fixed);
     void setIsLegalize(bool isLegalize);
+    void setRedistributedSlackD(double s);
     // Getter
     double getTimingSlack(const std::string &pinName)const;
     std::vector<FF*>& getClusterFF();
@@ -109,6 +116,7 @@ public:
     int getSlot()const;
     bool getFixed()const;
     bool getIsLegalize()const;
+    double getRedistributedSlackD()const;
     std::string getPhysicalPinName();
     std::vector<std::pair<Coor, double>> getCriticalCoor(); // return the relative coor on critical path
     size_t getCriticalSize(); // return the size of all critical path both Q and D pin

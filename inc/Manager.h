@@ -100,6 +100,7 @@ public:
     void preprocess();
     void meanshift();
     void preLegalize();
+    void computeSlackRedistribution();
     void banking();
     void postBankingOptimize();
     void legalize();

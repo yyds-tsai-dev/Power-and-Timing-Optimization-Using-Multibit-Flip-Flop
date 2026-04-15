@@ -430,9 +430,111 @@ void Manager::getNS(double& TNS, double& WNS, bool show){
     }
 }
 
+// Method D Stage A — Step 1: compute per-FF redistributed D-pin slack budget.
+// Iterate over dest FFs (canonical: one path per dest). For each path with a
+// prev-FF source, split the path slack between the two endpoints; take min
+// across all incident paths. Pure instrumentation — banking still reads raw
+// slack via getTimingSlack("D"). The redistributed value is clamped to [−inf,
+// raw_slack] so it never becomes a looser budget than banking already trusts.
+void Manager::computeSlackRedistribution(){
+    std::vector<FF*> wrappers;
+    wrappers.reserve(FF_Map.size());
+    for(auto& m : FF_Map){
+        wrappers.push_back(m.second);
+    }
+
+    // Refresh D-pin slacks once so getTimingSlack("D") is up to date.
+    for(FF* w : wrappers) w->updateSlack();
+
+    const int mode = param.SLACK_REDIST_MODE;
+    const double eps = 1e-12;
+
+    if(mode == 0){
+        for(FF* w : wrappers) w->setRedistributedSlackD(w->getTimingSlack("D"));
+    } else {
+        for(FF* w : wrappers) w->setRedistributedSlackD(DBL_MAX);
+
+        for(FF* w : wrappers){
+            FF* logic = w->getClusterFF()[0];
+            PrevStage prev = logic->getPrevStage();
+            double S_P = w->getTimingSlack("D");
+
+            if(prev.ff && prev.ff->getPhysicalFF()){
+                FF* prevW = prev.ff->getPhysicalFF();
+                double w_this = 1.0, w_prev = 1.0;
+                if(mode == 2){
+                    w_this = std::max(w->getTimingSlack("D"), eps);
+                    w_prev = std::max(prevW->getTimingSlack("D"), eps);
+                }
+                double sum = w_this + w_prev;
+                double share_this = S_P * w_this / sum;
+                double share_prev = S_P * w_prev / sum;
+                if(share_this < w->getRedistributedSlackD())
+                    w->setRedistributedSlackD(share_this);
+                if(share_prev < prevW->getRedistributedSlackD())
+                    prevW->setRedistributedSlackD(share_prev);
+            } else {
+                if(S_P < w->getRedistributedSlackD())
+                    w->setRedistributedSlackD(S_P);
+            }
+        }
+
+        // Clamp: source-only FFs whose budget remains DBL_MAX (unreachable in
+        // practice since every wrapper is dest of its own path) fall back to
+        // raw slack. Also cap at raw slack so we never widen budget.
+        for(FF* w : wrappers){
+            double rawS = w->getTimingSlack("D");
+            double cur = w->getRedistributedSlackD();
+            if(cur == DBL_MAX) cur = rawS;
+            if(cur > rawS) cur = rawS;
+            w->setRedistributedSlackD(cur);
+        }
+    }
+
+    // Stats
+    size_t n = wrappers.size();
+    if(n == 0){
+        std::cout << "[SLACK_REDIST] mode=" << mode << " N=0" << std::endl;
+        return;
+    }
+    double sumRaw = 0, sumRed = 0;
+    double minRed = DBL_MAX, maxRed = -DBL_MAX;
+    size_t nNegRaw = 0, nNegRed = 0;
+    std::vector<double> redVals;
+    redVals.reserve(n);
+    for(FF* w : wrappers){
+        double rawS = w->getTimingSlack("D");
+        double redS = w->getRedistributedSlackD();
+        sumRaw += rawS;
+        sumRed += redS;
+        if(redS < minRed) minRed = redS;
+        if(redS > maxRed) maxRed = redS;
+        if(rawS < 0) nNegRaw++;
+        if(redS < 0) nNegRed++;
+        redVals.push_back(redS);
+    }
+    std::sort(redVals.begin(), redVals.end());
+    auto pct = [&](double p)->double{
+        size_t idx = std::min<size_t>(n - 1, (size_t)(p * n));
+        return redVals[idx];
+    };
+    std::cout << "[SLACK_REDIST] mode=" << mode
+              << " N=" << n
+              << " raw_sum=" << sumRaw
+              << " red_sum=" << sumRed
+              << " raw_neg=" << nNegRaw
+              << " red_neg=" << nNegRed
+              << " red_min=" << minRed
+              << " red_p10=" << pct(0.10)
+              << " red_p50=" << pct(0.50)
+              << " red_p90=" << pct(0.90)
+              << " red_max=" << maxRed
+              << std::endl;
+}
+
 /**
  * @brief get TNS
- * 
+ *
  * @return double return the total negative slack value (+: has negative slack, 0: no negative slack)
  */
 double Manager::getTNS(){
