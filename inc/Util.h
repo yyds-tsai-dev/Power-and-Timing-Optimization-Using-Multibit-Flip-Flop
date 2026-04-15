@@ -40,6 +40,9 @@ class Param{
         ~Param();
         double MAX_SQUARE_DISPLACEMENT;
         double MAX_BANDWIDTH;
+        // Phase 3C (a): multiplier on the predicted-delay-vs-slack overshoot
+        // term added to CostCompare. 0 = behavior identical to pre-3C.
+        double SLACK_OVERSHOOT_WEIGHT;
 };
 
 double SquareEuclideanDistance(const Coor &p1, const Coor &p2);

@@ -1,6 +1,7 @@
 #include "Legalizer.h"
 #include <thread>
 #include <mutex>
+#include <omp.h>
 
 Legalizer::Legalizer(Manager& mgr) : mgr(mgr){
     // timer.start();
@@ -20,7 +21,6 @@ Legalizer::~Legalizer(){
 
 void Legalizer::initial(){
     DEBUG_LGZ("Initial Legalizer");
-    // LoadFF();
     LoadGate();
     LoadPlacementRow();
     SliceRowsByRows();
@@ -141,14 +141,47 @@ void Legalizer::SliceRowsByRows(){
 }
 
 void Legalizer::SliceRowsByGate(){
-    // DEBUG_LGZ("Seperate PlacementRows by Gate Cell");
-    for(const auto &gate : gates){
-        for(auto &row : rows){
-            if(row->getStartCoor().y > gate->getGPCoor().y + gate->getH()) break;
-            row->slicing(gate);
+    // T5: inside Banking's outer parallel region, keep the original break
+    // loop (inner pragma would serialize anyway; losing break is a big net
+    // loss). Outside (Manager::preLegalize), bucket gates by row and run
+    // a real parallel pass.
+    if(omp_in_parallel()){
+        for(const auto &gate : gates){
+            for(auto &row : rows){
+                if(row->getStartCoor().y > gate->getGPCoor().y + gate->getH()) break;
+                row->slicing(gate);
+            }
+            gate->setIsPlace(true);
         }
-        gate->setIsPlace(true);
+        return;
     }
+
+    // Bucket gates by row (serial, cheap). Rows are sorted by y ascending
+    // (see LoadPlacementRow). Row siteHeights may vary after SliceRowsByRows,
+    // so we scan rows[0..upIdx) and skip non-overlapping rows with continue
+    // rather than break.
+    std::vector<std::vector<size_t>> rowGateIdx(rows.size());
+    for(size_t g = 0; g < gates.size(); g++){
+        double gLo = gates[g]->getGPCoor().y;
+        double gHi = gLo + gates[g]->getH();
+        auto upIt = std::upper_bound(rows.begin(), rows.end(), gHi,
+            [](double v, Row *r){ return v < r->getStartCoor().y; });
+        size_t upIdx = upIt - rows.begin();
+        for(size_t rr = 0; rr < upIdx; rr++){
+            double rLo = rows[rr]->getStartCoor().y;
+            double rHi = rLo + rows[rr]->getSiteHeight();
+            if(rHi <= gLo) continue;
+            rowGateIdx[rr].push_back(g);
+        }
+    }
+
+    #pragma omp parallel for schedule(dynamic, 16) num_threads(MAX_THREADS)
+    for(size_t r = 0; r < rows.size(); r++){
+        for(size_t gIdx : rowGateIdx[r]){
+            rows[r]->slicing(gates[gIdx]);
+        }
+    }
+    for(auto &gate : gates) gate->setIsPlace(true);
 }
 
 Coor Legalizer::FindPlace(const Coor &coor, Cell * cell){

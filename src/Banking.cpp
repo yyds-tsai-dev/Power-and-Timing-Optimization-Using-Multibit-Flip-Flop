@@ -125,6 +125,8 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
     }
     costOptimize -= mgr.beta * (chooseCell->getGatePower()) + mgr.gamma * (chooseCell->getArea());
     double increaseTNS = 0;
+    double slackOvershoot = 0;
+    const double slackW = mgr.param.SLACK_OVERSHOOT_WEIGHT;
     for(size_t i = 0; i < FFToBank.size(); i++){
         FF* ff = FFToBank[i];
         int affectNum = 1;
@@ -132,10 +134,29 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
             affectNum += clusterFF->getNextStage().size();
             costOptimize += (ff->getCell()->getQpinDelay() - chooseCell->getQpinDelay()) * clusterFF->getNextStage().size();
         }
-        double displacementAffect = mgr.DisplacementDelay * HPWL(ff->getNewCoor(), clusterCoor) * affectNum;
-        increaseTNS += displacementAffect;
+        double predictedDelay = mgr.DisplacementDelay * HPWL(ff->getNewCoor(), clusterCoor);
+        increaseTNS += predictedDelay * affectNum;
+
+        // Phase 3C (a): slack-aware soft penalty. Uses the D-pin slack of the
+        // to-be-banked FFs; banks whose displacement eats into negative slack
+        // are extra-penalized, but nothing is hard-rejected.
+        if(slackW > 0){
+            double slackD;
+            if(ff->getClusterFF().size() <= 1){
+                slackD = ff->getTimingSlack("D");
+            } else {
+                slackD = DBL_MAX;
+                for(size_t s = 0; s < ff->getClusterFF().size(); s++){
+                    double sd = ff->getTimingSlack("D" + std::to_string(s));
+                    if(sd < slackD) slackD = sd;
+                }
+            }
+            double overshoot = predictedDelay - slackD;
+            if(overshoot > 0) slackOvershoot += overshoot * affectNum;
+        }
     }
     costOptimize -= mgr.alpha * increaseTNS;
+    if(slackW > 0) costOptimize -= mgr.alpha * slackW * slackOvershoot;
     // if(costOptimize > -100 && costOptimize < 0) std::cout << costOptimize << std::endl;
     return costOptimize;
 }

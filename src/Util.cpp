@@ -2,7 +2,8 @@
 
 Param::Param():
     MAX_SQUARE_DISPLACEMENT(400000000),
-    MAX_BANDWIDTH(10000)
+    MAX_BANDWIDTH(10000),
+    SLACK_OVERSHOOT_WEIGHT(0.0)
     {}
 Param::~Param(){}
 
