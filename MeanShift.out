@@ -1,0 +1,47 @@
+DieSize 0 0 23475 23280
+NumInput 2
+Input CLK 0 1970
+Input INPUT 8344 22840
+NumOutput 1
+Output OUTPUT 23075 11410
+FlipFlop 2 SVT_FF_2 798 1960 5
+Pin D1 494 510
+Pin Q0 665 30
+Pin Q1 665 750
+Pin CLK 95 30
+Pin D0 494 350
+FlipFlop 1 SVT_FF_1 741 480 3
+Pin Q 38 270
+Pin CLK 494 30
+Pin D 152 30
+NumInstances 4
+Inst FF_1_0 SVT_FF_1 4797.22 3633.33
+Inst FF_1_1 SVT_FF_1 1315.05 4817.45
+Inst FF_1_2 SVT_FF_1 1315.05 4817.45
+Inst FF_1_3 SVT_FF_1 4797.22 3633.33
+Net clk 5
+Pin CLK
+Pin reg4/CLK
+Pin reg3/CLK
+Pin reg2/CLK
+Pin reg1/CLK
+Net in 2
+Pin INPUT
+Pin reg1/D
+Net out 2
+Pin reg4/Q
+Pin OUTPUT
+Net p0 2
+Pin reg1/Q
+Pin reg2/D
+Net p1 2
+Pin reg2/Q
+Pin reg3/D
+Net p2 2
+Pin reg3/Q
+Pin reg4/D
+BinWidth 1200
+BinHeight 1200
+BinMaxUtil 25
+PlacementRows 480 3600 57 240 395
+PlacementRows 480 6000 57 240 395
