@@ -46,6 +46,7 @@ public:
     static Coor getMedian(const std::vector<FF*> &localFFs, std::vector<PointWithID>& toRemoveFFs);
     static void sortFFs(std::vector<std::pair<int, double>> &nearFFs);
     void doClustering();
+    void doMatchingClustering();
     void restoreUnclusterFFCoor();
     void ClusterResult();
     double CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank);

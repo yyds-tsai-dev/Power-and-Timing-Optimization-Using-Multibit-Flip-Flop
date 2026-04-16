@@ -1,6 +1,8 @@
 #include "Banking.h"
 #include <omp.h>
 #include <chrono>
+#include <lemon/smart_graph.h>
+#include <lemon/matching.h>
 
 Banking::Banking(Manager& mgr) : mgr(mgr){
     for(const auto &bitLib : mgr.Bit_FF_Map){
@@ -16,7 +18,12 @@ void Banking::run(){
     Timer t = Timer();
     t.start();
     if(bitOrder[0] != 1){
-        doClustering();
+        const char* mode = std::getenv("BANKING_MODE");
+        if(mode && std::string(mode) == "matching"){
+            doMatchingClustering();
+        } else {
+            doClustering();
+        }
     }
     t.stop();
     restoreUnclusterFFCoor();
@@ -349,6 +356,262 @@ void Banking::doClustering(){
               << "ms pending=" << n_pending << " fast=" << n_fastPath
               << " fallbackOK=" << n_fallbackOK << " dropped=" << n_dropped
               << std::endl;
+}
+
+void Banking::doMatchingClustering(){
+    // Stage B v1: Max-weight matching for 2-bit banking, then greedy for
+    // higher-bit targets (4-bit, 8-bit, ...) on remaining FFs.
+
+    auto tic = [](){ return std::chrono::high_resolution_clock::now(); };
+    auto ms_fn = [](std::chrono::high_resolution_clock::time_point a,
+                    std::chrono::high_resolution_clock::time_point b){
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    int clusterTotalNum = 0;
+    size_t max_clk_idx = 0;
+    for(const auto &pair : mgr.FF_Map){
+        max_clk_idx = std::max((int)max_clk_idx, pair.second->getClkIdx());
+    }
+    size_t clkCount = max_clk_idx + 1;
+
+    // Find the 2-bit cell
+    Cell* cell2bit = nullptr;
+    for(const auto &bitLib : mgr.Bit_FF_Map){
+        if(bitLib.first == 2){
+            cell2bit = bitLib.second[0];
+            break;
+        }
+    }
+    if(!cell2bit){
+        std::cout << "[MATCHING] No 2-bit cell in library, falling back to greedy" << std::endl;
+        doClustering();
+        return;
+    }
+
+    const int K_NEIGHBORS = 15;
+    const double WEIGHT_SCALE = 1000.0;
+
+    auto t_total = tic();
+    double t_graph = 0, t_match = 0, t_commit = 0;
+    int total_nodes = 0, total_edges = 0, total_matched = 0;
+    int n_committed = 0, n_dropped_place = 0, n_dropped_cost = 0;
+
+    // ================================================================
+    // Phase 1: Max-weight matching for 2-bit on all 1-bit FFs
+    // ================================================================
+    mgr.legalizer = new Legalizer(mgr);
+    mgr.legalizer->initial();
+
+    for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
+        std::vector<FF*> localFFs;
+        for(const auto &pair : mgr.FF_Map){
+            if((size_t)pair.second->getClkIdx() == clkIDX
+               && pair.second->getCell()->getBits() == 1){
+                localFFs.push_back(pair.second);
+            }
+        }
+        if(localFFs.size() < 2) continue;
+
+        auto tg0 = tic();
+
+        // Build rtree
+        std::vector<PointWithID> points;
+        points.reserve(localFFs.size());
+        for(size_t i = 0; i < localFFs.size(); i++){
+            FF *ff = localFFs[i];
+            points.push_back(std::make_pair(
+                Point(ff->getNewCoor().x, ff->getNewCoor().y), (int)i));
+        }
+        bgi::rtree<PointWithID, bgi::quadratic<P_PER_NODE>> rtree;
+        rtree.insert(points.begin(), points.end());
+
+        // Build LEMON graph
+        lemon::SmartGraph g;
+        std::vector<lemon::SmartGraph::Node> gnodes(localFFs.size());
+        for(size_t i = 0; i < localFFs.size(); i++){
+            gnodes[i] = g.addNode();
+        }
+
+        lemon::SmartGraph::EdgeMap<long long> weight(g);
+        int edgeCount = 0;
+
+        for(size_t i = 0; i < localFFs.size(); i++){
+            FF* ffA = localFFs[i];
+            Coor coorA = ffA->getNewCoor();
+
+            std::vector<PointWithID> neighbors;
+            neighbors.reserve(K_NEIGHBORS + 1);
+            rtree.query(
+                bgi::nearest(Point(coorA.x, coorA.y), K_NEIGHBORS + 1),
+                std::back_inserter(neighbors));
+
+            for(const auto &nb : neighbors){
+                int j = nb.second;
+                if(j <= (int)i) continue;
+
+                FF* ffB = localFFs[j];
+                Coor median((coorA.x + ffB->getNewCoor().x) / 2.0,
+                            (coorA.y + ffB->getNewCoor().y) / 2.0);
+                std::vector<FF*> pair_ffs = {ffA, ffB};
+                double gain = CostCompare(median, cell2bit, pair_ffs);
+
+                if(gain > 0){
+                    auto e = g.addEdge(gnodes[i], gnodes[j]);
+                    weight[e] = (long long)(gain * WEIGHT_SCALE);
+                    edgeCount++;
+                }
+            }
+        }
+
+        t_graph += ms_fn(tg0, tic());
+        total_nodes += (int)localFFs.size();
+        total_edges += edgeCount;
+
+        if(edgeCount == 0) continue;
+
+        // Run max-weight matching
+        auto tm0 = tic();
+        lemon::MaxWeightedMatching<lemon::SmartGraph,
+            lemon::SmartGraph::EdgeMap<long long>> mwm(g, weight);
+        mwm.run();
+        t_match += ms_fn(tm0, tic());
+
+        // Commit matched pairs
+        auto tc0 = tic();
+        lemon::SmartGraph::NodeMap<int> nodeIdx(g, -1);
+        for(size_t i = 0; i < localFFs.size(); i++){
+            nodeIdx[gnodes[i]] = (int)i;
+        }
+        std::vector<bool> committed(localFFs.size(), false);
+
+        for(size_t i = 0; i < localFFs.size(); i++){
+            if(committed[i]) continue;
+            lemon::SmartGraph::Node mate = mwm.mate(gnodes[i]);
+            if(mate == lemon::INVALID) continue;
+
+            int j = nodeIdx[mate];
+            if(j < 0 || committed[j]) continue;
+            total_matched++;
+
+            FF* ffA = localFFs[i];
+            FF* ffB = localFFs[j];
+            std::vector<FF*> pair_ffs = {ffA, ffB};
+
+            Coor median((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                        (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+            Coor placeCoor = mgr.legalizer->FindPlace(median, cell2bit);
+            if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                n_dropped_place++;
+                continue;
+            }
+
+            double realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+            if(realGain < 0){
+                n_dropped_cost++;
+                continue;
+            }
+
+            FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
+            mgr.legalizer->UpdateRows(newFF);
+            newFF->setIsLegalize(true);
+
+            ffA->setClusterIdx(clusterTotalNum);
+            ffA->setNewCoor(placeCoor);
+            ffB->setClusterIdx(clusterTotalNum);
+            ffB->setNewCoor(placeCoor);
+
+            committed[i] = true;
+            committed[j] = true;
+            clusterTotalNum++;
+            n_committed++;
+        }
+        t_commit += ms_fn(tc0, tic());
+    }
+
+    std::cout << "[MATCHING] 2bit: graph=" << t_graph << "ms match=" << t_match
+              << "ms commit=" << t_commit << "ms"
+              << " nodes=" << total_nodes << " edges=" << total_edges
+              << " matched=" << total_matched << " committed=" << n_committed
+              << " dropped_place=" << n_dropped_place
+              << " dropped_cost=" << n_dropped_cost << std::endl;
+
+    // ================================================================
+    // Phase 2: Greedy for higher-bit targets (4, 8, ...)
+    // ================================================================
+    std::map<int, std::vector<Cell *>> orderBitMap(mgr.Bit_FF_Map.begin(), mgr.Bit_FF_Map.end());
+    for(const auto &bitLib : orderBitMap){
+        Cell* chooseCell = bitLib.second[0];
+        int targetBit = chooseCell->getBits();
+        if(targetBit <= 2) continue;
+        DEBUG_BAN("Cluster " + std::to_string(targetBit) + " Bit MBFF (greedy fallback)");
+
+        delete mgr.legalizer;
+        mgr.legalizer = new Legalizer(mgr);
+        mgr.legalizer->initial();
+
+        for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
+            std::vector<FF*> localFFs;
+            for(const auto &pair : mgr.FF_Map){
+                if((size_t)pair.second->getClkIdx() == clkIDX){
+                    pair.second->setIsLegalize(false);
+                    localFFs.push_back(pair.second);
+                }
+            }
+            if(localFFs.empty()) continue;
+
+            std::vector<PointWithID> points;
+            points.reserve(localFFs.size());
+            for(size_t i = 0; i < localFFs.size(); i++){
+                FF *ff = localFFs[i];
+                points.push_back(std::make_pair(
+                    Point(ff->getNewCoor().x, ff->getNewCoor().y), (int)i));
+            }
+            bgi::rtree<PointWithID, bgi::quadratic<P_PER_NODE>> rtree;
+            rtree.insert(points.begin(), points.end());
+            std::vector<bool> isClustered(localFFs.size(), false);
+
+            for(size_t index = 0; index < localFFs.size(); index++){
+                FF* nowFF = localFFs[index];
+                if(isClustered[index]) continue;
+                std::vector<PointWithID> resultFFs, toRemoveFFs;
+                resultFFs.reserve(mgr.MaxBit);
+                rtree.query(bgi::nearest(Point(nowFF->getNewCoor().x,
+                    nowFF->getNewCoor().y), mgr.MaxBit),
+                    std::back_inserter(resultFFs));
+                std::vector<FF*> FFToBank;
+                bool isChoose = chooseCandidateFF(nowFF, localFFs, resultFFs,
+                    toRemoveFFs, FFToBank, targetBit);
+
+                if(isChoose){
+                    Coor medianCoor = getMedian(localFFs, toRemoveFFs);
+                    Coor clusterCoor = mgr.legalizer->FindPlace(medianCoor, chooseCell);
+                    if(clusterCoor.x == DBL_MAX && clusterCoor.y == DBL_MAX)
+                        continue;
+                    if(CostCompare(clusterCoor, chooseCell, FFToBank) < 0)
+                        continue;
+
+                    FF* newFF = mgr.bankFF(clusterCoor, chooseCell, FFToBank);
+                    mgr.legalizer->UpdateRows(newFF);
+                    newFF->setIsLegalize(true);
+
+                    for(size_t j = 0; j < toRemoveFFs.size(); j++){
+                        isClustered[toRemoveFFs[j].second] = true;
+                    }
+                    rtree.remove(toRemoveFFs.begin(), toRemoveFFs.end());
+
+                    for(FF* oldFF : FFToBank){
+                        oldFF->setClusterIdx(clusterTotalNum);
+                        oldFF->setNewCoor(clusterCoor);
+                    }
+                    clusterTotalNum++;
+                }
+            }
+        }
+    }
+
+    double t_total_ms = ms_fn(t_total, tic());
+    std::cout << "[MATCHING] total=" << t_total_ms << "ms" << std::endl;
 }
 
 void Banking::restoreUnclusterFFCoor(){

@@ -20,48 +20,43 @@ int main(int argc, char *argv[]){
         return EXIT_FAILURE;
     }
 
-    bool cost_verbose = true;
+    // PRODUCTION=1 skips all debug overhead (dumpVisual, mid-stage cost tables,
+    // evaluator fork, checker). Use for submission / runtime-factor benchmarking.
+    const bool production = std::getenv("PRODUCTION") && std::atoi(std::getenv("PRODUCTION"));
+    bool cost_verbose = !production;
 
     auto _all_s = std::chrono::high_resolution_clock::now();
 
     Manager mgr;
-    // Optional env-driven knobs for Step 1 experimentation.
+    // Optional env-driven knobs for experimentation.
     if(const char* e = std::getenv("SLACK_REDIST_MODE")) mgr.param.SLACK_REDIST_MODE = std::atoi(e);
     if(const char* e = std::getenv("SLACK_OVERSHOOT_WEIGHT")) mgr.param.SLACK_OVERSHOOT_WEIGHT = std::atof(e);
     STAGE("parse",             mgr.parse(argv[1]));
     STAGE("libScoring",        mgr.libScoring());
-    mgr.getOverallCost(cost_verbose, 0);
+    if(!production) mgr.getOverallCost(cost_verbose, 0);
     STAGE("preprocess",        mgr.preprocess());
-    mgr.getOverallCost(cost_verbose, 0);
-    mgr.dumpVisual("Preprocessor.out");
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Preprocessor.out"); }
 
-    // Phase 1.5: mid-stage external evaluator calls are dropped (runEvaluator=0).
-    // The external evaluator forks preliminary-evaluator on every call (~25-45s on big
-    // cases) which dominated wall time before. Only the final call after DetailPlacement
-    // still runs it so the [EVALUATOR] Score remains visible for submission sanity.
     STAGE("preLegalize",       mgr.preLegalize());
-    mgr.getOverallCost(cost_verbose, 0);
-    mgr.dumpVisual("PreLegalize.out");
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("PreLegalize.out"); }
 
     STAGE("slackRedist",       mgr.computeSlackRedistribution());
 
     STAGE("banking",           mgr.banking());
-    mgr.getOverallCost(cost_verbose, 0);
-    mgr.dumpVisual("Banking.out");
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Banking.out"); }
 
     STAGE("postBankingOpt",    mgr.postBankingOptimize());
-    mgr.getOverallCost(cost_verbose, 0);
-    mgr.dumpVisual("PostCG.out");
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("PostCG.out"); }
 
     STAGE("legalize",          mgr.legalize());
-    mgr.getOverallCost(cost_verbose, 0);
-    mgr.dumpVisual("Legalize.out");
-    mgr.checker();
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Legalize.out"); mgr.checker(); }
 
     STAGE("detailplacement",   mgr.detailplacement());
-    mgr.getOverallCost(cost_verbose, 1);
-    mgr.dumpVisual("DetailPlacement.out");
-    mgr.checker();
+    if(!production){
+        mgr.getOverallCost(cost_verbose, 1);
+        mgr.dumpVisual("DetailPlacement.out");
+        mgr.checker();
+    }
 
     STAGE("dump",              mgr.dump(argv[2]));
 
