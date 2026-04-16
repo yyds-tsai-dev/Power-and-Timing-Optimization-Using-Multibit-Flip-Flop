@@ -22,7 +22,6 @@ void DetailPlacement::run(){
     GlobalSwap();
 
     ChangeCell();
-
 }
 
 void DetailPlacement::BuildGlobalRtreeMaps(){
@@ -56,67 +55,74 @@ void DetailPlacement::CheckSwapSanity(){
 
 void DetailPlacement::GlobalSwap(){
     DEBUG_DP("Global Swap");
+    const int GS_K = 5; // query K nearest neighbors, pick best swap
     for(size_t id = 0; id < legalizer->ffs.size(); id++){
         Node *ff = legalizer->ffs[id];
+        Node *ff_current = ff;
+        Coor origCoorA = ff_current->getLGCoor();
+        double costA = ff_current->getFFPtr()->getCost();
 
-        // Query from rtree to find the best ff that near ff's global placement coordinate
+        // Query K nearest same-cell-type FFs near GP coordinate
         Point queryPoint(ff->getGPCoor().x, ff->getGPCoor().y);
         std::vector<PointWithID> nearestResults;
-        RtreeMaps[ff->getCell()].query(bgi::nearest(queryPoint, 1), std::back_inserter(nearestResults));
-        const auto& nearestPoint = nearestResults[0];
+        RtreeMaps[ff->getCell()].query(bgi::nearest(queryPoint, GS_K), std::back_inserter(nearestResults));
 
-        // Found itself
-        if(nearestPoint.second == (int)id){
-            // RtreeMaps[ff->getCell()].remove(nearestPoint);
-            continue;
+        // Find best swap partner among K candidates
+        double bestImprovement = 0;
+        int bestIdx = -1;
+        PointWithID bestPoint;
+        for(auto& candidate : nearestResults){
+            if(candidate.second == (int)id) continue;
+
+            Node *ff_target = legalizer->ffs[candidate.second];
+            Coor origCoorB = ff_target->getLGCoor();
+
+            double costBefore = costA + ff_target->getFFPtr()->getCost();
+
+            // Tentatively swap
+            ff_current->getFFPtr()->setNewCoor(origCoorB);
+            ff_target->getFFPtr()->setNewCoor(origCoorA);
+
+            double costAfter = ff_current->getFFPtr()->getCost()
+                             + ff_target->getFFPtr()->getCost();
+
+            // Undo
+            ff_current->getFFPtr()->setNewCoor(origCoorA);
+            ff_target->getFFPtr()->setNewCoor(origCoorB);
+
+            double improvement = costBefore - costAfter;
+            if(improvement > bestImprovement){
+                bestImprovement = improvement;
+                bestIdx = candidate.second;
+                bestPoint = candidate;
+            }
         }
 
-        Node *ff_current = ff;
-        Node *ff_choose_to_swap = legalizer->ffs[nearestPoint.second];
+        if(bestIdx < 0) continue; // no improving swap found
 
-        // Save original positions
-        Coor origCoorA = ff_current->getLGCoor();
+        // Commit the best swap
+        Node *ff_choose_to_swap = legalizer->ffs[bestIdx];
         Coor origCoorB = ff_choose_to_swap->getLGCoor();
 
-        // Cost before swap (using full α·TNS + β·Power + γ·Area)
-        double costBefore = ff_current->getFFPtr()->getCost()
-                          + ff_choose_to_swap->getFFPtr()->getCost();
-
-        // Tentatively swap coordinates
         ff_current->getFFPtr()->setNewCoor(origCoorB);
         ff_choose_to_swap->getFFPtr()->setNewCoor(origCoorA);
-
-        // Cost after swap
-        double costAfter = ff_current->getFFPtr()->getCost()
-                         + ff_choose_to_swap->getFFPtr()->getCost();
-
-        // Only accept if cost improves
-        if(costAfter >= costBefore){
-            // Undo swap
-            ff_current->getFFPtr()->setNewCoor(origCoorA);
-            ff_choose_to_swap->getFFPtr()->setNewCoor(origCoorB);
-            continue;
-        }
-
-        // Commit swap: update LGCoor in Node
         ff_current->setLGCoor(ff_current->getFFPtr()->getNewCoor());
         ff_choose_to_swap->setLGCoor(ff_choose_to_swap->getFFPtr()->getNewCoor());
 
-        // Update the Node::placeIdx
         size_t ff_current_placeIdx = ff->getPlaceRowIdx();
         size_t ff_choose_to_swap_placeIdx = ff_choose_to_swap->getPlaceRowIdx();
         ff->setPlaceRowIdx(ff_choose_to_swap_placeIdx);
         ff_choose_to_swap->setPlaceRowIdx(ff_current_placeIdx);
 
-        // Maintain the rtree: remove old entries, insert new ones
-        RtreeMaps[ff->getCell()].remove(nearestPoint);
+        // Maintain rtree: remove old, insert new for both FFs
+        RtreeMaps[ff->getCell()].remove(bestPoint);
         PointWithID oldEntry = std::make_pair(Point(origCoorA.x, origCoorA.y), id);
         RtreeMaps[ff->getCell()].remove(oldEntry);
 
         PointWithID newEntryA = std::make_pair(Point(origCoorB.x, origCoorB.y), id);
-        PointWithID newEntryB = std::make_pair(Point(origCoorA.x, origCoorA.y), nearestPoint.second);
+        PointWithID newEntryB = std::make_pair(Point(origCoorA.x, origCoorA.y), bestIdx);
         RtreeMaps[ff->getCell()].insert(newEntryA);
-        RtreeMaps[ff->getCell()].insert(newEntryB);        
+        RtreeMaps[ff->getCell()].insert(newEntryB);
     }
     CheckSwapSanity();
 }
@@ -148,9 +154,10 @@ void DetailPlacement::DetailAssignmentMBFF(){
         }
         
         size_t querySize = 100;
-        // if(sameCLKFFs.size() < 100){
-        //     querySize = sameCLKFFs.size();
-        // }
+        if(sameCLKFFs.size() < querySize){
+            querySize = sameCLKFFs.size();
+        }
+        if(querySize < 2) continue;
 
         vector<FF*> FFs(querySize);
         RTree rtree = RTree();
