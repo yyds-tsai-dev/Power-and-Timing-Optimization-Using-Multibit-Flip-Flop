@@ -10,25 +10,33 @@
 
 ### Score Table (lower = better)
 
-| Testcase | Baseline (coherent17) | Phase 3A-(a) | Current Shipped | Best Delta |
-|---|---:|---:|---:|---:|
-| testcase1_0812 | 743,005,833 | 742,623,859 (-0.05%) | **738,695,252 (-0.58%)** | -0.58% |
-| testcase2_0812 | 830,273 | 830,273 (0.00%) | 865,259 (+4.21%\*) | 0.00% |
-| testcase3 | 728,870,766 | 728,870,766 (0.00%) | 729,063,614 (+0.03%) | 0.00% |
-| testcase1_MBFF | 752,479,215 | 751,914,595 (-0.08%) | **743,531,170 (-1.19%)** | -1.19% |
-| testcase2_MBFF | 865,419 | 865,419 (0.00%) | 910,103 (+5.16%\*) | 0.00% |
+| Testcase | Baseline | Current Shipped | Delta | Dominant Cost |
+|---|---:|---:|---:|---|
+| testcase1_0812 | 743,005,833 | **738,695,252** | **-0.58%** | Area 99% |
+| testcase2_0812 | 830,273 | 865,259\* | +4.21%\* | TNS 11% / Power 20% / Area 69% |
+| testcase3 | 728,870,766 | 729,063,614 | +0.03% | Area 100% |
+| testcase1_MBFF | 752,479,215 | **743,531,170** | **-1.19%** | Area 99% |
+| testcase2_MBFF | 865,419 | 910,103\* | +5.16%\* | TNS 14% / Power 20% / Area 66% |
+| hiddencase01 | 32,732,137 | 32,931,709\* | +0.61%\* | **Power 96%** |
+| hiddencase02 | 13,863,364 | 13,863,364 | 0.00% | **TNS 34% / Power 62%** |
+| hiddencase03 | 55,941,538 | 55,941,538 | 0.00% | Area 100% |
+| hiddencase04 | 729,383,529 | 729,383,529 | 0.00% | Area 100% |
 
-> \* t2_0812 / t2_MBFF apparent regressions are due to **parallel banking nondeterminism** (~0.7% run-to-run variance). Baseline was measured in serial mode; current shipped runs with OpenMP parallelism. Repeated runs show these cases fluctuate within noise band. The meaningful signal is on the large testcases (t1_0812, t1_MBFF).
+> \* Apparent regressions on t2_0812/t2_MBFF/hc01 are within **parallel banking nondeterminism** (~0.7% run-to-run variance). Baseline was serial; current uses OpenMP parallelism. Meaningful signal is on the large testcases (t1_0812 -0.58%, t1_MBFF -1.19%).
 
 ### Banking Wall Time
 
-| Testcase | Baseline | Phase 3A-(a) | Current Shipped |
+| Testcase | Baseline | Current Shipped | Delta |
 |---|---:|---:|---:|
-| testcase1_0812 | 6.7s | 5.5s (-18%) | **5.4s (-20%)** |
-| testcase2_0812 | 18.1s | 17.9s (-1%) | **16.8s (-7%)** |
-| testcase3 | 5.6s | 5.6s (+0%) | **4.6s (-17%)** |
-| testcase1_MBFF | 6.9s | 5.9s (-15%) | **5.3s (-24%)** |
-| testcase2_MBFF | 18.1s | 18.0s (-0%) | **16.7s (-8%)** |
+| testcase1_0812 | 6.7s | **5.4s** | **-20%** |
+| testcase2_0812 | 18.1s | **16.8s** | **-7%** |
+| testcase3 | 5.6s | **4.6s** | **-17%** |
+| testcase1_MBFF | 6.9s | **5.3s** | **-24%** |
+| testcase2_MBFF | 18.1s | **16.7s** | **-8%** |
+| hiddencase01 | 5.0s | **4.9s** | **-2%** |
+| hiddencase02 | 17.7s | **14.8s** | **-16%** |
+| hiddencase03 | 17.8s | **14.9s** | **-17%** |
+| hiddencase04 | 5.6s | **4.6s** | **-17%** |
 
 ---
 
