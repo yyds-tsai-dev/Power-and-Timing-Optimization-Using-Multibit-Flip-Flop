@@ -21,18 +21,8 @@ void DetailPlacement::run(){
     GlobalSwap();
     GlobalSwap();
 
-    // // by c119cheng
-    // mgr.getOverallCost(true, 1);
-    // Timer t = Timer();
-    // t.start();
-    // DetailAssignmentMBFF(); // for same clk
-    // t.stop();
-    // Timer tt = Timer();
-    
-    // mgr.getOverallCost(true, 1);
-    // tt.start();
-    // ChangeCell();
-    // tt.stop();
+    ChangeCell();
+
 }
 
 void DetailPlacement::BuildGlobalRtreeMaps(){
@@ -81,29 +71,34 @@ void DetailPlacement::GlobalSwap(){
             continue;
         }
 
-        size_t ff_critical = 0;
-        size_t target_critical = 0;
-        for(auto& curFF : ff->getFFPtr()->getClusterFF()){
-            ff_critical += 1 + curFF->getNextStage().size();
-        }
-        for(auto& curFF : legalizer->ffs[nearestPoint.second]->getFFPtr()->getClusterFF()){
-            target_critical += 1 + curFF->getNextStage().size();
-        }
-
-        // The nearest point to swap will not improve the TNS
-        if(ff->getDisplacement() * ff_critical < legalizer->ffs[nearestPoint.second]->getDisplacement(ff->getLGCoor()) * target_critical){
-            continue;
-        }
-
-        // Swap the ff pairs by LGCoor and placeIdx
         Node *ff_current = ff;
         Node *ff_choose_to_swap = legalizer->ffs[nearestPoint.second];
 
-        // Commit to manager
-        ff_choose_to_swap->getFFPtr()->setNewCoor(ff->getLGCoor());
-        ff_current->getFFPtr()->setNewCoor(ff_choose_to_swap->getLGCoor());
+        // Save original positions
+        Coor origCoorA = ff_current->getLGCoor();
+        Coor origCoorB = ff_choose_to_swap->getLGCoor();
 
-        // Update the LGCoor in Node
+        // Cost before swap (using full α·TNS + β·Power + γ·Area)
+        double costBefore = ff_current->getFFPtr()->getCost()
+                          + ff_choose_to_swap->getFFPtr()->getCost();
+
+        // Tentatively swap coordinates
+        ff_current->getFFPtr()->setNewCoor(origCoorB);
+        ff_choose_to_swap->getFFPtr()->setNewCoor(origCoorA);
+
+        // Cost after swap
+        double costAfter = ff_current->getFFPtr()->getCost()
+                         + ff_choose_to_swap->getFFPtr()->getCost();
+
+        // Only accept if cost improves
+        if(costAfter >= costBefore){
+            // Undo swap
+            ff_current->getFFPtr()->setNewCoor(origCoorA);
+            ff_choose_to_swap->getFFPtr()->setNewCoor(origCoorB);
+            continue;
+        }
+
+        // Commit swap: update LGCoor in Node
         ff_current->setLGCoor(ff_current->getFFPtr()->getNewCoor());
         ff_choose_to_swap->setLGCoor(ff_choose_to_swap->getFFPtr()->getNewCoor());
 
@@ -113,13 +108,15 @@ void DetailPlacement::GlobalSwap(){
         ff->setPlaceRowIdx(ff_choose_to_swap_placeIdx);
         ff_choose_to_swap->setPlaceRowIdx(ff_current_placeIdx);
 
-        // Remove ff current from the rtree
+        // Maintain the rtree: remove old entries, insert new ones
         RtreeMaps[ff->getCell()].remove(nearestPoint);
+        PointWithID oldEntry = std::make_pair(Point(origCoorA.x, origCoorA.y), id);
+        RtreeMaps[ff->getCell()].remove(oldEntry);
 
-        // Maintain the rtree
-        PointWithID pointwithid;
-        pointwithid = std::make_pair(Point(ff->getLGCoor().x, ff->getLGCoor().y), id);
-        RtreeMaps[ff->getCell()].insert(pointwithid);        
+        PointWithID newEntryA = std::make_pair(Point(origCoorB.x, origCoorB.y), id);
+        PointWithID newEntryB = std::make_pair(Point(origCoorA.x, origCoorA.y), nearestPoint.second);
+        RtreeMaps[ff->getCell()].insert(newEntryA);
+        RtreeMaps[ff->getCell()].insert(newEntryB);        
     }
     CheckSwapSanity();
 }
@@ -273,13 +270,13 @@ void DetailPlacement::DetailAssignmentMBFF(){
 
 void DetailPlacement::ChangeCell(){
     DEBUG_DP("Change Cell");
-    vector<FF*> FFs(mgr.FF_Map.size());
-    size_t idx=0;
+    vector<FF*> FFs;
+    FFs.reserve(mgr.FF_Map.size());
     for(auto& ff_m : mgr.FF_Map){
-        FFs[idx] = ff_m.second;
-        idx++;
+        FFs.push_back(ff_m.second);
     }
-    #pragma omp parallel for num_threads(MAX_THREADS)
+    // Single-threaded: setCell + getCost reads neighbor state through
+    // nextStage connections, OMP causes data races when probing cells.
     for(size_t i=0;i<FFs.size();i++){
         FF* curFF = FFs[i];
         double bestCost = curFF->getCost();
@@ -287,21 +284,18 @@ void DetailPlacement::ChangeCell(){
         Cell* originalCell = curFF->getCell();
         size_t bit = curFF->getCell()->getBits();
         size_t bitMapSize = mgr.Bit_FF_Map[bit].size();
-        // iterate through all cell type
         for(size_t j=0;j<bitMapSize;j++){
             Cell* targetCell = mgr.Bit_FF_Map[bit][j];
             if(targetCell->getW() <= originalCell->getW() && targetCell->getH() <= originalCell->getH()){
                 curFF->setCell(targetCell);
                 double totalCost = curFF->getCost();
                 curFF->setCell(originalCell);
-                // hard constraint for using smaller cell, for easier legalize, need reconsider
                 if(totalCost < bestCost){
                     bestCost = totalCost;
                     bestCell = targetCell;
                 }
             }
         }
-
         curFF->setCell(bestCell);
     }
 }
