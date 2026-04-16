@@ -389,8 +389,19 @@ void Banking::doMatchingClustering(){
         return;
     }
 
-    const int K_NEIGHBORS = 15;
-    const double WEIGHT_SCALE = 1000.0;
+    // Tunable matching parameters via env vars
+    int K_NEIGHBORS = 15;
+    double WEIGHT_SCALE = 1000.0;
+    double EDGE_MIN_GAIN = 0.0;   // minimum CostCompare gain to create an edge
+    double DIST_BONUS = 0.1;      // proximity bonus coefficient
+    const char* envK = std::getenv("MATCH_K");
+    if(envK) K_NEIGHBORS = std::atoi(envK);
+    const char* envMinGain = std::getenv("MATCH_MIN_GAIN");
+    if(envMinGain) EDGE_MIN_GAIN = std::atof(envMinGain);
+    const char* envDistBonus = std::getenv("MATCH_DIST_BONUS");
+    if(envDistBonus) DIST_BONUS = std::atof(envDistBonus);
+    // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
+    // so dist * distScale ≈ 1.0 for a typical neighbor distance
 
     auto t_total = tic();
     double t_graph = 0, t_match = 0, t_commit = 0;
@@ -426,6 +437,27 @@ void Banking::doMatchingClustering(){
         bgi::rtree<PointWithID, bgi::quadratic<P_PER_NODE>> rtree;
         rtree.insert(points.begin(), points.end());
 
+        // Compute avg nearest-neighbor distance for distScale normalization
+        double distScale = 1.0;
+        {
+            double sumNN = 0;
+            int nSampled = std::min((int)localFFs.size(), 200);
+            int step = std::max(1, (int)localFFs.size() / nSampled);
+            int cnt = 0;
+            for(int si = 0; si < (int)localFFs.size() && cnt < nSampled; si += step, cnt++){
+                std::vector<PointWithID> nn2;
+                nn2.reserve(2);
+                rtree.query(bgi::nearest(Point(localFFs[si]->getNewCoor().x,
+                    localFFs[si]->getNewCoor().y), 2), std::back_inserter(nn2));
+                if(nn2.size() == 2){
+                    int oi = (nn2[0].second == si) ? 1 : 0;
+                    sumNN += HPWL(localFFs[si]->getNewCoor(), localFFs[nn2[oi].second]->getNewCoor());
+                }
+            }
+            double avgNN = (cnt > 0) ? sumNN / cnt : 1.0;
+            distScale = (avgNN > 1e-9) ? 1.0 / avgNN : 1.0;
+        }
+
         // Build LEMON graph
         lemon::SmartGraph g;
         std::vector<lemon::SmartGraph::Node> gnodes(localFFs.size());
@@ -451,14 +483,24 @@ void Banking::doMatchingClustering(){
                 if(j <= (int)i) continue;
 
                 FF* ffB = localFFs[j];
-                Coor median((coorA.x + ffB->getNewCoor().x) / 2.0,
-                            (coorA.y + ffB->getNewCoor().y) / 2.0);
+                Coor coorB = ffB->getNewCoor();
+                Coor median((coorA.x + coorB.x) / 2.0,
+                            (coorA.y + coorB.y) / 2.0);
                 std::vector<FF*> pair_ffs = {ffA, ffB};
                 double gain = CostCompare(median, cell2bit, pair_ffs);
 
-                if(gain > 0){
+                // Distance-aware edge weight: proximity bonus for closer pairs.
+                // gain * DIST_BONUS / (1 + normDist) rewards pairs that are
+                // near each other, since FindPlace is more likely to succeed
+                // close to the median for close pairs.
+                if(gain > EDGE_MIN_GAIN){
+                    double adjGain = gain;
+                    if(DIST_BONUS > 0){
+                        double dist = HPWL(coorA, coorB);
+                        adjGain += gain * DIST_BONUS / (1.0 + dist * distScale);
+                    }
                     auto e = g.addEdge(gnodes[i], gnodes[j]);
-                    weight[e] = (long long)(gain * WEIGHT_SCALE);
+                    weight[e] = (long long)(adjGain * WEIGHT_SCALE);
                     edgeCount++;
                 }
             }
@@ -529,6 +571,9 @@ void Banking::doMatchingClustering(){
         t_commit += ms_fn(tc0, tic());
     }
 
+    std::cout << "[MATCHING] params: K=" << K_NEIGHBORS
+              << " minGain=" << EDGE_MIN_GAIN
+              << " distBonus=" << DIST_BONUS << std::endl;
     std::cout << "[MATCHING] 2bit: graph=" << t_graph << "ms match=" << t_match
               << "ms commit=" << t_commit << "ms"
               << " nodes=" << total_nodes << " edges=" << total_edges
