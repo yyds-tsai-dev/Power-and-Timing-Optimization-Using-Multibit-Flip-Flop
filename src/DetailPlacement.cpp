@@ -15,13 +15,14 @@ DetailPlacement::~DetailPlacement(){
 void DetailPlacement::run(){
     DEBUG_DP("Running detail placement!");
     BuildGlobalRtreeMaps();
-    GlobalSwap();
-    GlobalSwap();
-    GlobalSwap();
-    GlobalSwap();
-    GlobalSwap();
 
-    ChangeCell();
+    const int MAX_ITER = 10;
+    for(int iter = 0; iter < MAX_ITER; iter++){
+        size_t swaps = GlobalSwap();
+        size_t changes = ChangeCell();
+        DEBUG_DP("Iter " << iter << ": swaps=" << swaps << " cellChanges=" << changes);
+        if(swaps == 0 && changes == 0) break;
+    }
 }
 
 void DetailPlacement::BuildGlobalRtreeMaps(){
@@ -53,9 +54,11 @@ void DetailPlacement::CheckSwapSanity(){
     }
 }
 
-void DetailPlacement::GlobalSwap(){
+size_t DetailPlacement::GlobalSwap(){
     DEBUG_DP("Global Swap");
-    const int GS_K = 5; // query K nearest neighbors, pick best swap
+    int GS_K = 5;
+    if(const char* e = std::getenv("GS_K")) GS_K = std::atoi(e);
+    size_t swapCount = 0;
     for(size_t id = 0; id < legalizer->ffs.size(); id++){
         Node *ff = legalizer->ffs[id];
         Node *ff_current = ff;
@@ -99,6 +102,7 @@ void DetailPlacement::GlobalSwap(){
         }
 
         if(bestIdx < 0) continue; // no improving swap found
+        swapCount++;
 
         // Commit the best swap
         Node *ff_choose_to_swap = legalizer->ffs[bestIdx];
@@ -125,6 +129,7 @@ void DetailPlacement::GlobalSwap(){
         RtreeMaps[ff->getCell()].insert(newEntryB);
     }
     CheckSwapSanity();
+    return swapCount;
 }
 
 void DetailPlacement::DetailAssignmentMBFF(){
@@ -275,8 +280,9 @@ void DetailPlacement::DetailAssignmentMBFF(){
 
 }
 
-void DetailPlacement::ChangeCell(){
+size_t DetailPlacement::ChangeCell(){
     DEBUG_DP("Change Cell");
+    size_t changeCount = 0;
     vector<FF*> FFs;
     FFs.reserve(mgr.FF_Map.size());
     for(auto& ff_m : mgr.FF_Map){
@@ -303,6 +309,8 @@ void DetailPlacement::ChangeCell(){
                 }
             }
         }
+        if(bestCell != originalCell) changeCount++;
         curFF->setCell(bestCell);
     }
+    return changeCount;
 }

@@ -68,12 +68,12 @@ private:
     void CheckSwapSanity();
 
     // 3 main methods for detail placement
-    void GlobalSwap();
+    size_t GlobalSwap();  // returns number of accepted swaps
     void LocalSwap();
 
-    // 
+    //
     void DetailAssignmentMBFF(); // for same clk
-    void ChangeCell();
+    size_t ChangeCell();  // returns number of cell changes
 };
 
 
