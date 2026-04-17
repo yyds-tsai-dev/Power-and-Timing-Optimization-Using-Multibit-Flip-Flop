@@ -50,6 +50,8 @@ public:
     void restoreUnclusterFFCoor();
     void ClusterResult();
     double CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank);
+    Coor ComputeOptimalPosition(Cell* chooseCell, const std::vector<FF*>& FFToBank);
+    static double weightedMedian(std::vector<std::pair<double,double>>& coordWeights);
 
 };
 

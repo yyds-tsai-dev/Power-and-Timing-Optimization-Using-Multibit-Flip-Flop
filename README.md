@@ -10,19 +10,19 @@
 
 ### Score Table (lower = better)
 
-| Testcase | Baseline | Stage B v2 | DP-v2 | **Current (Per-pin + DP-v3)** | Delta vs Baseline | Dominant Cost |
+| Testcase | Baseline | Stage B v2 | DP-v2 | **Current (Pin-offset fix)** | Delta vs Baseline | Dominant Cost |
 |---|---:|---:|---:|---:|---:|---|
-| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | **740,574,007** | **-0.33%** | Area 99% |
-| testcase2_0812 | 830,273 | 815,494 | 799,642 | **788,429** | **-5.04%** | TNS 11% / Power 20% / Area 69% |
-| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | **728,505,556** | -0.05% | Area 100% |
-| testcase1_MBFF | 752,479,215 | 748,465,219 | 745,999,703 | **747,776,903** | -0.62% | Area 99% |
-| testcase2_MBFF | 865,419 | 846,400 | 827,535 | **811,985** | **-6.17%** | TNS 14% / Power 20% / Area 66% |
-| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | **31,123,283** | **-4.91%** | **Power 96%** |
-| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | **12,475,084** | **-10.01%** | **TNS 34% / Power 62%** |
-| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | **55,878,678** | **-0.11%** | Area 100% |
-| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | **728,372,089** | **-0.14%** | Area 100% |
+| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | **740,426,488** | **-0.35%** | Area 99% |
+| testcase2_0812 | 830,273 | 815,494 | 799,642 | **772,711** | **-6.93%** | TNS 11% / Power 20% / Area 69% |
+| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | **728,677,742** | -0.03% | Area 100% |
+| testcase1_MBFF | 752,479,215 | 748,465,219 | 745,999,703 | **747,303,128** | **-0.69%** | Area 99% |
+| testcase2_MBFF | 865,419 | 846,400 | 827,535 | **816,308** | **-5.67%** | TNS 14% / Power 20% / Area 66% |
+| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | **31,070,005** | **-5.08%** | **Power 96%** |
+| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | **12,325,446** | **-11.09%** | **TNS 34% / Power 62%** |
+| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | **55,860,767** | **-0.14%** | Area 100% |
+| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | **728,289,561** | **-0.15%** | Area 100% |
 
-> Current shipped version: Per-pin CostCompare + DP-v3 iterative (GlobalSwap+ChangeCell with RtreeMap rebuild). 7/9 cases improved vs DP-v2; t3 +0.04% and t1_MBFF +0.24% slight regression (Area-dominated). Largest gains: hc02 **-10.01%**, t2_MBFF **-6.17%**, t2_0812 **-5.04%**, hc01 **-4.91%**.
+> Current shipped version: Per-pin CostCompare with pin-offset fix + DP-v3 iterative. Largest gains: hc02 **-11.09%**, t2_0812 **-6.93%**, t2_MBFF **-5.67%**, hc01 **-5.08%**.
 
 ### Banking Wall Time
 
@@ -53,7 +53,8 @@
 | DP-v1 | 2026-04-17 | Cost-aware GlobalSwap + enable ChangeCell | t2_0812 -2.02%, t2_MBFF -1.43%, hc02 -0.74% (vs B-v2) |
 | DP-v2 | 2026-04-17 | K=5 nearest GlobalSwap | hc02 -5.84%, hc01 -0.78%, t2_MBFF -0.81% (vs DP-v1) |
 | Per-pin | 2026-04-17 | Per-pin CostCompare: driver/load HPWL + max(0,-slack) TNS filter | t2_0812 -1.7%, hc02 -0.9% (vs old CostCompare, no DP) |
-| **DP-v3** | 2026-04-17 | **Iterative GS+CC with RtreeMap rebuild (fix DP-v2 stale rtree bug)** | **t2_0812 -1.40%, t2_MBFF -1.88%, hc02 -0.91% (vs DP-v2)** |
+| DP-v3 | 2026-04-17 | Iterative GS+CC with RtreeMap rebuild (fix DP-v2 stale rtree bug) | t2_0812 -1.40%, t2_MBFF -1.88%, hc02 -0.91% (vs DP-v2) |
+| **Pin-offset** | 2026-04-17 | **Fix CostCompare: use target cell pin offsets instead of cell origin** | **t2_0812 -1.99%, hc02 -1.20% (vs per-pin without fix)** |
 
 ---
 
@@ -63,8 +64,9 @@
 
 - **Stage A** (shipped): Redistribute D-pin slack along timing paths to per-FF budgets
 - **Stage B v2** (shipped): LEMON MaxWeightedMatching for pairwise 2-bit banking; greedy 4-bit+ fallback; proximity-bonus edge weighting
-- **Per-pin CostCompare** (shipped): Direction-aware per-pin D/Q HPWL + max(0,-slack) TNS filter replaces crude MBFF-level displacement
+- **Per-pin CostCompare + pin-offset fix** (shipped): Direction-aware per-pin D/Q HPWL with correct target cell pin offsets + max(0,-slack) TNS filter
 - **DP-v3** (shipped): Iterative GlobalSwap+ChangeCell with RtreeMap rebuild after cell type changes
+- **ComputeOptimalPosition** (implemented, not active): Slack-weighted median of driver/load positions; tested but doesn't improve 2-bit matching (pre-placement already near-optimal)
 - **Stage C** (planned): Iterative 2-bit -> 4-bit -> 8-bit extension (v2 attempted, hc01 regression — needs skip logic)
 - **Stage D** (planned): Critical-FF rescue pass
 

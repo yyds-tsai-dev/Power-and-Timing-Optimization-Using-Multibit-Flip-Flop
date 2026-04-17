@@ -1,6 +1,7 @@
 #include "Banking.h"
 #include <omp.h>
 #include <chrono>
+#include <unordered_set>
 #include <lemon/smart_graph.h>
 #include <lemon/matching.h>
 
@@ -140,6 +141,7 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
     // (b) per-pin displacement direction (closer vs farther from driver)
     // (c) Q-pin delay change weighted properly through slack
     double oldTNS = 0, newTNS = 0;
+    size_t flatIdx = 0; // slot index into target cell's pin layout
 
     for(size_t i = 0; i < FFToBank.size(); i++){
         FF* ff = FFToBank[i];
@@ -147,13 +149,17 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
         double newCellQDelay = chooseCell->getQpinDelay();
 
         for(auto& cf : ff->getClusterFF()){
+            // Target cell pin names: "D0","D1",... for multi-bit, "D" for 1-bit
+            std::string slotStr = (chooseCell->getBits() == 1)
+                ? "" : std::to_string(flatIdx);
+
             // ---- D-pin slack of this constituent FF ----
             double curSlackD = cf->getSlack();
 
             // Predict D-pin slack at new position using actual driver position
             Coor curDpin = ff->getNewCoor() + ff->getPinCoor(
                 "D" + cf->getPhysicalPinName());
-            Coor newDpin = clusterCoor;
+            Coor newDpin = clusterCoor + chooseCell->getPinCoor("D" + slotStr);
 
             double deltaHpwlD = 0;
             PrevInstance prev = cf->getPrevInstance();
@@ -189,7 +195,7 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
                 // Q-pin displacement: compute using actual load position
                 Coor curQpin = ff->getNewCoor() + ff->getPinCoor(
                     "Q" + cf->getPhysicalPinName());
-                Coor newQpin = clusterCoor;
+                Coor newQpin = clusterCoor + chooseCell->getPinCoor("Q" + slotStr);
 
                 Coor loadCoor;
                 if(next.outputGate){
@@ -209,12 +215,101 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
                 oldTNS += std::max(0.0, -nextCurSlack);
                 newTNS += std::max(0.0, -predNextSlack);
             }
+
+            flatIdx++;
         }
     }
 
     double deltaTNS = newTNS - oldTNS; // positive = TNS worsened
     costOptimize -= mgr.alpha * deltaTNS;
     return costOptimize;
+}
+
+double Banking::weightedMedian(std::vector<std::pair<double,double>>& cw){
+    // cw = {(coordinate, weight)}. Returns weighted median.
+    std::sort(cw.begin(), cw.end());
+    double totalW = 0;
+    for(auto& p : cw) totalW += p.second;
+    double cumW = 0;
+    for(auto& p : cw){
+        cumW += p.second;
+        if(cumW >= totalW * 0.5) return p.first;
+    }
+    return cw.back().first;
+}
+
+Coor Banking::ComputeOptimalPosition(Cell* chooseCell, const std::vector<FF*>& FFToBank){
+    // Collect weighted anchor points from ALL drivers/loads.
+    // All pins contribute; critical pins (slack < 0) get higher weight.
+    // Anchor = driverCoor - pinOffset, so that position + pinOffset ≈ driverCoor.
+    std::vector<std::pair<double,double>> anchorsX, anchorsY;
+    size_t flatIdx = 0;
+
+    for(size_t i = 0; i < FFToBank.size(); i++){
+        FF* ff = FFToBank[i];
+        for(auto& cf : ff->getClusterFF()){
+            std::string slotStr = (chooseCell->getBits() == 1)
+                ? "" : std::to_string(flatIdx);
+            Coor pinOffD = chooseCell->getPinCoor("D" + slotStr);
+            Coor pinOffQ = chooseCell->getPinCoor("Q" + slotStr);
+
+            double slackD = cf->getSlack();
+            PrevInstance prev = cf->getPrevInstance();
+            if(prev.instance){
+                Coor driverCoor;
+                if(prev.cellType == CellType::IO){
+                    driverCoor = prev.instance->getCoor();
+                } else if(prev.cellType == CellType::GATE){
+                    driverCoor = prev.instance->getCoor()
+                               + prev.instance->getPinCoor(prev.pinName);
+                } else {
+                    FF* inputFF = dynamic_cast<FF*>(prev.instance);
+                    driverCoor = inputFF->getPhysicalFF()->getNewCoor()
+                               + inputFF->getPhysicalFF()->getPinCoor(
+                                   "Q" + inputFF->getPhysicalPinName());
+                }
+                // Critical pins: high weight. Non-critical: base weight.
+                double w = (slackD < 0)
+                    ? mgr.DisplacementDelay * mgr.alpha
+                    : mgr.DisplacementDelay * mgr.alpha * 0.1;
+                anchorsX.push_back({driverCoor.x - pinOffD.x, w});
+                anchorsY.push_back({driverCoor.y - pinOffD.y, w});
+            }
+
+            // Q-pin loads
+            for(auto& next : cf->getNextStage()){
+                double slackQ = next.ff->getSlack();
+                Coor loadCoor;
+                if(next.outputGate){
+                    loadCoor = next.outputGate->getCoor()
+                             + next.outputGate->getPinCoor(next.pinName);
+                } else {
+                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                             + next.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + next.ff->getPhysicalPinName());
+                }
+                double w = (slackQ < 0)
+                    ? mgr.DisplacementDelay * mgr.alpha
+                    : mgr.DisplacementDelay * mgr.alpha * 0.1;
+                anchorsX.push_back({loadCoor.x - pinOffQ.x, w});
+                anchorsY.push_back({loadCoor.y - pinOffQ.y, w});
+            }
+
+            flatIdx++;
+        }
+    }
+
+    // Fallback to geometric median if no anchors at all (no timing connections)
+    if(anchorsX.empty()){
+        double sx = 0, sy = 0;
+        for(auto* ff : FFToBank){
+            sx += ff->getNewCoor().x;
+            sy += ff->getNewCoor().y;
+        }
+        return Coor(sx / FFToBank.size(), sy / FFToBank.size());
+    }
+
+    return Coor(weightedMedian(anchorsX), weightedMedian(anchorsY));
 }
 
 void Banking::doClustering(){
@@ -529,10 +624,6 @@ void Banking::doMatchingClustering(){
                 std::vector<FF*> pair_ffs = {ffA, ffB};
                 double gain = CostCompare(median, cell2bit, pair_ffs);
 
-                // Distance-aware edge weight: proximity bonus for closer pairs.
-                // gain * DIST_BONUS / (1 + normDist) rewards pairs that are
-                // near each other, since FindPlace is more likely to succeed
-                // close to the median for close pairs.
                 if(gain > EDGE_MIN_GAIN){
                     double adjGain = gain;
                     if(DIST_BONUS > 0){
@@ -578,6 +669,7 @@ void Banking::doMatchingClustering(){
 
             FF* ffA = localFFs[i];
             FF* ffB = localFFs[j];
+
             std::vector<FF*> pair_ffs = {ffA, ffB};
 
             Coor median((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
@@ -759,45 +851,162 @@ void Banking::doMatchingClustering(){
                 for(size_t i = 0; i < localFFs.size(); i++){
                     nodeIdx_hb[gnodes_hb[i]] = (int)i;
                 }
-                std::vector<bool> committed_hb(localFFs.size(), false);
 
+                // --- Collect matched pairs ---
+                struct MergeCand {
+                    int idxA, idxB;  // indices into localFFs
+                    std::unordered_set<FF*> affected;  // physicalFFs whose slack changes if committed
+                };
+                std::vector<MergeCand> candidates;
+
+                std::vector<bool> seen_hb(localFFs.size(), false);
                 for(size_t i = 0; i < localFFs.size(); i++){
-                    if(committed_hb[i]) continue;
+                    if(seen_hb[i]) continue;
                     lemon::SmartGraph::Node mate = mwm_hb.mate(gnodes_hb[i]);
                     if(mate == lemon::INVALID) continue;
-
                     int j = nodeIdx_hb[mate];
-                    if(j < 0 || committed_hb[j]) continue;
-                    hb_matched++;
+                    if(j < 0 || seen_hb[j]) continue;
+                    seen_hb[i] = true;
+                    seen_hb[j] = true;
 
+                    MergeCand mc;
+                    mc.idxA = (int)i;
+                    mc.idxB = j;
+
+                    // Build affected set: physicalFFs within 2-hop timing neighbors
                     FF* ffA = localFFs[i];
                     FF* ffB = localFFs[j];
-                    std::vector<FF*> pair_ffs = {ffA, ffB};
+                    mc.affected.insert(ffA);
+                    mc.affected.insert(ffB);
 
-                    Coor median((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
-                                (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
-                    Coor placeCoor = mgr.legalizer->FindPlace(median, chooseCell);
-                    if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
-                        hb_dropped_place++;
-                        continue;
+                    // Helper: collect 1-hop FF neighbors of a constituent FF
+                    auto collect1hop = [](FF* cf, std::vector<FF*>& out){
+                        PrevInstance prev = cf->getPrevInstance();
+                        if(prev.instance && prev.cellType == CellType::FF){
+                            FF* driverFF = dynamic_cast<FF*>(prev.instance);
+                            if(driverFF) out.push_back(driverFF);
+                        }
+                        for(auto& next : cf->getNextStage()){
+                            if(next.ff) out.push_back(next.ff);
+                        }
+                    };
+
+                    // 1-hop: direct timing neighbors of constituent FFs
+                    std::vector<FF*> hop1FFs;
+                    for(FF* mbff : {ffA, ffB}){
+                        for(auto& cf : mbff->getClusterFF()){
+                            collect1hop(cf, hop1FFs);
+                        }
+                    }
+                    for(FF* h1 : hop1FFs){
+                        if(h1->getPhysicalFF())
+                            mc.affected.insert(h1->getPhysicalFF());
                     }
 
-                    double realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
-                    if(realGain < 0){
-                        hb_dropped_cost++;
-                        continue;
+                    // 2-hop: timing neighbors of hop1 FFs
+                    for(FF* h1 : hop1FFs){
+                        FF* phys = h1->getPhysicalFF();
+                        if(!phys) continue;
+                        for(auto& cf2 : phys->getClusterFF()){
+                            std::vector<FF*> hop2FFs;
+                            collect1hop(cf2, hop2FFs);
+                            for(FF* h2 : hop2FFs){
+                                if(h2->getPhysicalFF())
+                                    mc.affected.insert(h2->getPhysicalFF());
+                            }
+                        }
                     }
+                    candidates.push_back(std::move(mc));
+                }
+                hb_matched = (int)candidates.size();
 
-                    FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
-                    mgr.legalizer->UpdateRows(newFF);
-                    newFF->setIsLegalize(true);
+                // --- Build conflict graph (adjacency list) ---
+                // Two candidates conflict if their affected sets intersect
+                int nCand = (int)candidates.size();
+                std::vector<std::vector<int>> adj(nCand);
 
-                    committed_hb[i] = true;
-                    committed_hb[j] = true;
-                    clusterTotalNum++;
-                    hb_committed++;
+                // Map: physicalFF -> list of candidate indices that affect it
+                std::unordered_map<FF*, std::vector<int>> ffToCands;
+                for(int ci = 0; ci < nCand; ci++){
+                    for(FF* af : candidates[ci].affected){
+                        ffToCands[af].push_back(ci);
+                    }
+                }
+                // Build adjacency from shared affected FFs
+                for(auto& kv : ffToCands){
+                    auto& cands = kv.second;
+                    for(size_t a = 0; a < cands.size(); a++){
+                        for(size_t b = a + 1; b < cands.size(); b++){
+                            adj[cands[a]].push_back(cands[b]);
+                            adj[cands[b]].push_back(cands[a]);
+                        }
+                    }
+                }
+                // Deduplicate adjacency lists
+                for(int ci = 0; ci < nCand; ci++){
+                    std::sort(adj[ci].begin(), adj[ci].end());
+                    adj[ci].erase(std::unique(adj[ci].begin(), adj[ci].end()), adj[ci].end());
+                }
+
+                // --- Greedy graph coloring ---
+                std::vector<int> color(nCand, -1);
+                int numColors = 0;
+                for(int ci = 0; ci < nCand; ci++){
+                    std::unordered_set<int> usedColors;
+                    for(int nb : adj[ci]){
+                        if(color[nb] >= 0) usedColors.insert(color[nb]);
+                    }
+                    int c = 0;
+                    while(usedColors.count(c)) c++;
+                    color[ci] = c;
+                    numColors = std::max(numColors, c + 1);
+                }
+
+                // --- Process each color group (batch) ---
+                std::vector<bool> committed_hb(localFFs.size(), false);
+                int hb_color_groups = numColors;
+
+                for(int col = 0; col < numColors; col++){
+                    for(int ci = 0; ci < nCand; ci++){
+                        if(color[ci] != col) continue;
+                        int ii = candidates[ci].idxA;
+                        int jj = candidates[ci].idxB;
+                        if(committed_hb[ii] || committed_hb[jj]) continue;
+
+                        FF* ffA = localFFs[ii];
+                        FF* ffB = localFFs[jj];
+                        std::vector<FF*> pair_ffs = {ffA, ffB};
+
+                        Coor median((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                    (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        Coor placeCoor = mgr.legalizer->FindPlace(median, chooseCell);
+                        if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                            hb_dropped_place++;
+                            continue;
+                        }
+
+                        // Re-evaluate with current slack (updated by prior batches)
+                        double realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
+                        if(realGain < 0){
+                            hb_dropped_cost++;
+                            continue;
+                        }
+
+                        FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
+                        mgr.legalizer->UpdateRows(newFF);
+                        newFF->setIsLegalize(true);
+
+                        committed_hb[ii] = true;
+                        committed_hb[jj] = true;
+                        clusterTotalNum++;
+                        hb_committed++;
+                    }
                 }
                 t_commit_hb += ms_fn(tc0, tic());
+
+                std::cout << "[MATCHING] " << targetBit << "bit: "
+                          << nCand << " candidates, " << hb_color_groups
+                          << " color groups" << std::endl;
             }
 
             std::cout << "[MATCHING] " << targetBit << "bit: graph=" << t_graph_hb
