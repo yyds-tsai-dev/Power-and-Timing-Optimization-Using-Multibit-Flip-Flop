@@ -582,18 +582,199 @@ void Banking::doMatchingClustering(){
               << " dropped_cost=" << n_dropped_cost << std::endl;
 
     // ================================================================
-    // Phase 2: Greedy for higher-bit targets (4, 8, ...)
+    // Phase 2+3: For each higher-bit target (4, 8, ...):
+    //   (a) Max-weight matching on sourceBit pairs (if applicable)
+    //   (b) Greedy fallback for remaining FFs
+    // Both share the same legalizer so placements are consistent.
     // ================================================================
     std::map<int, std::vector<Cell *>> orderBitMap(mgr.Bit_FF_Map.begin(), mgr.Bit_FF_Map.end());
     for(const auto &bitLib : orderBitMap){
         Cell* chooseCell = bitLib.second[0];
         int targetBit = chooseCell->getBits();
         if(targetBit <= 2) continue;
-        DEBUG_BAN("Cluster " + std::to_string(targetBit) + " Bit MBFF (greedy fallback)");
+        int sourceBit = targetBit / 2;
+        bool canMatch = (mgr.Bit_FF_Map.find(sourceBit) != mgr.Bit_FF_Map.end());
 
+        // Fresh legalizer for this bit level
         delete mgr.legalizer;
         mgr.legalizer = new Legalizer(mgr);
         mgr.legalizer->initial();
+
+        // --- (a) Matching phase: pair sourceBit MBFFs ---
+        // Gate higher-bit matching behind MATCH_HIGHER_BIT env var (default: off)
+        // because CostCompare underestimates TNS impact for large-displacement
+        // merges on TNS-heavy cases.
+        bool doHigherMatch = canMatch;
+        if(doHigherMatch){
+            const char* envHB = std::getenv("MATCH_HIGHER_BIT");
+            doHigherMatch = (envHB && std::string(envHB) != "0");
+        }
+        if(doHigherMatch){
+            std::cout << "[MATCHING] " << targetBit << "bit: pairing "
+                      << sourceBit << "+" << sourceBit << " MBFFs" << std::endl;
+
+            double t_graph_hb = 0, t_match_hb = 0, t_commit_hb = 0;
+            int hb_nodes = 0, hb_edges = 0, hb_matched = 0;
+            int hb_committed = 0, hb_dropped_place = 0, hb_dropped_cost = 0;
+
+            for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
+                std::vector<FF*> localFFs;
+                for(const auto &pair : mgr.FF_Map){
+                    if((size_t)pair.second->getClkIdx() == clkIDX
+                       && pair.second->getCell()->getBits() == sourceBit){
+                        localFFs.push_back(pair.second);
+                    }
+                }
+                if(localFFs.size() < 2) continue;
+
+                auto tg0 = tic();
+
+                std::vector<PointWithID> points;
+                points.reserve(localFFs.size());
+                for(size_t i = 0; i < localFFs.size(); i++){
+                    FF *ff = localFFs[i];
+                    points.push_back(std::make_pair(
+                        Point(ff->getNewCoor().x, ff->getNewCoor().y), (int)i));
+                }
+                bgi::rtree<PointWithID, bgi::quadratic<P_PER_NODE>> rtree_hb;
+                rtree_hb.insert(points.begin(), points.end());
+
+                double distScale_hb = 1.0;
+                {
+                    double sumNN = 0;
+                    int nSampled = std::min((int)localFFs.size(), 200);
+                    int step = std::max(1, (int)localFFs.size() / nSampled);
+                    int cnt = 0;
+                    for(int si = 0; si < (int)localFFs.size() && cnt < nSampled; si += step, cnt++){
+                        std::vector<PointWithID> nn2;
+                        nn2.reserve(2);
+                        rtree_hb.query(bgi::nearest(Point(localFFs[si]->getNewCoor().x,
+                            localFFs[si]->getNewCoor().y), 2), std::back_inserter(nn2));
+                        if(nn2.size() == 2){
+                            int oi = (nn2[0].second == si) ? 1 : 0;
+                            sumNN += HPWL(localFFs[si]->getNewCoor(), localFFs[nn2[oi].second]->getNewCoor());
+                        }
+                    }
+                    double avgNN = (cnt > 0) ? sumNN / cnt : 1.0;
+                    distScale_hb = (avgNN > 1e-9) ? 1.0 / avgNN : 1.0;
+                }
+
+                lemon::SmartGraph g_hb;
+                std::vector<lemon::SmartGraph::Node> gnodes_hb(localFFs.size());
+                for(size_t i = 0; i < localFFs.size(); i++){
+                    gnodes_hb[i] = g_hb.addNode();
+                }
+
+                lemon::SmartGraph::EdgeMap<long long> weight_hb(g_hb);
+                int edgeCount_hb = 0;
+
+                for(size_t i = 0; i < localFFs.size(); i++){
+                    FF* ffA = localFFs[i];
+                    Coor coorA = ffA->getNewCoor();
+
+                    std::vector<PointWithID> neighbors;
+                    neighbors.reserve(K_NEIGHBORS + 1);
+                    rtree_hb.query(
+                        bgi::nearest(Point(coorA.x, coorA.y), K_NEIGHBORS + 1),
+                        std::back_inserter(neighbors));
+
+                    for(const auto &nb : neighbors){
+                        int j = nb.second;
+                        if(j <= (int)i) continue;
+
+                        FF* ffB = localFFs[j];
+                        Coor coorB = ffB->getNewCoor();
+                        Coor median((coorA.x + coorB.x) / 2.0,
+                                    (coorA.y + coorB.y) / 2.0);
+                        std::vector<FF*> pair_ffs = {ffA, ffB};
+                        double gain = CostCompare(median, chooseCell, pair_ffs);
+
+                        if(gain > EDGE_MIN_GAIN){
+                            double adjGain = gain;
+                            if(DIST_BONUS > 0){
+                                double dist = HPWL(coorA, coorB);
+                                adjGain += gain * DIST_BONUS / (1.0 + dist * distScale_hb);
+                            }
+                            auto e = g_hb.addEdge(gnodes_hb[i], gnodes_hb[j]);
+                            weight_hb[e] = (long long)(adjGain * WEIGHT_SCALE);
+                            edgeCount_hb++;
+                        }
+                    }
+                }
+
+                t_graph_hb += ms_fn(tg0, tic());
+                hb_nodes += (int)localFFs.size();
+                hb_edges += edgeCount_hb;
+
+                if(edgeCount_hb == 0) continue;
+
+                auto tm0 = tic();
+                lemon::MaxWeightedMatching<lemon::SmartGraph,
+                    lemon::SmartGraph::EdgeMap<long long>> mwm_hb(g_hb, weight_hb);
+                mwm_hb.run();
+                t_match_hb += ms_fn(tm0, tic());
+
+                auto tc0 = tic();
+                lemon::SmartGraph::NodeMap<int> nodeIdx_hb(g_hb, -1);
+                for(size_t i = 0; i < localFFs.size(); i++){
+                    nodeIdx_hb[gnodes_hb[i]] = (int)i;
+                }
+                std::vector<bool> committed_hb(localFFs.size(), false);
+
+                for(size_t i = 0; i < localFFs.size(); i++){
+                    if(committed_hb[i]) continue;
+                    lemon::SmartGraph::Node mate = mwm_hb.mate(gnodes_hb[i]);
+                    if(mate == lemon::INVALID) continue;
+
+                    int j = nodeIdx_hb[mate];
+                    if(j < 0 || committed_hb[j]) continue;
+                    hb_matched++;
+
+                    FF* ffA = localFFs[i];
+                    FF* ffB = localFFs[j];
+                    std::vector<FF*> pair_ffs = {ffA, ffB};
+
+                    Coor median((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                    Coor placeCoor = mgr.legalizer->FindPlace(median, chooseCell);
+                    if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                        hb_dropped_place++;
+                        continue;
+                    }
+
+                    double realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
+                    if(realGain < 0){
+                        hb_dropped_cost++;
+                        continue;
+                    }
+
+                    FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
+                    mgr.legalizer->UpdateRows(newFF);
+                    newFF->setIsLegalize(true);
+
+                    committed_hb[i] = true;
+                    committed_hb[j] = true;
+                    clusterTotalNum++;
+                    hb_committed++;
+                }
+                t_commit_hb += ms_fn(tc0, tic());
+            }
+
+            std::cout << "[MATCHING] " << targetBit << "bit: graph=" << t_graph_hb
+                      << "ms match=" << t_match_hb << "ms commit=" << t_commit_hb << "ms"
+                      << " nodes=" << hb_nodes << " edges=" << hb_edges
+                      << " matched=" << hb_matched << " committed=" << hb_committed
+                      << " dropped_place=" << hb_dropped_place
+                      << " dropped_cost=" << hb_dropped_cost << std::endl;
+
+            // Rebuild legalizer to see committed matching results before greedy
+            delete mgr.legalizer;
+            mgr.legalizer = new Legalizer(mgr);
+            mgr.legalizer->initial();
+        }
+
+        // --- (b) Greedy fallback: cluster remaining FFs into targetBit ---
+        DEBUG_BAN("Cluster " + std::to_string(targetBit) + " Bit MBFF (greedy fallback)");
 
         for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
             std::vector<FF*> localFFs;
