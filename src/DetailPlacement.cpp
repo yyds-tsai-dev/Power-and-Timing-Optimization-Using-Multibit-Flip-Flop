@@ -22,6 +22,7 @@ void DetailPlacement::run(){
         size_t changes = ChangeCell();
         DEBUG_DP("Iter " << iter << ": swaps=" << swaps << " cellChanges=" << changes);
         if(swaps == 0 && changes == 0) break;
+        if(changes > 0) BuildGlobalRtreeMaps();
     }
 }
 
