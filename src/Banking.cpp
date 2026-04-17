@@ -123,57 +123,97 @@ void Banking::sortFFs(std::vector<std::pair<int, double>> &nearFFs){
 }
 
 double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank){
+    // --- Power + Area savings (exact) ---
     double costOptimize = 0;
     for(size_t i = 0; i < FFToBank.size(); i++){
         FF* ff = FFToBank[i];
-        //costOptimize += mgr.alpha * (ff->getCell()->getQpinDelay());
         costOptimize += mgr.beta * (ff->getCell()->getGatePower());
         costOptimize += mgr.gamma * (ff->getCell()->getArea());
     }
     costOptimize -= mgr.beta * (chooseCell->getGatePower()) + mgr.gamma * (chooseCell->getArea());
-    double increaseTNS = 0;
-    double slackOvershoot = 0;
-    const double slackW = mgr.param.SLACK_OVERSHOOT_WEIGHT;
+
+    // --- Per-pin TNS calculation ---
+    // Instead of the crude MBFF-level displacement estimate, compute actual
+    // per-constituent-FF slack change using driver/load positions and the
+    // max(0, -slack) TNS filter. This correctly handles:
+    // (a) positive-slack FFs absorbing displacement without TNS increase
+    // (b) per-pin displacement direction (closer vs farther from driver)
+    // (c) Q-pin delay change weighted properly through slack
+    double oldTNS = 0, newTNS = 0;
+
     for(size_t i = 0; i < FFToBank.size(); i++){
         FF* ff = FFToBank[i];
-        int affectNum = 1;
-        for(const auto & clusterFF : ff->getClusterFF()){
-            affectNum += clusterFF->getNextStage().size();
-            costOptimize += (ff->getCell()->getQpinDelay() - chooseCell->getQpinDelay()) * clusterFF->getNextStage().size();
-        }
-        double predictedDelay = mgr.DisplacementDelay * HPWL(ff->getNewCoor(), clusterCoor);
-        increaseTNS += predictedDelay * affectNum;
+        double oldCellQDelay = ff->getCell()->getQpinDelay();
+        double newCellQDelay = chooseCell->getQpinDelay();
 
-        // Phase 3C (a): slack-aware soft penalty. Uses the D-pin slack of the
-        // to-be-banked FFs; banks whose displacement eats into negative slack
-        // are extra-penalized, but nothing is hard-rejected.
-        // Method D Stage A — Step 2: when SLACK_REDIST_MODE > 0, read the
-        // path-aware redistributed budget instead of the raw D-pin slack. For
-        // 1-bit FFs (banking input) this is always populated by
-        // Manager::computeSlackRedistribution(). Multi-bit inputs fall back to
-        // the raw min-pin slack.
-        if(slackW > 0){
-            double slackD;
-            const bool useRedist = (mgr.param.SLACK_REDIST_MODE > 0)
-                                   && (ff->getClusterFF().size() <= 1);
-            if(useRedist){
-                slackD = ff->getRedistributedSlackD();
-            } else if(ff->getClusterFF().size() <= 1){
-                slackD = ff->getTimingSlack("D");
-            } else {
-                slackD = DBL_MAX;
-                for(size_t s = 0; s < ff->getClusterFF().size(); s++){
-                    double sd = ff->getTimingSlack("D" + std::to_string(s));
-                    if(sd < slackD) slackD = sd;
+        for(auto& cf : ff->getClusterFF()){
+            // ---- D-pin slack of this constituent FF ----
+            double curSlackD = cf->getSlack();
+
+            // Predict D-pin slack at new position using actual driver position
+            Coor curDpin = ff->getNewCoor() + ff->getPinCoor(
+                "D" + cf->getPhysicalPinName());
+            Coor newDpin = clusterCoor;
+
+            double deltaHpwlD = 0;
+            PrevInstance prev = cf->getPrevInstance();
+            if(prev.instance){
+                Coor driverCoor;
+                if(prev.cellType == CellType::IO){
+                    driverCoor = prev.instance->getCoor();
+                } else if(prev.cellType == CellType::GATE){
+                    driverCoor = prev.instance->getCoor()
+                               + prev.instance->getPinCoor(prev.pinName);
+                } else {
+                    FF* inputFF = dynamic_cast<FF*>(prev.instance);
+                    driverCoor = inputFF->getPhysicalFF()->getNewCoor()
+                               + inputFF->getPhysicalFF()->getPinCoor(
+                                   "Q" + inputFF->getPhysicalPinName());
                 }
+                // positive = new position is closer to driver (timing improves)
+                deltaHpwlD = HPWL(driverCoor, curDpin)
+                           - HPWL(driverCoor, newDpin);
             }
-            double overshoot = predictedDelay - slackD;
-            if(overshoot > 0) slackOvershoot += overshoot * affectNum;
+
+            double predSlackD = curSlackD + mgr.DisplacementDelay * deltaHpwlD;
+            oldTNS += std::max(0.0, -curSlackD);
+            newTNS += std::max(0.0, -predSlackD);
+
+            // ---- Q-pin: downstream FFs' D-pin slack ----
+            for(auto& next : cf->getNextStage()){
+                double nextCurSlack = next.ff->getSlack();
+
+                // Q-pin delay change: positive if new cell is faster
+                double qDelayBenefit = oldCellQDelay - newCellQDelay;
+
+                // Q-pin displacement: compute using actual load position
+                Coor curQpin = ff->getNewCoor() + ff->getPinCoor(
+                    "Q" + cf->getPhysicalPinName());
+                Coor newQpin = clusterCoor;
+
+                Coor loadCoor;
+                if(next.outputGate){
+                    loadCoor = next.outputGate->getCoor()
+                             + next.outputGate->getPinCoor(next.pinName);
+                } else {
+                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                             + next.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + next.ff->getPhysicalPinName());
+                }
+                // positive = Q-pin moved closer to load (timing improves)
+                double deltaHpwlQ = HPWL(loadCoor, curQpin)
+                                  - HPWL(loadCoor, newQpin);
+
+                double predNextSlack = nextCurSlack + qDelayBenefit
+                                     + mgr.DisplacementDelay * deltaHpwlQ;
+                oldTNS += std::max(0.0, -nextCurSlack);
+                newTNS += std::max(0.0, -predNextSlack);
+            }
         }
     }
-    costOptimize -= mgr.alpha * increaseTNS;
-    if(slackW > 0) costOptimize -= mgr.alpha * slackW * slackOvershoot;
-    // if(costOptimize > -100 && costOptimize < 0) std::cout << costOptimize << std::endl;
+
+    double deltaTNS = newTNS - oldTNS; // positive = TNS worsened
+    costOptimize -= mgr.alpha * deltaTNS;
     return costOptimize;
 }
 
