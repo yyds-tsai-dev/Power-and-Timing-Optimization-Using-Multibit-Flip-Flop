@@ -3,8 +3,215 @@
 #include <omp.h>
 #include <chrono>
 #include <unordered_set>
+#include <random>
 #include <lemon/smart_graph.h>
 #include <lemon/matching.h>
+
+namespace {
+// P4 Defer-and-Batch shared types (used by both 2-bit and HB commit paths).
+struct MatchCandidate {
+    std::vector<FF*> ffs;
+    Coor   fpTarget;
+    Cell*  cell = nullptr;
+    double D1 = DBL_MAX;
+    double D2 = DBL_MAX;
+    Coor   coord = Coor(DBL_MAX, DBL_MAX);
+    double sscore = -DBL_MAX;
+    double minSlack = DBL_MAX;
+    double laTermVal = 0.0;
+    std::string sortKey;
+};
+inline double sigmoid01(double z){
+    if(z >  35.0) return 1.0;
+    if(z < -35.0) return 0.0;
+    return 1.0 / (1.0 + std::exp(-z));
+}
+
+// Median of FF getNewCoor() per-dim (L1-optimal target for HPWL/cost center).
+inline Coor medianFFCoor(const std::vector<FF*>& ffs){
+    if(ffs.empty()) return Coor(0.0, 0.0);
+    std::vector<double> xs, ys;
+    xs.reserve(ffs.size()); ys.reserve(ffs.size());
+    for(FF* f : ffs){
+        xs.push_back(f->getNewCoor().x);
+        ys.push_back(f->getNewCoor().y);
+    }
+    std::sort(xs.begin(), xs.end());
+    std::sort(ys.begin(), ys.end());
+    return Coor(xs[xs.size()/2], ys[ys.size()/2]);
+}
+
+inline std::string deriveSortKey(const std::vector<FF*>& ffs){
+    std::string k;
+    for(FF* f : ffs){
+        const std::string& n = f->getInstanceName();
+        if(k.empty() || n < k) k = n;
+    }
+    return k;
+}
+
+// P4 SA (Path B / Blossom + SA): takes candidates collected & scored by the
+// defer-and-batch loop and explores 2-bit <-> 4-bit repartitions via Metropolis
+// moves. The evaluator is Banking::CostCompare, which (when
+// COSTCOMPARE_DOWNSTREAM=1) already includes option (ii)'s 1-hop downstream
+// margin term — so hc02-class slack-tight cases naturally reject promotes,
+// tc2-class slack-slack cases allow them. Operators: swap (same-cell FF
+// exchange between two candidates), promote (2-bit + 2-bit -> 4-bit), demote
+// (4-bit -> 2-bit + 2-bit, HPWL-shortest split). Produces new/modified
+// candidates whose sscore is stale; caller must re-score after return.
+void runP4SA(Banking& banking, Manager& mgr, std::vector<MatchCandidate>& cands){
+    long long iters = std::max<long long>(2000LL, (long long)cands.size() * 4);
+    double T0 = 1000.0;
+    double alpha = 0.995;
+    uint64_t seed = 42;
+    if(const char* e = std::getenv("ALG1_SA_ITERS")) iters = std::atoll(e);
+    if(const char* e = std::getenv("ALG1_SA_T0"))    T0 = std::atof(e);
+    if(const char* e = std::getenv("ALG1_SA_ALPHA")) alpha = std::atof(e);
+    if(const char* e = std::getenv("ALG1_SA_SEED"))  seed = (uint64_t)std::atoll(e);
+
+    Cell* cell2 = nullptr;
+    Cell* cell4 = nullptr;
+    auto it2 = mgr.Bit_FF_Map.find(2);
+    if(it2 != mgr.Bit_FF_Map.end() && !it2->second.empty()) cell2 = it2->second[0];
+    auto it4 = mgr.Bit_FF_Map.find(4);
+    if(it4 != mgr.Bit_FF_Map.end() && !it4->second.empty()) cell4 = it4->second[0];
+
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+
+    // Initialize realGain vector (CostCompare at fpTarget for each candidate).
+    std::vector<double> gain(cands.size(), -DBL_MAX);
+    for(size_t i = 0; i < cands.size(); i++){
+        if(cands[i].ffs.empty()) continue;
+        gain[i] = banking.CostCompare(cands[i].fpTarget, cands[i].cell, cands[i].ffs);
+    }
+
+    int n_swap_t=0, n_swap_a=0, n_prom_t=0, n_prom_a=0, n_dem_t=0, n_dem_a=0;
+    double T = T0;
+    auto accept = [&](double delta){
+        if(delta > 0) return true;
+        if(T <= 0) return false;
+        return u01(rng) < std::exp(delta / T);
+    };
+
+    for(long long it = 0; it < iters; it++){
+        if(cands.size() < 2){ T *= alpha; continue; }
+        int op = (int)(rng() % 3);
+
+        if(op == 0){
+            // SWAP: same-cell candidates exchange one FF each.
+            size_t a = (size_t)(rng() % cands.size());
+            size_t b = (size_t)(rng() % cands.size());
+            if(a == b || cands[a].ffs.empty() || cands[b].ffs.empty() ||
+               cands[a].cell != cands[b].cell){ T *= alpha; continue; }
+            size_t fai = (size_t)(rng() % cands[a].ffs.size());
+            size_t fbi = (size_t)(rng() % cands[b].ffs.size());
+            std::vector<FF*> newA = cands[a].ffs;
+            std::vector<FF*> newB = cands[b].ffs;
+            std::swap(newA[fai], newB[fbi]);
+            Coor fpA = medianFFCoor(newA);
+            Coor fpB = medianFFCoor(newB);
+            double gA = banking.CostCompare(fpA, cands[a].cell, newA);
+            double gB = banking.CostCompare(fpB, cands[b].cell, newB);
+            double delta = (gA + gB) - (gain[a] + gain[b]);
+            n_swap_t++;
+            if(accept(delta)){
+                cands[a].ffs = std::move(newA); cands[a].fpTarget = fpA;
+                cands[a].sortKey = deriveSortKey(cands[a].ffs); gain[a] = gA;
+                cands[b].ffs = std::move(newB); cands[b].fpTarget = fpB;
+                cands[b].sortKey = deriveSortKey(cands[b].ffs); gain[b] = gB;
+                n_swap_a++;
+            }
+        } else if(op == 1){
+            // PROMOTE: two 2-bit candidates -> one 4-bit.
+            if(!cell2 || !cell4){ T *= alpha; continue; }
+            size_t a = (size_t)(rng() % cands.size());
+            size_t b = (size_t)(rng() % cands.size());
+            if(a == b){ T *= alpha; continue; }
+            if(cands[a].cell != cell2 || cands[b].cell != cell2 ||
+               cands[a].ffs.size() != 2 || cands[b].ffs.size() != 2){
+                T *= alpha; continue;
+            }
+            std::vector<FF*> merged;
+            merged.reserve(4);
+            for(FF* f : cands[a].ffs) merged.push_back(f);
+            for(FF* f : cands[b].ffs) merged.push_back(f);
+            Coor fp = medianFFCoor(merged);
+            double gNew = banking.CostCompare(fp, cell4, merged);
+            double delta = gNew - (gain[a] + gain[b]);
+            n_prom_t++;
+            if(accept(delta)){
+                cands[a].cell = cell4;
+                cands[a].ffs = std::move(merged);
+                cands[a].fpTarget = fp;
+                cands[a].sortKey = deriveSortKey(cands[a].ffs);
+                gain[a] = gNew;
+                cands[b].ffs.clear();      // tombstone; erased post-loop
+                cands[b].sscore = -DBL_MAX;
+                gain[b] = -DBL_MAX;
+                n_prom_a++;
+            }
+        } else {
+            // DEMOTE: one 4-bit -> two 2-bit (shortest-HPWL split).
+            if(!cell2 || !cell4){ T *= alpha; continue; }
+            size_t a = (size_t)(rng() % cands.size());
+            if(cands[a].cell != cell4 || cands[a].ffs.size() != 4){
+                T *= alpha; continue;
+            }
+            FF* f0 = cands[a].ffs[0]; FF* f1 = cands[a].ffs[1];
+            FF* f2 = cands[a].ffs[2]; FF* f3 = cands[a].ffs[3];
+            double d01 = HPWL(f0->getNewCoor(), f1->getNewCoor())
+                       + HPWL(f2->getNewCoor(), f3->getNewCoor());
+            double d02 = HPWL(f0->getNewCoor(), f2->getNewCoor())
+                       + HPWL(f1->getNewCoor(), f3->getNewCoor());
+            double d03 = HPWL(f0->getNewCoor(), f3->getNewCoor())
+                       + HPWL(f1->getNewCoor(), f2->getNewCoor());
+            std::vector<FF*> pa, pb;
+            if(d01 <= d02 && d01 <= d03){ pa = {f0,f1}; pb = {f2,f3}; }
+            else if(d02 <= d03){            pa = {f0,f2}; pb = {f1,f3}; }
+            else {                          pa = {f0,f3}; pb = {f1,f2}; }
+            Coor fpa = medianFFCoor(pa);
+            Coor fpb = medianFFCoor(pb);
+            double ga = banking.CostCompare(fpa, cell2, pa);
+            double gb = banking.CostCompare(fpb, cell2, pb);
+            double delta = (ga + gb) - gain[a];
+            n_dem_t++;
+            if(accept(delta)){
+                cands[a].cell = cell2;
+                cands[a].ffs = std::move(pa);
+                cands[a].fpTarget = fpa;
+                cands[a].sortKey = deriveSortKey(cands[a].ffs);
+                gain[a] = ga;
+                MatchCandidate nb;
+                nb.ffs = std::move(pb);
+                nb.fpTarget = fpb;
+                nb.cell = cell2;
+                nb.sortKey = deriveSortKey(nb.ffs);
+                cands.push_back(std::move(nb));
+                gain.push_back(gb);
+                n_dem_a++;
+            }
+        }
+        T *= alpha;
+    }
+
+    // Compact out promoted-away tombstones.
+    size_t before = cands.size();
+    std::vector<MatchCandidate> kept;
+    kept.reserve(cands.size());
+    for(auto& c : cands){
+        if(!c.ffs.empty()) kept.push_back(std::move(c));
+    }
+    cands = std::move(kept);
+
+    std::cerr << "[ALG1_SA] swap " << n_swap_a << "/" << n_swap_t
+              << " promote " << n_prom_a << "/" << n_prom_t
+              << " demote " << n_dem_a << "/" << n_dem_t
+              << " cands " << before << "->" << cands.size()
+              << " final_T=" << T
+              << " iters=" << iters << "\n";
+}
+} // anonymous namespace
 
 Banking::Banking(Manager& mgr) : mgr(mgr){
     for(const auto &bitLib : mgr.Bit_FF_Map){
@@ -125,11 +332,16 @@ void Banking::sortFFs(std::vector<std::pair<int, double>> &nearFFs){
 }
 
 void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
-                            const Coor& placeCoor, double& oldTNS, double& newTNS){
+                            const Coor& placeCoor, double& oldTNS, double& newTNS,
+                            double* downstreamMargin){
     // Per-pin TNS calculation: compute actual per-constituent-FF slack change
     // using driver/load positions and the max(0, -slack) TNS filter.
+    // If downstreamMargin != nullptr, also accumulate positive-slack margin
+    // erosion on 1-hop downstream FFs (the piece the TNS filter misses when
+    // slack stays >= 0 but shrinks). This is option (ii) in the HB diagnosis.
     oldTNS = 0;
     newTNS = 0;
+    if(downstreamMargin) *downstreamMargin = 0;
     size_t flatIdx = 0; // slot index into target cell's pin layout
 
     for(size_t i = 0; i < FFToBank.size(); i++){
@@ -203,6 +415,18 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
                                      + mgr.DisplacementDelay * deltaHpwlQ;
                 oldTNS += std::max(0.0, -nextCurSlack);
                 newTNS += std::max(0.0, -predNextSlack);
+
+                // Option (ii): downstream margin erosion (positive slack shrinking).
+                // TNS-delta above captures cross-zero and further-negative cases but
+                // is blind when both old and pred are positive (slack=1.0 -> 0.3 is
+                // invisible). This term fills that gap: min(oldSlack, oldSlack-pred)
+                // counts positive margin lost, capped at oldSlack (the reserve we
+                // actually had). Skipped when oldSlack<=0 (already in TNS regime).
+                if(downstreamMargin && nextCurSlack > 0.0){
+                    double loss = std::min(nextCurSlack,
+                                           nextCurSlack - predNextSlack);
+                    if(loss > 0.0) *downstreamMargin += loss;
+                }
             }
 
             flatIdx++;
@@ -220,11 +444,22 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
     }
     costOptimize -= mgr.beta * (chooseCell->getGatePower()) + mgr.gamma * (chooseCell->getArea());
 
-    // --- Per-pin TNS ---
-    double oldTNS = 0, newTNS = 0;
-    computePinTNS(FFToBank, chooseCell, clusterCoor, oldTNS, newTNS);
+    // Option (ii) gate, read once. Gamma scales the α-weighted penalty on
+    // downstream positive-slack margin erosion. 0 = disabled (byte-exact fallback).
+    static const double downGamma = [](){
+        const char* en = std::getenv("COSTCOMPARE_DOWNSTREAM");
+        if(!en || std::string(en) == "0") return 0.0;
+        const char* g = std::getenv("COSTCOMPARE_DOWN_GAMMA");
+        return g ? std::atof(g) : 0.5;
+    }();
+
+    // --- Per-pin TNS (+ optional downstream margin) ---
+    double oldTNS = 0, newTNS = 0, downMargin = 0;
+    double* downPtr = (downGamma > 0.0) ? &downMargin : nullptr;
+    computePinTNS(FFToBank, chooseCell, clusterCoor, oldTNS, newTNS, downPtr);
     double deltaTNS = newTNS - oldTNS; // positive = TNS worsened
     costOptimize -= mgr.alpha * deltaTNS;
+    if(downPtr) costOptimize -= downGamma * mgr.alpha * downMargin;
     return costOptimize;
 }
 
@@ -944,13 +1179,19 @@ void Banking::doMatchingClustering(){
     // Default OFF (bit-exact fallback when unset). ALG1_C5=0 disables N3 lookahead
     // (NTU-faithful baseline).
     bool alg1_2b = false;
+    bool alg1_hb = false;
+    bool alg1_sa = false;
     double alg1_c3 = 0.0, alg1_c4 = 1.0, alg1_c5 = 0.0, alg1_c6 = 1.0;
     int alg1_lookaheadK = 4;
     {
         const char* envA = std::getenv("ALG1_2B");
         if(envA && std::string(envA) != "0") alg1_2b = true;
+        const char* envH = std::getenv("ALG1_HB");
+        if(envH && std::string(envH) != "0") alg1_hb = true;
+        const char* envS = std::getenv("ALG1_SA");
+        if(envS && std::string(envS) != "0") alg1_sa = true;
     }
-    if(alg1_2b){
+    if(alg1_2b || alg1_hb){
         // Adaptive coefficients derived from 1-bit FF slack distribution across
         // the full design. Computed once per banking entry (cheap: ~20K sort).
         std::vector<double> slacksAll;
@@ -987,7 +1228,9 @@ void Banking::doMatchingClustering(){
         if(const char* e = std::getenv("ALG1_C5")) alg1_c5 = std::atof(e);
         if(const char* e = std::getenv("ALG1_C6")) alg1_c6 = std::atof(e);
         if(const char* e = std::getenv("ALG1_LOOKAHEAD_K")) alg1_lookaheadK = std::atoi(e);
-        std::cerr << "[ALG1_2B] adaptive c3=" << alg1_c3 << " c4=" << alg1_c4
+        std::cerr << "[ALG1] 2b=" << alg1_2b << " hb=" << alg1_hb
+                  << " sa=" << alg1_sa
+                  << " adaptive c3=" << alg1_c3 << " c4=" << alg1_c4
                   << " c5=" << alg1_c5 << " c6=" << alg1_c6
                   << " lookaheadK=" << alg1_lookaheadK
                   << " (p10=" << p10 << " p50=" << p50 << " p90=" << p90
@@ -1007,6 +1250,17 @@ void Banking::doMatchingClustering(){
     double alg1_pass2_ms = 0, alg1_pass3_ms = 0;
     double alg1_avg_score_sum = 0;
     double alg1_max_score = -DBL_MAX, alg1_min_score = DBL_MAX;
+
+    // P4 HB aggregate counters (accumulated across HB targetBit phases).
+    int alg1_hb_cands_total = 0;
+    int alg1_hb_scored_total = 0;
+    int alg1_hb_no_slot_total = 0;
+    int alg1_hb_committed_total = 0;
+    int alg1_hb_dropped_after_priority_total = 0;
+    int alg1_hb_dropped_cost_total = 0;
+    int alg1_hb_dropped_margin_total = 0;
+    int alg1_hb_lookahead_dominant_total = 0;
+    double alg1_hb_pass2_ms = 0, alg1_hb_pass3_ms = 0;
 
     // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
     // so dist * distScale ≈ 1.0 for a typical neighbor distance
@@ -1228,24 +1482,9 @@ void Banking::doMatchingClustering(){
             // Pass 1 collects matched pairs as MatchCandidates. Pass 2 scores
             // each via S_space + N3 lookahead using a read-only top-2 legal
             // probe (no row mutation). Pass 3 sorts descending and re-FindPlace
-            // -commits each in priority order.
-            struct MatchCandidate {
-                std::vector<FF*> ffs;
-                Coor fpTarget;
-                Cell* cell;
-                double D1 = DBL_MAX;
-                double D2 = DBL_MAX;
-                Coor  coord = Coor(DBL_MAX, DBL_MAX);
-                double sscore = -DBL_MAX;
-                double minSlack = DBL_MAX;
-                double laTermVal = 0.0;
-                std::string sortKey;
-            };
-            auto sigmoid01 = [](double z) -> double {
-                if(z > 35.0) return 1.0;
-                if(z < -35.0) return 0.0;
-                return 1.0 / (1.0 + std::exp(-z));
-            };
+            // -commits each in priority order. MatchCandidate / sigmoid01 are
+            // defined in the anonymous namespace at the top of this TU and
+            // shared with the HB defer-and-batch path below.
 
             // Pass 1: collect matched pairs
             std::vector<MatchCandidate> cands;
@@ -1281,15 +1520,13 @@ void Banking::doMatchingClustering(){
             }
 
             // Pass 2: score via NTU S_space (self slack) + N3 fanout lookahead.
-            auto tp2 = tic();
-            int local_no_slot = 0;
-            int local_lookahead_dominant = 0;
-            for(auto &c : cands){
+            // Extracted to a per-candidate lambda so it can be re-run after SA
+            // mutates cands. Returns true if the candidate found any legal slot.
+            auto scoreOne = [&](MatchCandidate& c) -> bool {
                 auto top2 = mgr.legalizer->FindTop2LegalCoors(c.fpTarget, c.cell);
                 if(top2.empty()){
                     c.sscore = -DBL_MAX;
-                    local_no_slot++;
-                    continue;
+                    return false;
                 }
                 c.D1 = top2[0].disp;
                 c.coord = top2[0].coor;
@@ -1325,8 +1562,35 @@ void Banking::doMatchingClustering(){
                 }
                 c.laTermVal = laTerm;
                 c.sscore = (c.D2 - c.D1) + selfTerm + laTerm;
+                return true;
+            };
+
+            auto tp2 = tic();
+            int local_no_slot = 0;
+            int local_lookahead_dominant = 0;
+            for(auto &c : cands){
+                if(!scoreOne(c)) local_no_slot++;
             }
             double t_pass2 = ms_fn(tp2, tic());
+
+            // Pass 2.5 (optional): SA explores 2-bit <-> 4-bit repartitions on
+            // top of the Blossom solution. Runs only when ALG1_SA=1. Uses
+            // CostCompare as evaluator — so COSTCOMPARE_DOWNSTREAM=1 (option ii)
+            // is the recommended companion: downstream-aware cost governs
+            // which promotes survive in slack-tight vs slack-slack regions.
+            // After SA, cands composition is changed (size, ffs, cell,
+            // fpTarget) so we re-run scoreOne to refresh sscore/D1/D2 before
+            // the Pass 3 priority sort.
+            if(alg1_sa){
+                auto tsa = tic();
+                runP4SA(*this, mgr, cands);
+                local_no_slot = 0;
+                for(auto &c : cands){
+                    if(!scoreOne(c)) local_no_slot++;
+                }
+                double t_sa = ms_fn(tsa, tic());
+                std::cerr << "[ALG1_SA] pass2.5_ms=" << t_sa << "\n";
+            }
 
             // Count how many candidates would move relative rank by >= 1 vs
             // c5=0 ordering. Cheap approximation: if laTerm exceeds half of
@@ -1790,113 +2054,320 @@ void Banking::doMatchingClustering(){
                 std::vector<bool> committed_hb(localFFs.size(), false);
                 hb_matched = 0;
 
-                for(size_t i = 0; i < localFFs.size(); i++){
-                    if(committed_hb[i]) continue;
-                    lemon::SmartGraph::Node mate = mwm_hb.mate(gnodes_hb[i]);
-                    if(mate == lemon::INVALID) continue;
-                    int j = nodeIdx_hb[mate];
-                    if(j < 0 || committed_hb[j]) continue;
-                    hb_matched++;
+                if(alg1_hb){
+                    // P4 HB: defer-and-batch (NTU Algorithm 1, k>=4 path).
+                    // Pass 1 collects matched HB pairs as MatchCandidates.
+                    // Pass 2 scores via S_space + N3 lookahead (read-only Top2).
+                    // Pass 3 sorts descending and re-commits in priority order,
+                    // breaking the 4-bit cascade where one bad commit poisons
+                    // downstream eager-loop placements (root cause of the
+                    // MATCH_HIGHER_BIT +254% regression on hc02).
+                    std::vector<MatchCandidate> hb_cands;
+                    hb_cands.reserve(localFFs.size() / 2);
+                    for(size_t i = 0; i < localFFs.size(); i++){
+                        if(committed_hb[i]) continue;
+                        lemon::SmartGraph::Node mate = mwm_hb.mate(gnodes_hb[i]);
+                        if(mate == lemon::INVALID) continue;
+                        int j = nodeIdx_hb[mate];
+                        if(j < 0 || committed_hb[j]) continue;
+                        hb_matched++;
 
-                    FF* ffA = localFFs[i];
-                    FF* ffB = localFFs[j];
-                    std::vector<FF*> pair_ffs = {ffA, ffB};
-
-                    Coor fpTarget;
-                    if(spaceAware){
-                        auto it = spaceMap_hb.find(pairKey_hb(i, j));
-                        if(it != spaceMap_hb.end())
-                            fpTarget = it->second;
-                        else
-                            fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
-                                            (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
-                    } else if(useV21){
-                        auto it = optPMap_hb.find(pairKey_hb(i, j));
-                        if(it != optPMap_hb.end())
-                            fpTarget = it->second;
-                        else
-                            fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
-                                            (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
-                    } else {
-                        fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
-                                        (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
-                    }
-                    // Re-validate: space may have been consumed by earlier commits
-                    Coor placeCoor = mgr.legalizer->FindNearestLegalSpace(
-                        fpTarget, chooseCell, avgNN_hb);
-                    if(placeCoor.x == DBL_MAX)
-                        placeCoor = mgr.legalizer->FindPlace(fpTarget, chooseCell);
-                    if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
-                        hb_dropped_place++;
-                        continue;
-                    }
-
-                    double realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
-                    if(realGain < 0){
-                        hb_dropped_cost++;
-                        continue;
-                    }
-                    if(safetyMargin > 0.0 && realGain < safetyMargin){
-                        hb_dropped_by_margin++;
-                        continue;
+                        FF* ffA = localFFs[i];
+                        FF* ffB = localFFs[j];
+                        MatchCandidate mc;
+                        mc.ffs = {ffA, ffB};
+                        mc.cell = chooseCell;
+                        if(spaceAware){
+                            auto it = spaceMap_hb.find(pairKey_hb(i, j));
+                            mc.fpTarget = (it != spaceMap_hb.end()) ? it->second :
+                                Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                     (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        } else if(useV21){
+                            auto it = optPMap_hb.find(pairKey_hb(i, j));
+                            mc.fpTarget = (it != optPMap_hb.end()) ? it->second :
+                                Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                     (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        } else {
+                            mc.fpTarget = Coor(
+                                (ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        }
+                        mc.sortKey = (ffA->getInstanceName() < ffB->getInstanceName())
+                                     ? ffA->getInstanceName() : ffB->getInstanceName();
+                        committed_hb[i] = true;
+                        committed_hb[j] = true;
+                        hb_cands.push_back(std::move(mc));
                     }
 
-                    // Diagnostic: compute per-constituent displacement
-                    double maxCFDisp = 0;
-                    double sumCFDisp = 0;
-                    int nCFs = 0;
-                    for(FF* mbff : pair_ffs){
-                        for(auto& cf : mbff->getClusterFF()){
-                            FF* phys = cf->getPhysicalFF();
-                            Coor cfPos = phys ? phys->getNewCoor() : cf->getNewCoor();
-                            double d = HPWL(cfPos, placeCoor);
-                            sumCFDisp += d;
-                            maxCFDisp = std::max(maxCFDisp, d);
-                            nCFs++;
+                    // Pass 2: score
+                    auto thp2 = tic();
+                    int hb_local_no_slot = 0;
+                    int hb_local_la_dom = 0;
+                    for(auto &c : hb_cands){
+                        auto top2 = mgr.legalizer->FindTop2LegalCoors(c.fpTarget, c.cell);
+                        if(top2.empty()){
+                            c.sscore = -DBL_MAX;
+                            hb_local_no_slot++;
+                            continue;
+                        }
+                        c.D1 = top2[0].disp;
+                        c.coord = top2[0].coor;
+                        c.D2 = (top2.size() >= 2) ? top2[1].disp : (c.D1 + 1e6);
+
+                        double slackI = DBL_MAX;
+                        for(FF* f : c.ffs){
+                            double s;
+                            try { s = f->getTimingSlack("D"); }
+                            catch (...) { continue; }
+                            if(s < slackI) slackI = s;
+                        }
+                        if(slackI == DBL_MAX) slackI = 0.0;
+                        c.minSlack = slackI;
+                        double selfTerm = alg1_c3 * sigmoid01(-slackI / alg1_c4);
+                        double laTerm = 0.0;
+                        if(alg1_c5 > 0){
+                            int laN = 0;
+                            for(FF* f : c.ffs){
+                                for(const NextStage &ns : f->getNextStage()){
+                                    if(ns.ff && laN < alg1_lookaheadK){
+                                        double sns;
+                                        try { sns = ns.ff->getTimingSlack("D"); }
+                                        catch (...) { laN++; continue; }
+                                        laTerm += sigmoid01(-sns / alg1_c6);
+                                        laN++;
+                                    }
+                                }
+                            }
+                            laTerm *= alg1_c5;
+                        }
+                        c.laTermVal = laTerm;
+                        c.sscore = (c.D2 - c.D1) + selfTerm + laTerm;
+                    }
+                    double th_pass2 = ms_fn(thp2, tic());
+
+                    // lookahead-dominant heuristic (mirror 2-bit logic)
+                    {
+                        std::vector<double> absScores;
+                        absScores.reserve(hb_cands.size());
+                        for(const auto& c : hb_cands){
+                            if(c.sscore > -DBL_MAX / 2)
+                                absScores.push_back(std::abs(c.sscore - c.laTermVal));
+                        }
+                        double medAbs = 1e-9;
+                        if(!absScores.empty()){
+                            std::sort(absScores.begin(), absScores.end());
+                            medAbs = absScores[absScores.size() / 2];
+                        }
+                        for(const auto& c : hb_cands){
+                            if(c.laTermVal > 0.5 * std::max(medAbs, 1e-9))
+                                hb_local_la_dom++;
                         }
                     }
-                    hb_sumDisp += sumCFDisp;
-                    hb_maxDisp = std::max(hb_maxDisp, maxCFDisp);
-                    hb_nCFs += nCFs;
 
-                    // Diagnostic: cost component breakdown
-                    double powerSav = 0, areaSav = 0;
-                    for(FF* ff : pair_ffs){
-                        powerSav += mgr.beta * ff->getCell()->getGatePower();
-                        areaSav += mgr.gamma * ff->getCell()->getArea();
-                    }
-                    powerSav -= mgr.beta * chooseCell->getGatePower();
-                    areaSav -= mgr.gamma * chooseCell->getArea();
-                    double oldTNS_d = 0, newTNS_d = 0;
-                    computePinTNS(pair_ffs, chooseCell, placeCoor, oldTNS_d, newTNS_d);
-                    double tnsCost = mgr.alpha * (newTNS_d - oldTNS_d);
-                    hb_sumPowerSav += powerSav;
-                    hb_sumAreaSav += areaSav;
-                    hb_sumTNSCost += tnsCost;
+                    std::sort(hb_cands.begin(), hb_cands.end(),
+                        [](const MatchCandidate& a, const MatchCandidate& b){
+                            if(a.sscore != b.sscore) return a.sscore > b.sscore;
+                            return a.sortKey < b.sortKey;
+                        });
 
-                    // Step 5: capture logical 1-bit constituents BEFORE bankFF
-                    // clears pair_ffs wrappers. Flatten each wrapper's
-                    // clusterFF (may be empty for a fresh 1-bit).
-                    std::vector<FF*> hb_constituents;
-                    if(slackRelease){
-                        for(FF* pf : pair_ffs){
-                            auto& cfs = pf->getClusterFF();
-                            if(cfs.empty()) hb_constituents.push_back(pf);
-                            else for(FF* cf : cfs) if(cf) hb_constituents.push_back(cf);
+                    // Pass 3: commit in priority order. Mirror legacy fallback
+                    // chain: FindNearestLegalSpace first, then FindPlace.
+                    auto thp3 = tic();
+                    int hb_local_dropped_after = 0;
+                    int hb_local_scored = 0;
+                    for(auto &c : hb_cands){
+                        if(c.sscore > -DBL_MAX / 2) hb_local_scored++;
+                        if(c.sscore == -DBL_MAX) continue;
+
+                        Coor placeCoor = mgr.legalizer->FindNearestLegalSpace(
+                            c.fpTarget, c.cell, avgNN_hb);
+                        if(placeCoor.x == DBL_MAX)
+                            placeCoor = mgr.legalizer->FindPlace(c.fpTarget, c.cell);
+                        if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                            hb_local_dropped_after++;
+                            hb_dropped_place++;
+                            continue;
                         }
+
+                        double realGain = CostCompare(placeCoor, c.cell, c.ffs);
+                        if(realGain < 0){
+                            hb_dropped_cost++;
+                            continue;
+                        }
+                        if(safetyMargin > 0.0 && realGain < safetyMargin){
+                            hb_dropped_by_margin++;
+                            continue;
+                        }
+
+                        // Diagnostic: per-constituent displacement
+                        double maxCFDisp = 0, sumCFDisp = 0; int nCFs = 0;
+                        for(FF* mbff : c.ffs){
+                            for(auto& cf : mbff->getClusterFF()){
+                                FF* phys = cf->getPhysicalFF();
+                                Coor cfPos = phys ? phys->getNewCoor() : cf->getNewCoor();
+                                double d = HPWL(cfPos, placeCoor);
+                                sumCFDisp += d;
+                                maxCFDisp = std::max(maxCFDisp, d);
+                                nCFs++;
+                            }
+                        }
+                        hb_sumDisp += sumCFDisp;
+                        hb_maxDisp = std::max(hb_maxDisp, maxCFDisp);
+                        hb_nCFs += nCFs;
+
+                        double powerSav = 0, areaSav = 0;
+                        for(FF* ff : c.ffs){
+                            powerSav += mgr.beta * ff->getCell()->getGatePower();
+                            areaSav += mgr.gamma * ff->getCell()->getArea();
+                        }
+                        powerSav -= mgr.beta * c.cell->getGatePower();
+                        areaSav -= mgr.gamma * c.cell->getArea();
+                        double oldTNS_d = 0, newTNS_d = 0;
+                        computePinTNS(c.ffs, c.cell, placeCoor, oldTNS_d, newTNS_d);
+                        double tnsCost = mgr.alpha * (newTNS_d - oldTNS_d);
+                        hb_sumPowerSav += powerSav;
+                        hb_sumAreaSav += areaSav;
+                        hb_sumTNSCost += tnsCost;
+
+                        std::vector<FF*> hb_constituents;
+                        if(slackRelease){
+                            for(FF* pf : c.ffs){
+                                auto& cfs = pf->getClusterFF();
+                                if(cfs.empty()) hb_constituents.push_back(pf);
+                                else for(FF* cf : cfs) if(cf) hb_constituents.push_back(cf);
+                            }
+                        }
+
+                        FF* newFF = mgr.bankFF(placeCoor, c.cell, c.ffs);
+                        mgr.legalizer->UpdateRows(newFF);
+                        newFF->setIsLegalize(true);
+
+                        if(slackRelease)
+                            releaseSlackAfterCommit(newFF, hb_constituents);
+
+                        clusterTotalNum++;
+                        hb_committed++;
                     }
+                    double th_pass3 = ms_fn(thp3, tic());
 
-                    FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
-                    mgr.legalizer->UpdateRows(newFF);
-                    newFF->setIsLegalize(true);
+                    alg1_hb_cands_total += (int)hb_cands.size();
+                    alg1_hb_scored_total += hb_local_scored;
+                    alg1_hb_no_slot_total += hb_local_no_slot;
+                    alg1_hb_committed_total += hb_committed;
+                    alg1_hb_dropped_after_priority_total += hb_local_dropped_after;
+                    alg1_hb_dropped_cost_total += hb_dropped_cost;
+                    alg1_hb_dropped_margin_total += hb_dropped_by_margin;
+                    alg1_hb_lookahead_dominant_total += hb_local_la_dom;
+                    alg1_hb_pass2_ms += th_pass2;
+                    alg1_hb_pass3_ms += th_pass3;
+                } else {
+                    // Legacy eager HB commit (bit-exact to pre-P4 production).
+                    for(size_t i = 0; i < localFFs.size(); i++){
+                        if(committed_hb[i]) continue;
+                        lemon::SmartGraph::Node mate = mwm_hb.mate(gnodes_hb[i]);
+                        if(mate == lemon::INVALID) continue;
+                        int j = nodeIdx_hb[mate];
+                        if(j < 0 || committed_hb[j]) continue;
+                        hb_matched++;
 
-                    if(slackRelease)
-                        releaseSlackAfterCommit(newFF, hb_constituents);
+                        FF* ffA = localFFs[i];
+                        FF* ffB = localFFs[j];
+                        std::vector<FF*> pair_ffs = {ffA, ffB};
 
-                    committed_hb[i] = true;
-                    committed_hb[j] = true;
-                    clusterTotalNum++;
-                    hb_committed++;
+                        Coor fpTarget;
+                        if(spaceAware){
+                            auto it = spaceMap_hb.find(pairKey_hb(i, j));
+                            if(it != spaceMap_hb.end())
+                                fpTarget = it->second;
+                            else
+                                fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                                (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        } else if(useV21){
+                            auto it = optPMap_hb.find(pairKey_hb(i, j));
+                            if(it != optPMap_hb.end())
+                                fpTarget = it->second;
+                            else
+                                fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                                (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        } else {
+                            fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                            (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        }
+                        // Re-validate: space may have been consumed by earlier commits
+                        Coor placeCoor = mgr.legalizer->FindNearestLegalSpace(
+                            fpTarget, chooseCell, avgNN_hb);
+                        if(placeCoor.x == DBL_MAX)
+                            placeCoor = mgr.legalizer->FindPlace(fpTarget, chooseCell);
+                        if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                            hb_dropped_place++;
+                            continue;
+                        }
+
+                        double realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
+                        if(realGain < 0){
+                            hb_dropped_cost++;
+                            continue;
+                        }
+                        if(safetyMargin > 0.0 && realGain < safetyMargin){
+                            hb_dropped_by_margin++;
+                            continue;
+                        }
+
+                        // Diagnostic: compute per-constituent displacement
+                        double maxCFDisp = 0;
+                        double sumCFDisp = 0;
+                        int nCFs = 0;
+                        for(FF* mbff : pair_ffs){
+                            for(auto& cf : mbff->getClusterFF()){
+                                FF* phys = cf->getPhysicalFF();
+                                Coor cfPos = phys ? phys->getNewCoor() : cf->getNewCoor();
+                                double d = HPWL(cfPos, placeCoor);
+                                sumCFDisp += d;
+                                maxCFDisp = std::max(maxCFDisp, d);
+                                nCFs++;
+                            }
+                        }
+                        hb_sumDisp += sumCFDisp;
+                        hb_maxDisp = std::max(hb_maxDisp, maxCFDisp);
+                        hb_nCFs += nCFs;
+
+                        // Diagnostic: cost component breakdown
+                        double powerSav = 0, areaSav = 0;
+                        for(FF* ff : pair_ffs){
+                            powerSav += mgr.beta * ff->getCell()->getGatePower();
+                            areaSav += mgr.gamma * ff->getCell()->getArea();
+                        }
+                        powerSav -= mgr.beta * chooseCell->getGatePower();
+                        areaSav -= mgr.gamma * chooseCell->getArea();
+                        double oldTNS_d = 0, newTNS_d = 0;
+                        computePinTNS(pair_ffs, chooseCell, placeCoor, oldTNS_d, newTNS_d);
+                        double tnsCost = mgr.alpha * (newTNS_d - oldTNS_d);
+                        hb_sumPowerSav += powerSav;
+                        hb_sumAreaSav += areaSav;
+                        hb_sumTNSCost += tnsCost;
+
+                        // Step 5: capture logical 1-bit constituents BEFORE bankFF
+                        std::vector<FF*> hb_constituents;
+                        if(slackRelease){
+                            for(FF* pf : pair_ffs){
+                                auto& cfs = pf->getClusterFF();
+                                if(cfs.empty()) hb_constituents.push_back(pf);
+                                else for(FF* cf : cfs) if(cf) hb_constituents.push_back(cf);
+                            }
+                        }
+
+                        FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
+                        mgr.legalizer->UpdateRows(newFF);
+                        newFF->setIsLegalize(true);
+
+                        if(slackRelease)
+                            releaseSlackAfterCommit(newFF, hb_constituents);
+
+                        committed_hb[i] = true;
+                        committed_hb[j] = true;
+                        clusterTotalNum++;
+                        hb_committed++;
+                    }
                 }
                 t_commit_hb += ms_fn(tc0, tic());
                 } // end for(auto& localFFs : batches_hb)
@@ -1925,6 +2396,28 @@ void Banking::doMatchingClustering(){
                           << " tnsCost=" << hb_sumTNSCost
                           << " netGain=" << (hb_sumPowerSav + hb_sumAreaSav - hb_sumTNSCost)
                           << std::endl;
+            }
+            if(alg1_hb && alg1_hb_cands_total > 0){
+                std::cerr << "[ALG1_HB] candidates=" << alg1_hb_cands_total
+                          << " scored=" << alg1_hb_scored_total
+                          << " no_slot=" << alg1_hb_no_slot_total
+                          << " committed=" << alg1_hb_committed_total
+                          << " dropped_after_priority=" << alg1_hb_dropped_after_priority_total
+                          << " lookahead_dominant=" << alg1_hb_lookahead_dominant_total
+                          << " pass2_ms=" << alg1_hb_pass2_ms
+                          << " pass3_ms=" << alg1_hb_pass3_ms
+                          << "\n";
+                // Reset HB counters between targetBit phases (4-bit, 8-bit, ...)
+                alg1_hb_cands_total = 0;
+                alg1_hb_scored_total = 0;
+                alg1_hb_no_slot_total = 0;
+                alg1_hb_committed_total = 0;
+                alg1_hb_dropped_after_priority_total = 0;
+                alg1_hb_dropped_cost_total = 0;
+                alg1_hb_dropped_margin_total = 0;
+                alg1_hb_lookahead_dominant_total = 0;
+                alg1_hb_pass2_ms = 0;
+                alg1_hb_pass3_ms = 0;
             }
 
             // Rebuild legalizer to see committed matching results before greedy

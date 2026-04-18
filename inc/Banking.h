@@ -50,7 +50,8 @@ public:
     void restoreUnclusterFFCoor();
     void ClusterResult();
     void computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
-                       const Coor& placeCoor, double& oldTNS, double& newTNS);
+                       const Coor& placeCoor, double& oldTNS, double& newTNS,
+                       double* downstreamMargin = nullptr);
     Coor findWindowOptimal(const std::vector<FF*>& FFToBank, Cell* targetCell,
                            double xlo, double xhi, double ylo, double yhi);
     double CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank);
