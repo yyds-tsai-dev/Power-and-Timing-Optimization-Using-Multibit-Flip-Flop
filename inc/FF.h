@@ -69,6 +69,13 @@ private:
     // equal to the raw D-pin slack (or 0 until computeSlackRedistribution runs).
     // Step 1 populates + logs only; banking still reads raw slack.
     double redistributedSlackD;
+
+    // Method D Step 5: inter-batch slack release credit. Accumulated during
+    // banking commits when an MBFF lands closer to an upstream driver / closer
+    // to a downstream load than the original FF was. Added on top of getSlack()
+    // via getEffectiveSlack() and consumed only by matching edge-weight logic
+    // under SLACK_RELEASE=1. Not part of getSlack() itself.
+    double bankingReleasedSlackD;
 public:
     FF();
     explicit FF(int size);
@@ -94,6 +101,8 @@ public:
     void setFixed(bool fixed);
     void setIsLegalize(bool isLegalize);
     void setRedistributedSlackD(double s);
+    void addBankingReleasedSlackD(double delta);
+    void clearBankingReleasedSlackD();
     // Getter
     double getTimingSlack(const std::string &pinName)const;
     std::vector<FF*>& getClusterFF();
@@ -117,6 +126,8 @@ public:
     bool getFixed()const;
     bool getIsLegalize()const;
     double getRedistributedSlackD()const;
+    double getBankingReleasedSlackD()const;
+    double getEffectiveSlack();   // getSlack() + bankingReleasedSlackD; for matching edge weights only
     std::string getPhysicalPinName();
     std::vector<std::pair<Coor, double>> getCriticalCoor(); // return the relative coor on critical path
     size_t getCriticalSize(); // return the size of all critical path both Q and D pin

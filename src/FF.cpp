@@ -20,7 +20,8 @@ FF::FF() :
     physicalFF(nullptr),
     slot(0),
     fixed(true),
-    redistributedSlackD(0){
+    redistributedSlackD(0),
+    bankingReleasedSlackD(0){
 }
 
 FF::FF(int size) : Instance(), clusterFF(size, nullptr){
@@ -45,6 +46,7 @@ FF::FF(int size) : Instance(), clusterFF(size, nullptr){
     slot = -1;
     fixed = true;
     redistributedSlackD = 0;
+    bankingReleasedSlackD = 0;
 }
 
 FF::~FF(){}
@@ -149,6 +151,22 @@ void FF::setRedistributedSlackD(double s){
 
 double FF::getRedistributedSlackD()const{
     return redistributedSlackD;
+}
+
+void FF::addBankingReleasedSlackD(double delta){
+    bankingReleasedSlackD += delta;
+}
+
+void FF::clearBankingReleasedSlackD(){
+    bankingReleasedSlackD = 0;
+}
+
+double FF::getBankingReleasedSlackD()const{
+    return bankingReleasedSlackD;
+}
+
+double FF::getEffectiveSlack(){
+    return getSlack() + bankingReleasedSlackD;
 }
 
 // Getter

@@ -664,16 +664,50 @@ void Banking::doMatchingClustering(){
     }
     if(slackSigmoid)
         std::cout << "[MATCHING] slack-budget sigmoid enabled (scale=" << slackSigmoidScale << ")" << std::endl;
+
+    // Phase 3Z Step 5: inter-batch slack release. After each banked commit,
+    // credit upstream/downstream FFs with DisplacementDelay*(oldHPWL-newHPWL)
+    // when the MBFF landed closer to them than the original FF was. Credit
+    // lands on FF::bankingReleasedSlackD and is read by getEffectiveSlack()
+    // only under the same gate, so SLACK_RELEASE=0 is byte-exact baseline.
+    bool slackRelease = false;
+    double slackReleaseCap = 2.0;   // cap = slackReleaseCap * |snapshot_raw_slack|; 0 disables cap
+    {
+        const char* envSR = std::getenv("SLACK_RELEASE");
+        if(envSR && std::string(envSR) != "0") slackRelease = true;
+        const char* envSRC = std::getenv("SLACK_RELEASE_CAP");
+        if(envSRC) slackReleaseCap = std::atof(envSRC);
+    }
+    if(slackRelease)
+        std::cout << "[MATCHING] slack release enabled (cap=" << slackReleaseCap << ")" << std::endl;
+
+    // Per-FF raw-slack snapshot used as cap reference. Captured lazily on first
+    // credit. Local to this invocation of doMatchingClustering.
+    std::unordered_map<FF*, double> slackReleaseSnapshot;
+
+    // Counters (reset per phase by caller; see 2-bit and higher-bit phase blocks).
+    int sr_released_edges = 0;
+    int sr_skipped_non_ff = 0;
+    int sr_n_capped = 0;
+    int sr_n_neg_skipped = 0;
+    double sr_sum_released = 0.0;
+    double sr_max_per_ff = 0.0;
+
     // Return minimum dynamic D-pin slack across all constituent FFs of a
     // cluster FF. Using getSlack() on constituents picks up position-dependent
-    // updates as earlier commits move the driver/load pins.
+    // updates as earlier commits move the driver/load pins. Under SLACK_RELEASE
+    // we add bankingReleasedSlackD via getEffectiveSlack so credits from prior
+    // batches influence edge weights.
     auto minDynSlack = [&](FF* a) -> double {
         auto& cfs = a->getClusterFF();
-        if(cfs.empty()) return a->getTimingSlack("D");
+        if(cfs.empty()){
+            double base = a->getTimingSlack("D");
+            return slackRelease ? base + a->getBankingReleasedSlackD() : base;
+        }
         double m = DBL_MAX;
         for(FF* o : cfs){
             if(!o) continue;
-            double s = o->getSlack();
+            double s = slackRelease ? o->getEffectiveSlack() : o->getSlack();
             if(s < m) m = s;
         }
         return m;
@@ -682,6 +716,133 @@ void Banking::doMatchingClustering(){
         if(!slackSigmoid) return 1.0;
         double minSlack = std::min(minDynSlack(a), minDynSlack(b));
         return 1.0 / (1.0 + std::exp(-minSlack / slackSigmoidScale));
+    };
+
+    // releaseSlackAfterCommit: D-side credit only. For each 1-bit constituent f
+    // of the just-banked MBFF, credit the upstream FF whose Q-pin→f-arc just
+    // got shorter. Driver position resolved by: (1) prevStage if it has a
+    // critical-path gate (outputGate stable, use gate output pin), else
+    // (2) prevInstance with cellType==FF (direct FF→FF, use upstream physical
+    // Q pin). Non-FF endpoints (IO drivers, gate-only predecessors with no
+    // carrier FF) are skipped with a counter.
+    //
+    // Q-side credit was removed: moving f shortens arc f.Q→ns.D, but
+    // ns->getSlack() already tracks that via its own D-side HPWL delta
+    // (see FF.cpp:366-395). Crediting ns on top would double-count.
+    //
+    // Credit is capped at slackReleaseCap * |snapshot_raw_slack| per FF
+    // (first-credit snapshot).
+    auto creditOne = [&](FF* target, double delta) {
+        if(!target || delta <= 0) return;
+        auto it = slackReleaseSnapshot.find(target);
+        double snap;
+        if(it == slackReleaseSnapshot.end()){
+            snap = target->getSlack();
+            slackReleaseSnapshot.emplace(target, snap);
+        } else {
+            snap = it->second;
+        }
+        double before = target->getBankingReleasedSlackD();
+        double after = before + delta;
+        if(slackReleaseCap > 0.0){
+            double cap = slackReleaseCap * std::abs(snap);
+            if(after > cap){
+                after = cap;
+                if(after > before) sr_n_capped++;
+                else { sr_n_capped++; return; } // already at cap, skip
+            }
+        }
+        double applied = after - before;
+        if(applied <= 0) return;
+        target->addBankingReleasedSlackD(applied);
+        sr_released_edges++;
+        sr_sum_released += applied;
+        double cur = target->getBankingReleasedSlackD();
+        if(cur > sr_max_per_ff) sr_max_per_ff = cur;
+    };
+    auto releaseSlackAfterCommit = [&](FF* newFF,
+                                       const std::vector<FF*>& constituents) {
+        if(!slackRelease) return;
+        if(!newFF) return;
+        double dd = FF::DisplacementDelay;
+        for(FF* f : constituents){
+            if(!f) continue;
+
+            // New D-pin position inside the banked MBFF. getPhysicalPinName()
+            // returns "" for 1-bit physical, "<slot>" for multi-bit.
+            Coor newDpin = newFF->getNewCoor()
+                           + newFF->getPinCoor("D" + f->getPhysicalPinName());
+
+            // Resolve upstream driver position + credit target.
+            //   Case 1: prevStage populated (critical path through a gate) —
+            //           driver = gate output pin (stable).
+            //   Case 2: prevInstance.cellType == FF (direct FF→FF) —
+            //           driver = upstream physical Q pin (current MBFF pos).
+            //   Case 3: IO / gate-only predecessor — no FF carrier, skip.
+            FF*  creditTarget = nullptr;
+            Coor driverOld, driverNew;
+            bool haveArc = false;
+
+            PrevStage prevS = f->getPrevStage();
+            if(prevS.ff && prevS.outputGate){
+                Coor gatePin = prevS.outputGate->getCoor()
+                               + prevS.outputGate->getPinCoor(prevS.pinName);
+                driverOld = gatePin;
+                driverNew = gatePin;
+                creditTarget = prevS.ff;
+                haveArc = true;
+            } else {
+                PrevInstance prevI = f->getPrevInstance();
+                if(prevI.instance && prevI.cellType == CellType::FF){
+                    FF* upFF = dynamic_cast<FF*>(prevI.instance);
+                    if(upFF && upFF->getPhysicalFF()){
+                        driverOld = upFF->getOriginalQ();
+                        FF* upPhys = upFF->getPhysicalFF();
+                        driverNew = upPhys->getNewCoor()
+                                    + upPhys->getPinCoor(
+                                          "Q" + upFF->getPhysicalPinName());
+                        creditTarget = upFF;
+                        haveArc = true;
+                    }
+                }
+            }
+
+            if(!haveArc || !creditTarget){
+                sr_skipped_non_ff++;
+                continue;
+            }
+
+            double oldHPWL = HPWL(driverOld, f->getOriginalD());
+            double newHPWL = HPWL(driverNew, newDpin);
+            double released = dd * (oldHPWL - newHPWL);
+            if(released > 0) creditOne(creditTarget, released);
+            else             sr_n_neg_skipped++;
+        }
+    };
+    // Reset phase counters (caller prints + resets before next phase).
+    auto resetSRCounters = [&]() {
+        sr_released_edges = 0;
+        sr_skipped_non_ff = 0;
+        sr_n_capped = 0;
+        sr_n_neg_skipped = 0;
+        sr_sum_released = 0.0;
+        sr_max_per_ff = 0.0;
+    };
+    auto printSRCounters = [&](const std::string& phase) {
+        if(!slackRelease) return;
+        size_t n_boosted = 0;
+        for(const auto& kv : slackReleaseSnapshot){
+            if(kv.first->getBankingReleasedSlackD() > 0) n_boosted++;
+        }
+        std::cout << "[SLACK_RELEASE] phase=" << phase
+                  << " released_edges=" << sr_released_edges
+                  << " skipped_non_ff=" << sr_skipped_non_ff
+                  << " sum_released_ns=" << sr_sum_released
+                  << " max_per_ff_boost=" << sr_max_per_ff
+                  << " n_ff_boosted=" << n_boosted
+                  << " n_capped=" << sr_n_capped
+                  << " n_neg_skipped=" << sr_n_neg_skipped
+                  << std::endl;
     };
 
     // Phase 3Z Step 1: Library-aware higher-bit gate.
@@ -806,7 +967,7 @@ void Banking::doMatchingClustering(){
         if(allLocalFFs.size() < 2) continue;
 
         std::vector<std::vector<FF*>> batches;
-        if(batchMatching2B){
+        if(batchMatching2B && batchMaxK > 1){
             batches = ConflictPartition::partitionByConflict(
                 allLocalFFs, batchHops, batchSlackThresh, batchMaxK, batchMinSize);
             std::cout << "[MATCHING] 2bit clk=" << clkIDX
@@ -1032,6 +1193,19 @@ void Banking::doMatchingClustering(){
                 continue;
             }
 
+            // Step 5: capture logical 1-bit constituents BEFORE bankFF runs;
+            // bankFF calls deleteFF(ffA)/deleteFF(ffB) which clears their
+            // clusterFF. The logical 1-bit children survive (live in newFF's
+            // clusterFF after bankFF) but we need pointers to them now.
+            std::vector<FF*> constituents_2b;
+            if(slackRelease){
+                for(FF* pf : {ffA, ffB}){
+                    auto& cfs = pf->getClusterFF();
+                    if(cfs.empty()) constituents_2b.push_back(pf);
+                    else for(FF* cf : cfs) if(cf) constituents_2b.push_back(cf);
+                }
+            }
+
             FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
             mgr.legalizer->UpdateRows(newFF);
             newFF->setIsLegalize(true);
@@ -1041,6 +1215,10 @@ void Banking::doMatchingClustering(){
             ffB->setClusterIdx(clusterTotalNum);
             ffB->setNewCoor(placeCoor);
 
+            // Step 5: credit upstream FFs whose Q→f-arc got shorter by this
+            // commit (no-op when SLACK_RELEASE=0).
+            releaseSlackAfterCommit(newFF, constituents_2b);
+
             committed[i] = true;
             committed[j] = true;
             clusterTotalNum++;
@@ -1049,6 +1227,8 @@ void Banking::doMatchingClustering(){
         t_commit += ms_fn(tc0, tic());
         } // end for(auto& localFFs : batches)
     }
+    printSRCounters("2bit");
+    resetSRCounters();
 
     std::cout << "[MATCHING] params: K=" << K_NEIGHBORS
               << " minGain=" << EDGE_MIN_GAIN
@@ -1392,9 +1572,24 @@ void Banking::doMatchingClustering(){
                     hb_sumAreaSav += areaSav;
                     hb_sumTNSCost += tnsCost;
 
+                    // Step 5: capture logical 1-bit constituents BEFORE bankFF
+                    // clears pair_ffs wrappers. Flatten each wrapper's
+                    // clusterFF (may be empty for a fresh 1-bit).
+                    std::vector<FF*> hb_constituents;
+                    if(slackRelease){
+                        for(FF* pf : pair_ffs){
+                            auto& cfs = pf->getClusterFF();
+                            if(cfs.empty()) hb_constituents.push_back(pf);
+                            else for(FF* cf : cfs) if(cf) hb_constituents.push_back(cf);
+                        }
+                    }
+
                     FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
                     mgr.legalizer->UpdateRows(newFF);
                     newFF->setIsLegalize(true);
+
+                    if(slackRelease)
+                        releaseSlackAfterCommit(newFF, hb_constituents);
 
                     committed_hb[i] = true;
                     committed_hb[j] = true;
@@ -1404,6 +1599,8 @@ void Banking::doMatchingClustering(){
                 t_commit_hb += ms_fn(tc0, tic());
                 } // end for(auto& localFFs : batches_hb)
             }
+            printSRCounters(std::to_string(targetBit) + "bit");
+            resetSRCounters();
 
             std::cout << "[MATCHING] " << targetBit << "bit: graph=" << t_graph_hb
                       << "ms match=" << t_match_hb << "ms commit=" << t_commit_hb << "ms"
