@@ -671,6 +671,34 @@ void Banking::doMatchingClustering(){
         return 1.0 / (1.0 + std::exp(-minSlack / slackSigmoidScale));
     };
 
+    // Phase 3Z Step 1: Library-aware higher-bit gate.
+    // Skip higher-bit matching for a target cell whose best-case area+power
+    // saving over 2x the cheapest lower-bit alternative is already <= LIB_GATE_MIN.
+    // saving = 2*(beta*minSrcPower + gamma*minSrcArea) - (beta*tgtPower + gamma*tgtArea)
+    bool libGate = false;
+    double libGateMin = 0.0;
+    {
+        const char* envLG = std::getenv("LIB_GATE");
+        if(envLG && std::string(envLG) != "0") libGate = true;
+        const char* envLGM = std::getenv("LIB_GATE_MIN");
+        if(envLGM) libGateMin = std::atof(envLGM);
+    }
+    if(libGate)
+        std::cout << "[MATCHING] library-aware higher-bit gate enabled (min="
+                  << libGateMin << ")" << std::endl;
+    auto libBenefitCeiling = [&](Cell* tgt, int srcBit) -> double {
+        auto it = mgr.Bit_FF_Map.find(srcBit);
+        if(it == mgr.Bit_FF_Map.end() || it->second.empty()) return 0.0;
+        double bestSrc = DBL_MAX;
+        for(Cell* c : it->second){
+            double cc = mgr.beta * c->getGatePower() + mgr.gamma * c->getArea();
+            if(cc < bestSrc) bestSrc = cc;
+        }
+        double tgtCost = mgr.beta * tgt->getGatePower() + mgr.gamma * tgt->getArea();
+        return 2.0 * bestSrc - tgtCost;
+    };
+    int libGate_skipped = 0;
+
     // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
     // so dist * distScale ≈ 1.0 for a typical neighbor distance
 
@@ -966,6 +994,17 @@ void Banking::doMatchingClustering(){
         if(doHigherMatch){
             const char* envHB = std::getenv("MATCH_HIGHER_BIT");
             doHigherMatch = (envHB && std::string(envHB) != "0");
+        }
+        if(doHigherMatch && libGate){
+            double ceiling = libBenefitCeiling(chooseCell, sourceBit);
+            if(ceiling <= libGateMin){
+                std::cout << "[MATCHING] " << targetBit << "bit: LIB_GATE skip"
+                          << " (ceiling=" << ceiling
+                          << " <= " << libGateMin
+                          << ", tgt=" << chooseCell->getCellName() << ")" << std::endl;
+                doHigherMatch = false;
+                libGate_skipped++;
+            }
         }
         if(doHigherMatch){
             std::cout << "[MATCHING] " << targetBit << "bit: pairing "
