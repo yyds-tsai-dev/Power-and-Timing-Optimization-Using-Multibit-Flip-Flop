@@ -934,6 +934,80 @@ void Banking::doMatchingClustering(){
                   << " minSize=" << batchMinSize << ")" << std::endl;
     int batch_total_count_2b = 0, batch_total_count_hb = 0;
 
+    // P4: Defer-and-Batch MBFF Placement (NTU Algorithm 1, thesis §3.2.3).
+    // When ALG1_2B=1, the 2-bit matching commit loop splits into 3 passes:
+    //   Pass 1: collect matched pairs
+    //   Pass 2: score each candidate with S_space(i)
+    //           = D_{U,2}(i) − D_{U,1}(i) + c3·σ(−slack(i)/c4)
+    //           + c5·Σ σ(−slack(j)/c6) for j in downstream fanout  ← thesis novelty N3
+    //   Pass 3: sort descending by score, batch commit with re-FindPlace
+    // Default OFF (bit-exact fallback when unset). ALG1_C5=0 disables N3 lookahead
+    // (NTU-faithful baseline).
+    bool alg1_2b = false;
+    double alg1_c3 = 0.0, alg1_c4 = 1.0, alg1_c5 = 0.0, alg1_c6 = 1.0;
+    int alg1_lookaheadK = 4;
+    {
+        const char* envA = std::getenv("ALG1_2B");
+        if(envA && std::string(envA) != "0") alg1_2b = true;
+    }
+    if(alg1_2b){
+        // Adaptive coefficients derived from 1-bit FF slack distribution across
+        // the full design. Computed once per banking entry (cheap: ~20K sort).
+        std::vector<double> slacksAll;
+        slacksAll.reserve(mgr.FF_Map.size());
+        size_t negCnt = 0;
+        for(const auto& kv : mgr.FF_Map){
+            if(kv.second->getCell()->getBits() != 1) continue;
+            // Wrapper FFs in FF_Map have physicalFF=nullptr, so getSlack() would
+            // segfault (it derefs physicalFF->getNewCoor). Use D-pin static slack
+            // from the TimingSlack map — what the existing matching graph uses.
+            double s;
+            try { s = kv.second->getTimingSlack("D"); }
+            catch (...) { continue; }
+            slacksAll.push_back(s);
+            if(s < 0) negCnt++;
+        }
+        double p10 = 0, p50 = 0, p90 = 0;
+        size_t totalFFs = slacksAll.size();
+        if(totalFFs > 0){
+            std::sort(slacksAll.begin(), slacksAll.end());
+            auto pct = [&](double p){
+                size_t idx = std::min<size_t>(totalFFs - 1, (size_t)(p * totalFFs));
+                return slacksAll[idx];
+            };
+            p10 = pct(0.10); p50 = pct(0.50); p90 = pct(0.90);
+        }
+        alg1_c4 = std::max(0.5, (p90 - p10) / 4.0);
+        alg1_c6 = alg1_c4;
+        double pressure = (totalFFs > 0 && negCnt > totalFFs / 4) ? 5.0 : 2.0;
+        alg1_c3 = FF::DisplacementDelay * pressure;
+        alg1_c5 = alg1_c3 * 0.5;
+        if(const char* e = std::getenv("ALG1_C3")) alg1_c3 = std::atof(e);
+        if(const char* e = std::getenv("ALG1_C4")) alg1_c4 = std::atof(e);
+        if(const char* e = std::getenv("ALG1_C5")) alg1_c5 = std::atof(e);
+        if(const char* e = std::getenv("ALG1_C6")) alg1_c6 = std::atof(e);
+        if(const char* e = std::getenv("ALG1_LOOKAHEAD_K")) alg1_lookaheadK = std::atoi(e);
+        std::cerr << "[ALG1_2B] adaptive c3=" << alg1_c3 << " c4=" << alg1_c4
+                  << " c5=" << alg1_c5 << " c6=" << alg1_c6
+                  << " lookaheadK=" << alg1_lookaheadK
+                  << " (p10=" << p10 << " p50=" << p50 << " p90=" << p90
+                  << " neg=" << negCnt << "/" << totalFFs << ")\n";
+    }
+
+    // P4 aggregate counters (accumulated across clkIDX × batches, reported
+    // once at end of 2-bit phase).
+    int alg1_cands_total = 0;
+    int alg1_scored_total = 0;
+    int alg1_no_slot_total = 0;
+    int alg1_committed_total = 0;
+    int alg1_dropped_after_priority_total = 0;
+    int alg1_dropped_cost_total = 0;
+    int alg1_dropped_margin_total = 0;
+    int alg1_lookahead_dominant_total = 0;
+    double alg1_pass2_ms = 0, alg1_pass3_ms = 0;
+    double alg1_avg_score_sum = 0;
+    double alg1_max_score = -DBL_MAX, alg1_min_score = DBL_MAX;
+
     // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
     // so dist * distScale ≈ 1.0 for a typical neighbor distance
 
@@ -1149,80 +1223,289 @@ void Banking::doMatchingClustering(){
         }
         std::vector<bool> committed(localFFs.size(), false);
 
-        for(size_t i = 0; i < localFFs.size(); i++){
-            if(committed[i]) continue;
-            lemon::SmartGraph::Node mate = mwm.mate(gnodes[i]);
-            if(mate == lemon::INVALID) continue;
+        if(alg1_2b){
+            // P4: Defer-and-Batch commit (NTU Algorithm 1).
+            // Pass 1 collects matched pairs as MatchCandidates. Pass 2 scores
+            // each via S_space + N3 lookahead using a read-only top-2 legal
+            // probe (no row mutation). Pass 3 sorts descending and re-FindPlace
+            // -commits each in priority order.
+            struct MatchCandidate {
+                std::vector<FF*> ffs;
+                Coor fpTarget;
+                Cell* cell;
+                double D1 = DBL_MAX;
+                double D2 = DBL_MAX;
+                Coor  coord = Coor(DBL_MAX, DBL_MAX);
+                double sscore = -DBL_MAX;
+                double minSlack = DBL_MAX;
+                double laTermVal = 0.0;
+                std::string sortKey;
+            };
+            auto sigmoid01 = [](double z) -> double {
+                if(z > 35.0) return 1.0;
+                if(z < -35.0) return 0.0;
+                return 1.0 / (1.0 + std::exp(-z));
+            };
 
-            int j = nodeIdx[mate];
-            if(j < 0 || committed[j]) continue;
-            total_matched++;
+            // Pass 1: collect matched pairs
+            std::vector<MatchCandidate> cands;
+            cands.reserve(localFFs.size() / 2);
+            for(size_t i = 0; i < localFFs.size(); i++){
+                if(committed[i]) continue;
+                lemon::SmartGraph::Node mate = mwm.mate(gnodes[i]);
+                if(mate == lemon::INVALID) continue;
+                int j = nodeIdx[mate];
+                if(j < 0 || committed[j]) continue;
+                total_matched++;
 
-            FF* ffA = localFFs[i];
-            FF* ffB = localFFs[j];
+                FF* ffA = localFFs[i];
+                FF* ffB = localFFs[j];
+                MatchCandidate mc;
+                mc.ffs = {ffA, ffB};
+                mc.cell = cell2bit;
+                if(useV21){
+                    auto it = optPMap.find(pairKey(i, j));
+                    mc.fpTarget = (it != optPMap.end()) ? it->second :
+                        Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                             (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                } else {
+                    mc.fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                       (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                }
+                mc.sortKey = (ffA->getInstanceName() < ffB->getInstanceName())
+                             ? ffA->getInstanceName() : ffB->getInstanceName();
+                // Mark both sides as claimed to avoid mate re-surfacing from j's side.
+                committed[i] = true;
+                committed[j] = true;
+                cands.push_back(std::move(mc));
+            }
 
-            std::vector<FF*> pair_ffs = {ffA, ffB};
+            // Pass 2: score via NTU S_space (self slack) + N3 fanout lookahead.
+            auto tp2 = tic();
+            int local_no_slot = 0;
+            int local_lookahead_dominant = 0;
+            for(auto &c : cands){
+                auto top2 = mgr.legalizer->FindTop2LegalCoors(c.fpTarget, c.cell);
+                if(top2.empty()){
+                    c.sscore = -DBL_MAX;
+                    local_no_slot++;
+                    continue;
+                }
+                c.D1 = top2[0].disp;
+                c.coord = top2[0].coor;
+                c.D2 = (top2.size() >= 2) ? top2[1].disp : (c.D1 + 1e6);
 
-            // FindPlace target: use storedOptP (v2.1) or median (legacy)
-            Coor fpTarget;
-            if(useV21){
-                auto it = optPMap.find(pairKey(i, j));
-                if(it != optPMap.end()){
-                    fpTarget = it->second;
+                double slackI = DBL_MAX;
+                for(FF* f : c.ffs){
+                    // Use D-pin static slack (same source as matching graph).
+                    // getSlack() needs physicalFF which is null on FF_Map wrappers.
+                    double s;
+                    try { s = f->getTimingSlack("D"); }
+                    catch (...) { continue; }
+                    if(s < slackI) slackI = s;
+                }
+                if(slackI == DBL_MAX) slackI = 0.0;
+                c.minSlack = slackI;
+                double selfTerm = alg1_c3 * sigmoid01(-slackI / alg1_c4);
+                double laTerm = 0.0;
+                if(alg1_c5 > 0){
+                    int laN = 0;
+                    for(FF* f : c.ffs){
+                        for(const NextStage &ns : f->getNextStage()){
+                            if(ns.ff && laN < alg1_lookaheadK){
+                                double sns;
+                                try { sns = ns.ff->getTimingSlack("D"); }
+                                catch (...) { laN++; continue; }
+                                laTerm += sigmoid01(-sns / alg1_c6);
+                                laN++;
+                            }
+                        }
+                    }
+                    laTerm *= alg1_c5;
+                }
+                c.laTermVal = laTerm;
+                c.sscore = (c.D2 - c.D1) + selfTerm + laTerm;
+            }
+            double t_pass2 = ms_fn(tp2, tic());
+
+            // Count how many candidates would move relative rank by >= 1 vs
+            // c5=0 ordering. Cheap approximation: if laTerm exceeds half of
+            // the median |score|, we flag it as lookahead-dominant.
+            {
+                std::vector<double> absScores;
+                absScores.reserve(cands.size());
+                for(const auto& c : cands){
+                    if(c.sscore > -DBL_MAX / 2)
+                        absScores.push_back(std::abs(c.sscore - c.laTermVal));
+                }
+                double medAbs = 1e-9;
+                if(!absScores.empty()){
+                    std::sort(absScores.begin(), absScores.end());
+                    medAbs = absScores[absScores.size() / 2];
+                }
+                for(const auto& c : cands){
+                    if(c.laTermVal > 0.5 * std::max(medAbs, 1e-9))
+                        local_lookahead_dominant++;
+                }
+            }
+
+            std::sort(cands.begin(), cands.end(),
+                [](const MatchCandidate& a, const MatchCandidate& b){
+                    if(a.sscore != b.sscore) return a.sscore > b.sscore;
+                    return a.sortKey < b.sortKey;
+                });
+
+            // Pass 3: commit in priority order (re-FindPlace since row state evolves).
+            auto tp3 = tic();
+            int local_dropped_after_priority = 0;
+            int local_dropped_cost = 0;
+            int local_dropped_margin = 0;
+            int local_committed = 0;
+            int local_scored = 0;
+            double local_sum_score = 0, local_max = -DBL_MAX, local_min = DBL_MAX;
+            for(auto &c : cands){
+                if(c.sscore > -DBL_MAX / 2){
+                    local_scored++;
+                    local_sum_score += c.sscore;
+                    if(c.sscore > local_max) local_max = c.sscore;
+                    if(c.sscore < local_min) local_min = c.sscore;
+                }
+                if(c.sscore == -DBL_MAX){
+                    continue;
+                }
+                Coor placeCoor = mgr.legalizer->FindPlace(c.fpTarget, c.cell);
+                if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                    local_dropped_after_priority++;
+                    n_dropped_place++;
+                    continue;
+                }
+                double realGain = CostCompare(placeCoor, c.cell, c.ffs);
+                if(realGain < 0){
+                    local_dropped_cost++;
+                    n_dropped_cost++;
+                    continue;
+                }
+                if(safetyMargin2B > 0.0 && realGain < safetyMargin2B){
+                    local_dropped_margin++;
+                    n_dropped_by_margin++;
+                    continue;
+                }
+
+                std::vector<FF*> constituents_2b;
+                if(slackRelease){
+                    for(FF* pf : c.ffs){
+                        auto& cfs = pf->getClusterFF();
+                        if(cfs.empty()) constituents_2b.push_back(pf);
+                        else for(FF* cf : cfs) if(cf) constituents_2b.push_back(cf);
+                    }
+                }
+
+                FF* newFF = mgr.bankFF(placeCoor, c.cell, c.ffs);
+                mgr.legalizer->UpdateRows(newFF);
+                newFF->setIsLegalize(true);
+                for(FF* f : c.ffs){
+                    f->setClusterIdx(clusterTotalNum);
+                    f->setNewCoor(placeCoor);
+                }
+                releaseSlackAfterCommit(newFF, constituents_2b);
+                clusterTotalNum++;
+                n_committed++;
+                local_committed++;
+            }
+            double t_pass3 = ms_fn(tp3, tic());
+
+            alg1_cands_total += (int)cands.size();
+            alg1_scored_total += local_scored;
+            alg1_no_slot_total += local_no_slot;
+            alg1_committed_total += local_committed;
+            alg1_dropped_after_priority_total += local_dropped_after_priority;
+            alg1_dropped_cost_total += local_dropped_cost;
+            alg1_dropped_margin_total += local_dropped_margin;
+            alg1_lookahead_dominant_total += local_lookahead_dominant;
+            alg1_pass2_ms += t_pass2;
+            alg1_pass3_ms += t_pass3;
+            if(local_scored > 0){
+                alg1_avg_score_sum += local_sum_score;
+                if(local_max > alg1_max_score) alg1_max_score = local_max;
+                if(local_min < alg1_min_score) alg1_min_score = local_min;
+            }
+        } else {
+            // Legacy eager commit (bit-exact to pre-P4 production).
+            for(size_t i = 0; i < localFFs.size(); i++){
+                if(committed[i]) continue;
+                lemon::SmartGraph::Node mate = mwm.mate(gnodes[i]);
+                if(mate == lemon::INVALID) continue;
+
+                int j = nodeIdx[mate];
+                if(j < 0 || committed[j]) continue;
+                total_matched++;
+
+                FF* ffA = localFFs[i];
+                FF* ffB = localFFs[j];
+
+                std::vector<FF*> pair_ffs = {ffA, ffB};
+
+                // FindPlace target: use storedOptP (v2.1) or median (legacy)
+                Coor fpTarget;
+                if(useV21){
+                    auto it = optPMap.find(pairKey(i, j));
+                    if(it != optPMap.end()){
+                        fpTarget = it->second;
+                    } else {
+                        fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                        (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                    }
                 } else {
                     fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
                                     (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
                 }
-            } else {
-                fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
-                                (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
-            }
-            Coor placeCoor = mgr.legalizer->FindPlace(fpTarget, cell2bit);
-            if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
-                n_dropped_place++;
-                continue;
-            }
-
-            double realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
-            if(realGain < 0){
-                n_dropped_cost++;
-                continue;
-            }
-            if(safetyMargin2B > 0.0 && realGain < safetyMargin2B){
-                n_dropped_by_margin++;
-                continue;
-            }
-
-            // Step 5: capture logical 1-bit constituents BEFORE bankFF runs;
-            // bankFF calls deleteFF(ffA)/deleteFF(ffB) which clears their
-            // clusterFF. The logical 1-bit children survive (live in newFF's
-            // clusterFF after bankFF) but we need pointers to them now.
-            std::vector<FF*> constituents_2b;
-            if(slackRelease){
-                for(FF* pf : {ffA, ffB}){
-                    auto& cfs = pf->getClusterFF();
-                    if(cfs.empty()) constituents_2b.push_back(pf);
-                    else for(FF* cf : cfs) if(cf) constituents_2b.push_back(cf);
+                Coor placeCoor = mgr.legalizer->FindPlace(fpTarget, cell2bit);
+                if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                    n_dropped_place++;
+                    continue;
                 }
+
+                double realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+                if(realGain < 0){
+                    n_dropped_cost++;
+                    continue;
+                }
+                if(safetyMargin2B > 0.0 && realGain < safetyMargin2B){
+                    n_dropped_by_margin++;
+                    continue;
+                }
+
+                // Step 5: capture logical 1-bit constituents BEFORE bankFF runs;
+                // bankFF calls deleteFF(ffA)/deleteFF(ffB) which clears their
+                // clusterFF. The logical 1-bit children survive (live in newFF's
+                // clusterFF after bankFF) but we need pointers to them now.
+                std::vector<FF*> constituents_2b;
+                if(slackRelease){
+                    for(FF* pf : {ffA, ffB}){
+                        auto& cfs = pf->getClusterFF();
+                        if(cfs.empty()) constituents_2b.push_back(pf);
+                        else for(FF* cf : cfs) if(cf) constituents_2b.push_back(cf);
+                    }
+                }
+
+                FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
+                mgr.legalizer->UpdateRows(newFF);
+                newFF->setIsLegalize(true);
+
+                ffA->setClusterIdx(clusterTotalNum);
+                ffA->setNewCoor(placeCoor);
+                ffB->setClusterIdx(clusterTotalNum);
+                ffB->setNewCoor(placeCoor);
+
+                // Step 5: credit upstream FFs whose Q→f-arc got shorter by this
+                // commit (no-op when SLACK_RELEASE=0).
+                releaseSlackAfterCommit(newFF, constituents_2b);
+
+                committed[i] = true;
+                committed[j] = true;
+                clusterTotalNum++;
+                n_committed++;
             }
-
-            FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
-            mgr.legalizer->UpdateRows(newFF);
-            newFF->setIsLegalize(true);
-
-            ffA->setClusterIdx(clusterTotalNum);
-            ffA->setNewCoor(placeCoor);
-            ffB->setClusterIdx(clusterTotalNum);
-            ffB->setNewCoor(placeCoor);
-
-            // Step 5: credit upstream FFs whose Q→f-arc got shorter by this
-            // commit (no-op when SLACK_RELEASE=0).
-            releaseSlackAfterCommit(newFF, constituents_2b);
-
-            committed[i] = true;
-            committed[j] = true;
-            clusterTotalNum++;
-            n_committed++;
         }
         t_commit += ms_fn(tc0, tic());
         } // end for(auto& localFFs : batches)
@@ -1243,6 +1526,25 @@ void Banking::doMatchingClustering(){
     if(nEdgesChecked > 0)
         std::cout << "[MATCHING] risk-adaptive: " << nEdgesZeroed << "/" << nEdgesChecked
                   << " edges zeroed (" << (100.0*nEdgesZeroed/nEdgesChecked) << "%)" << std::endl;
+
+    if(alg1_2b){
+        double avg = (alg1_scored_total > 0)
+                     ? (alg1_avg_score_sum / alg1_scored_total) : 0.0;
+        std::cerr << "[ALG1_2B] candidates=" << alg1_cands_total
+                  << " scored=" << alg1_scored_total
+                  << " no_slot=" << alg1_no_slot_total
+                  << " committed=" << alg1_committed_total
+                  << " dropped_after_priority=" << alg1_dropped_after_priority_total
+                  << " dropped_cost=" << alg1_dropped_cost_total
+                  << " dropped_by_margin=" << alg1_dropped_margin_total
+                  << " lookahead_dominant=" << alg1_lookahead_dominant_total
+                  << " avg_score=" << avg
+                  << " max_score=" << alg1_max_score
+                  << " min_score=" << alg1_min_score
+                  << " pass2_ms=" << alg1_pass2_ms
+                  << " pass3_ms=" << alg1_pass3_ms
+                  << "\n";
+    }
 
     // ================================================================
     // Phase 2+3: For each higher-bit target (4, 8, ...):
