@@ -1,4 +1,5 @@
 #include "Banking.h"
+#include "ConflictPartition.h"
 #include <omp.h>
 #include <chrono>
 #include <unordered_set>
@@ -663,11 +664,23 @@ void Banking::doMatchingClustering(){
     }
     if(slackSigmoid)
         std::cout << "[MATCHING] slack-budget sigmoid enabled (scale=" << slackSigmoidScale << ")" << std::endl;
+    // Return minimum dynamic D-pin slack across all constituent FFs of a
+    // cluster FF. Using getSlack() on constituents picks up position-dependent
+    // updates as earlier commits move the driver/load pins.
+    auto minDynSlack = [&](FF* a) -> double {
+        auto& cfs = a->getClusterFF();
+        if(cfs.empty()) return a->getTimingSlack("D");
+        double m = DBL_MAX;
+        for(FF* o : cfs){
+            if(!o) continue;
+            double s = o->getSlack();
+            if(s < m) m = s;
+        }
+        return m;
+    };
     auto slackMul = [&](FF* a, FF* b) -> double {
         if(!slackSigmoid) return 1.0;
-        double slA = a->getTimingSlack("D");
-        double slB = b->getTimingSlack("D");
-        double minSlack = std::min(slA, slB);
+        double minSlack = std::min(minDynSlack(a), minDynSlack(b));
         return 1.0 / (1.0 + std::exp(-minSlack / slackSigmoidScale));
     };
 
@@ -718,6 +731,48 @@ void Banking::doMatchingClustering(){
     int hb_dropped_by_margin = 0;
     int n_dropped_by_margin = 0;
 
+    // Phase 3Z Step 4: batched matching with conflict-graph partition.
+    // Split each clkIDX's FF set into conflict-disjoint batches via DSatur.
+    // Matching runs on each batch in sequence; later batches see the updated
+    // placement state (legalizer rows) left by earlier batches.
+    // Defaults: off (single batch = full clk domain ⇒ bit-exact baseline).
+    // BATCH_MATCHING toggles both 2-bit and higher-bit together; per-path
+    // overrides (BATCH_MATCHING_2B / BATCH_MATCHING_HB) allow selective use
+    // — higher-bit benefits from cascade mitigation, 2-bit usually doesn't.
+    bool batchMatching = false;
+    bool batchMatching2B = false;
+    bool batchMatchingHB = false;
+    int batchHops = 2;
+    double batchSlackThresh = 0.0;
+    int batchMaxK = 8;
+    int batchMinSize = 20;
+    {
+        const char* envBM = std::getenv("BATCH_MATCHING");
+        if(envBM && std::string(envBM) != "0") batchMatching = true;
+        const char* envBM2 = std::getenv("BATCH_MATCHING_2B");
+        if(envBM2) batchMatching2B = (std::string(envBM2) != "0");
+        else       batchMatching2B = batchMatching;
+        const char* envBMH = std::getenv("BATCH_MATCHING_HB");
+        if(envBMH) batchMatchingHB = (std::string(envBMH) != "0");
+        else       batchMatchingHB = batchMatching;
+        const char* envBH = std::getenv("BATCH_CONFLICT_HOPS");
+        if(envBH) batchHops = std::atoi(envBH);
+        const char* envBT = std::getenv("BATCH_SLACK_THRESH");
+        if(envBT) batchSlackThresh = std::atof(envBT);
+        const char* envBK = std::getenv("BATCH_MAX_K");
+        if(envBK) batchMaxK = std::atoi(envBK);
+        const char* envBMS = std::getenv("BATCH_MIN_SIZE");
+        if(envBMS) batchMinSize = std::atoi(envBMS);
+    }
+    if(batchMatching2B || batchMatchingHB)
+        std::cout << "[MATCHING] batched matching enabled (2B=" << batchMatching2B
+                  << " HB=" << batchMatchingHB
+                  << " hops=" << batchHops
+                  << " slackThresh=" << batchSlackThresh
+                  << " maxK=" << batchMaxK
+                  << " minSize=" << batchMinSize << ")" << std::endl;
+    int batch_total_count_2b = 0, batch_total_count_hb = 0;
+
     // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
     // so dist * distScale ≈ 1.0 for a typical neighbor distance
 
@@ -741,13 +796,30 @@ void Banking::doMatchingClustering(){
     mgr.legalizer->initial();
 
     for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
-        std::vector<FF*> localFFs;
+        std::vector<FF*> allLocalFFs;
         for(const auto &pair : mgr.FF_Map){
             if((size_t)pair.second->getClkIdx() == clkIDX
                && pair.second->getCell()->getBits() == 1){
-                localFFs.push_back(pair.second);
+                allLocalFFs.push_back(pair.second);
             }
         }
+        if(allLocalFFs.size() < 2) continue;
+
+        std::vector<std::vector<FF*>> batches;
+        if(batchMatching2B){
+            batches = ConflictPartition::partitionByConflict(
+                allLocalFFs, batchHops, batchSlackThresh, batchMaxK, batchMinSize);
+            std::cout << "[MATCHING] 2bit clk=" << clkIDX
+                      << " n=" << allLocalFFs.size()
+                      << " batches=" << batches.size() << " sizes:";
+            for(auto& b : batches) std::cout << " " << b.size();
+            std::cout << std::endl;
+            batch_total_count_2b += (int)batches.size();
+        } else {
+            batches.push_back(std::move(allLocalFFs));
+        }
+
+        for(auto& localFFs : batches){
         if(localFFs.size() < 2) continue;
 
         auto tg0 = tic();
@@ -975,6 +1047,7 @@ void Banking::doMatchingClustering(){
             n_committed++;
         }
         t_commit += ms_fn(tc0, tic());
+        } // end for(auto& localFFs : batches)
     }
 
     std::cout << "[MATCHING] params: K=" << K_NEIGHBORS
@@ -1043,13 +1116,30 @@ void Banking::doMatchingClustering(){
             double hb_sumPowerSav = 0, hb_sumAreaSav = 0, hb_sumTNSCost = 0;
 
             for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
-                std::vector<FF*> localFFs;
+                std::vector<FF*> allLocalFFs;
                 for(const auto &pair : mgr.FF_Map){
                     if((size_t)pair.second->getClkIdx() == clkIDX
                        && pair.second->getCell()->getBits() == sourceBit){
-                        localFFs.push_back(pair.second);
+                        allLocalFFs.push_back(pair.second);
                     }
                 }
+                if(allLocalFFs.size() < 2) continue;
+
+                std::vector<std::vector<FF*>> batches_hb;
+                if(batchMatchingHB){
+                    batches_hb = ConflictPartition::partitionByConflict(
+                        allLocalFFs, batchHops, batchSlackThresh, batchMaxK, batchMinSize);
+                    std::cout << "[MATCHING] " << targetBit << "bit clk=" << clkIDX
+                              << " n=" << allLocalFFs.size()
+                              << " batches=" << batches_hb.size() << " sizes:";
+                    for(auto& b : batches_hb) std::cout << " " << b.size();
+                    std::cout << std::endl;
+                    batch_total_count_hb += (int)batches_hb.size();
+                } else {
+                    batches_hb.push_back(std::move(allLocalFFs));
+                }
+
+                for(auto& localFFs : batches_hb){
                 if(localFFs.size() < 2) continue;
 
                 auto tg0 = tic();
@@ -1312,6 +1402,7 @@ void Banking::doMatchingClustering(){
                     hb_committed++;
                 }
                 t_commit_hb += ms_fn(tc0, tic());
+                } // end for(auto& localFFs : batches_hb)
             }
 
             std::cout << "[MATCHING] " << targetBit << "bit: graph=" << t_graph_hb
