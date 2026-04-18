@@ -216,6 +216,36 @@ Coor Legalizer::FindPlace(const Coor &coor, Cell * cell){
     return newCoor;
 }
 
+Coor Legalizer::FindNearestLegalSpace(const Coor &coor, Cell* cell, double maxDist){
+    size_t closest_row_idx = FindClosestRow(coor);
+    double minDisplacement = maxDist;
+    Coor newCoor(DBL_MAX, DBL_MAX);
+
+    bool placeable = true;
+    PredictFFLGPlace(coor, cell, closest_row_idx, placeable, minDisplacement, newCoor);
+    int down_row_idx = closest_row_idx - 1;
+    int up_row_idx = closest_row_idx + 1;
+    while(down_row_idx >= 0 && std::abs(coor.y - rows[down_row_idx]->getStartCoor().y) < minDisplacement){
+        if(!rows[down_row_idx]->hasCell(cell)){
+            placeable = true;
+            PredictFFLGPlace(coor, cell, down_row_idx, placeable, minDisplacement, newCoor);
+            if(!placeable)
+                rows[down_row_idx]->addRejectCell(cell);
+        }
+        down_row_idx--;
+    }
+    while(up_row_idx < (int)rows.size() && std::abs(coor.y - rows[up_row_idx]->getStartCoor().y) < minDisplacement){
+        if(!rows[up_row_idx]->hasCell(cell)){
+            placeable = true;
+            PredictFFLGPlace(coor, cell, up_row_idx, placeable, minDisplacement, newCoor);
+            if(!placeable)
+                rows[up_row_idx]->addRejectCell(cell);
+        }
+        up_row_idx++;
+    }
+    return newCoor;
+}
+
 void Legalizer::UpdateRows(FF* newFF){
     Node *ff = new Node();
     ff->setName(newFF->getInstanceName());
@@ -236,6 +266,73 @@ void Legalizer::UpdateRows(FF* newFF){
             ff->setPlaceRowIdx(i);// for DP
         }
 
+    }
+}
+
+// Phase 5: drop the Node whose FFPtr matches `ff` from the tracking vector.
+// Needed because postLGDecluster destroys MBFFs via debankFF, which recycles
+// the FF* into FFGarbageCollector. Any Node still pointing at that FF* would
+// read stale-or-reused state in DP's GlobalSwap.
+void Legalizer::RemoveNodeByFFPtr(FF* ff){
+    for(size_t i = 0; i < ffs.size(); ++i){
+        if(ffs[i]->getFFPtr() == ff){
+            delete ffs[i];
+            ffs.erase(ffs.begin() + i);
+            return;
+        }
+    }
+}
+
+// Phase 5: free a rect from row state. Inverse of UpdateRows' slicing.
+// Insert a new subrow covering [x0,x1] into each row whose startY falls in
+// [y0,y1), then sweep and merge any subrows that now abut each other. The
+// rect must have been fully excluded from subrows previously (i.e. a placed
+// cell actually occupied it), otherwise the new subrow will overlap existing
+// free space — asserted out.
+void Legalizer::FreeRect(const Coor &lgCoor, double width, double height){
+    double x0 = lgCoor.x, x1 = lgCoor.x + width;
+    double y0 = lgCoor.y, y1 = lgCoor.y + height;
+    const double EPS = 1e-3;
+    for(size_t i = 0; i < rows.size(); i++){
+        Row* row = rows[i];
+        double ry = row->getStartCoor().y;
+        if(ry + EPS >= y1) break;
+        if(ry < y0 - EPS) continue;
+        auto& subrows = row->getSubrows();
+
+        // Sanity: [x0,x1] should not overlap any existing subrow.
+        for(auto* s : subrows){
+            if(s->getEndX() > x0 + EPS && s->getStartX() < x1 - EPS){
+                // overlap: skip freeing in this row (would corrupt state).
+                // This happens if the cell's rect wasn't fully row-excluded,
+                // e.g. a gate overhangs from above. Safer to bail.
+                return;
+            }
+        }
+
+        // Insert at sorted position.
+        size_t ins = 0;
+        while(ins < subrows.size() && subrows[ins]->getStartX() < x0) ins++;
+        Subrow* s = new Subrow();
+        s->setStartX(x0);
+        s->setEndX(x1);
+        s->setFreeWidth(x1 - x0);
+        s->setHeight(row->getSiteHeight());
+        subrows.insert(subrows.begin() + ins, s);
+
+        // Merge touching subrows in order.
+        for(size_t j = 1; j < subrows.size(); ){
+            Subrow* prev = subrows[j - 1];
+            Subrow* curr = subrows[j];
+            if(std::abs(prev->getEndX() - curr->getStartX()) < EPS){
+                prev->setEndX(curr->getEndX());
+                prev->setFreeWidth(prev->getEndX() - prev->getStartX());
+                delete curr;
+                subrows.erase(subrows.begin() + j);
+            } else {
+                j++;
+            }
+        }
     }
 }
 

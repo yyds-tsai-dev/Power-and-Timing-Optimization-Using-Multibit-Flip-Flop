@@ -51,6 +51,9 @@ int main(int argc, char *argv[]){
     STAGE("legalize",          mgr.legalize());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Legalize.out"); mgr.checker(); }
 
+    STAGE("postLGDecluster",   mgr.postLGDecluster());
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+
     STAGE("detailplacement",   mgr.detailplacement());
     if(!production){
         mgr.getOverallCost(cost_verbose, 1);

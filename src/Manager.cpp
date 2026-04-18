@@ -415,6 +415,166 @@ std::vector<FF*> Manager::debankFF(FF* MBFF, Cell* debankCellType){
     return outputFF;
 }
 
+void Manager::debankAll(){
+    Cell* cell1bit = Bit_FF_Map[1][0];
+    std::vector<FF*> toDebank;
+    for(auto& pair : FF_Map)
+        if(pair.second->getCell()->getBits() > 1)
+            toDebank.push_back(pair.second);
+    std::cout << "[DEBANK_ALL] debanking " << toDebank.size() << " MBFFs" << std::endl;
+    for(auto* ff : toDebank)
+        debankFF(ff, cell1bit);
+}
+
+// Phase 5: Post-LG Decluster
+// After LG snaps MBFFs to legal positions, some banks turn out to be net-negative
+// under the same cost model used during banking (per-pin TNS + Power + Area).
+// This pass computes ΔC(keep → decluster to N 1-bit FFs) using LG-accurate
+// positions for both the MBFF's Q-pin fanout and the debanked FFs' D-pin
+// (preserved by debankFF). If ΔC < -margin (score would improve), decluster.
+// After the decluster batch, the whole design is re-legalized.
+void Manager::postLGDecluster(){
+    const char* envOn = std::getenv("POST_LG_DECLUSTER");
+    if(!envOn || std::atoi(envOn) == 0) return;
+    double margin = 0.0;
+    if(const char* envM = std::getenv("POST_LG_DECLUSTER_MARGIN")) margin = std::atof(envM);
+
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+
+    // Lambda: ΔC of declustering one MBFF into N copies of oneBitCell.
+    // Returns score change under MINIMIZE convention: negative => decluster wins.
+    auto scoreDelta = [&](FF* mbff) -> double {
+        Cell* mCell = mbff->getCell();
+        int N = mCell->getBits();
+        // Power/Area delta: after decluster, we use N × oneBit instead of 1 × MBFF.
+        double pwrDelta  = beta  * (N * oneBitCell->getGatePower() - mCell->getGatePower());
+        double areaDelta = gamma * (N * oneBitCell->getArea()      - mCell->getArea());
+
+        // TNS delta: D-pin absolute coord preserved by debankFF, so D-side
+        // contribution unchanged. Q-side shifts because of QpinDelay + Q-pin
+        // offset differences. Iterate each constituent cf in the MBFF.
+        double oldTNS = 0, newTNS = 0;
+        double qDelayBenefit = mCell->getQpinDelay() - oneBitCell->getQpinDelay();
+        std::vector<FF*>& clusterFF = mbff->getClusterFF();
+        int slot = 0;
+        for(auto* cf : clusterFF){
+            std::string slotStr = (mCell->getBits() == 1) ? "" : std::to_string(slot);
+            // D-side: unchanged absolute position, same contribution both sides -> cancels.
+            // Q-side: downstream FFs' D-pin slack affected.
+            // Use LG-snapped coord for both sides: predicts the position debankFF
+            // will use after we update the debanked 1-bits' newCoor below.
+            Coor curQpin = mbff->getNewCoor() + mbff->getPinCoor("Q" + slotStr);
+            Coor debankedCoor = mbff->getNewCoor() + mbff->getPinCoor("D" + slotStr)
+                              - oneBitCell->getPinCoor("D");
+            Coor newQpin = debankedCoor + oneBitCell->getPinCoor("Q");
+            for(auto& next : cf->getNextStage()){
+                double nextCurSlack = next.ff->getSlack();
+                Coor loadCoor;
+                if(next.outputGate){
+                    loadCoor = next.outputGate->getCoor()
+                             + next.outputGate->getPinCoor(next.pinName);
+                } else {
+                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                             + next.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + next.ff->getPhysicalPinName());
+                }
+                double deltaHpwlQ = HPWL(loadCoor, curQpin) - HPWL(loadCoor, newQpin);
+                double predNextSlack = nextCurSlack + qDelayBenefit
+                                     + DisplacementDelay * deltaHpwlQ;
+                oldTNS += std::max(0.0, -nextCurSlack);
+                newTNS += std::max(0.0, -predNextSlack);
+            }
+            slot++;
+        }
+        double tnsDelta = alpha * (newTNS - oldTNS);
+        return tnsDelta + pwrDelta + areaDelta;
+    };
+
+    // Collect candidates (need a snapshot: debankFF mutates FF_Map).
+    std::vector<FF*> candidates;
+    candidates.reserve(FF_Map.size());
+    for(auto& pair : FF_Map){
+        if(pair.second->getCell()->getBits() > 1) candidates.push_back(pair.second);
+    }
+    std::vector<FF*> toDecluster;
+    double totalSaved = 0;
+    for(auto* ff : candidates){
+        double delta = scoreDelta(ff);
+        if(delta < -margin){
+            toDecluster.push_back(ff);
+            totalSaved += -delta;
+        }
+    }
+    std::cout << "[PostLGDecluster] candidates=" << candidates.size()
+              << " toDecluster=" << toDecluster.size()
+              << " margin=" << margin
+              << " predictedScoreImprovement=" << totalSaved << std::endl;
+
+    if(toDecluster.empty()) return;
+
+    // Incremental path: for each MBFF we decluster, call debankFF then use
+    // FindPlace + UpdateRows on each new 1-bit FF. This leaves every other FF's
+    // LG position untouched (avoiding the ~+1% regression a full re-LG causes).
+    // The MBFF's old rect stays sliced in the row state — treated as wasted
+    // space so the new 1-bits don't overlap it. FindPlace naturally searches
+    // just outside that footprint.
+    int okCnt = 0, failCnt = 0;
+    double declusterRadius = 0.0;
+    if(const char* envR = std::getenv("POST_LG_DECLUSTER_RADIUS")) declusterRadius = std::atof(envR);
+
+    for(auto* mbff : toDecluster){
+        Coor lgCoor = mbff->getNewCoor();
+        Cell* mCell = mbff->getCell();
+        int N = mCell->getBits();
+        double mW = mCell->getW();
+        double mH = mCell->getH();
+        std::cout << "[PLDc] declustering " << mbff->getInstanceName()
+                  << " cell=" << mCell->getCellName()
+                  << " at (" << lgCoor.x << "," << lgCoor.y << ")"
+                  << " N=" << N << std::endl;
+        std::vector<Coor> intendedPos(N);
+        for(int i = 0; i < N; i++){
+            intendedPos[i] = lgCoor + mCell->getPinCoor("D" + std::to_string(i))
+                           - oneBitCell->getPinCoor("D");
+        }
+        // Free the MBFF's rect so the new 1-bits can reclaim its footprint.
+        legalizer->FreeRect(lgCoor, mW, mH);
+        // Drop the MBFF's Node from legalizer->ffs before debankFF recycles the
+        // FF* pointer — otherwise DP iterates a stale Node whose FFPtr later
+        // points at a debanked 1-bit and corrupts swap state.
+        legalizer->RemoveNodeByFFPtr(mbff);
+        std::vector<FF*> newFFs = debankFF(mbff, oneBitCell);
+        for(size_t i = 0; i < newFFs.size() && i < intendedPos.size(); i++){
+            Coor target = intendedPos[i];
+            std::cout << "[PLDc]   new 1-bit " << newFFs[i]->getInstanceName()
+                      << " intended (" << target.x << "," << target.y << ")";
+            Coor placed;
+            if(declusterRadius > 0){
+                placed = legalizer->FindNearestLegalSpace(target, oneBitCell, declusterRadius);
+            } else {
+                placed = legalizer->FindPlace(target, oneBitCell);
+            }
+            if(placed.x == DBL_MAX){
+                // Fallback: accept the intended (possibly overlapping) position.
+                // Placement checker will flag it; we log and move on so the run
+                // still produces a scoreable output.
+                placed = target;
+                failCnt++;
+            } else {
+                okCnt++;
+            }
+            newFFs[i]->setCoor(placed);
+            newFFs[i]->setNewCoor(placed);
+            newFFs[i]->setIsLegalize(true);
+            legalizer->UpdateRows(newFFs[i]);
+            std::cout << " placed (" << placed.x << "," << placed.y << ")" << std::endl;
+        }
+    }
+    std::cout << "[PostLGDecluster] placed_ok=" << okCnt
+              << " placed_fallback=" << failCnt << std::endl;
+}
+
+
 void Manager::getNS(double& TNS, double& WNS, bool show){
     TNS = 0;
     WNS = 0;

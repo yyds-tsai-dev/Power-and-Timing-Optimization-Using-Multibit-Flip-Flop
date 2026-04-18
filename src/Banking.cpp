@@ -637,6 +637,40 @@ void Banking::doMatchingClustering(){
                   << (riskAdaptive ? " (risk mode, scale=" + std::to_string(riskScale) + ")" : " (slack<0 mode)")
                   << std::endl;
 
+    // Phase 4: Space-aware matching for higher-bit. Only affects 4-bit+ graph build.
+    bool spaceAware = false;
+    double spaceRadiusMult = 3.0;
+    {
+        const char* envSA = std::getenv("SPACE_AWARE");
+        if(envSA && std::string(envSA) != "0") spaceAware = true;
+        const char* envSRM = std::getenv("SPACE_RADIUS_MULT");
+        if(envSRM) spaceRadiusMult = std::atof(envSRM);
+    }
+    if(spaceAware)
+        std::cout << "[MATCHING] space-aware 4-bit+ enabled (radius_mult=" << spaceRadiusMult << ")" << std::endl;
+
+    // Phase 4 Step 2: slack-budget sigmoid on edge weight. Attacks cascade by
+    // down-weighting merges on timing-critical paths before matching picks them.
+    // adjGain = gain * sigmoid(min_slack / scale). When min_slack >>0: multiplier→1
+    // (no change). When min_slack <<0: multiplier→0 (edge effectively dropped).
+    bool slackSigmoid = false;
+    double slackSigmoidScale = 1.0;
+    {
+        const char* envSG = std::getenv("SLACK_SIGMOID");
+        if(envSG && std::string(envSG) != "0") slackSigmoid = true;
+        const char* envSGS = std::getenv("SLACK_SIGMOID_SCALE");
+        if(envSGS) slackSigmoidScale = std::atof(envSGS);
+    }
+    if(slackSigmoid)
+        std::cout << "[MATCHING] slack-budget sigmoid enabled (scale=" << slackSigmoidScale << ")" << std::endl;
+    auto slackMul = [&](FF* a, FF* b) -> double {
+        if(!slackSigmoid) return 1.0;
+        double slA = a->getTimingSlack("D");
+        double slB = b->getTimingSlack("D");
+        double minSlack = std::min(slA, slB);
+        return 1.0 / (1.0 + std::exp(-minSlack / slackSigmoidScale));
+    };
+
     // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
     // so dist * distScale ≈ 1.0 for a typical neighbor distance
 
@@ -645,6 +679,13 @@ void Banking::doMatchingClustering(){
     int total_nodes = 0, total_edges = 0, total_matched = 0;
     int n_committed = 0, n_dropped_place = 0, n_dropped_cost = 0;
     int nEdgesChecked = 0, nEdgesZeroed = 0;  // debug: risk-adaptive stats
+
+    // Phase 4 optional: debank all existing MBFFs to 1-bit before re-matching
+    {
+        const char* envDA = std::getenv("DEBANK_ALL");
+        if(envDA && std::string(envDA) == "1")
+            mgr.debankAll();
+    }
 
     // ================================================================
     // Phase 1: Max-weight matching for 2-bit on all 1-bit FFs
@@ -761,8 +802,9 @@ void Banking::doMatchingClustering(){
                     double gain = savings - mgr.alpha * (newTNS - oldTNS);
 
                     if(gain > 0){
+                        double adjGain = gain * slackMul(ffA, ffB);
                         auto e = g.addEdge(gnodes[i], gnodes[j]);
-                        weight[e] = (long long)(gain * WEIGHT_SCALE);
+                        weight[e] = (long long)(adjGain * WEIGHT_SCALE);
                         edgeCount++;
                         optPMap[pairKey(i, j)] = evalP;
                     }
@@ -797,6 +839,7 @@ void Banking::doMatchingClustering(){
                                 adjGain += gain * edgeBonus / (1.0 + dist * distScale);
                             }
                         }
+                        adjGain *= slackMul(ffA, ffB);
                         auto e = g.addEdge(gnodes[i], gnodes[j]);
                         weight[e] = (long long)(adjGain * WEIGHT_SCALE);
                         edgeCount++;
@@ -931,6 +974,10 @@ void Banking::doMatchingClustering(){
             double t_graph_hb = 0, t_match_hb = 0, t_commit_hb = 0;
             int hb_nodes = 0, hb_edges = 0, hb_matched = 0;
             int hb_committed = 0, hb_dropped_place = 0, hb_dropped_cost = 0;
+            int hb_space_found = 0, hb_space_missed = 0;
+            double hb_sumDisp = 0, hb_maxDisp = 0;
+            int hb_nCFs = 0;
+            double hb_sumPowerSav = 0, hb_sumAreaSav = 0, hb_sumTNSCost = 0;
 
             for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
                 std::vector<FF*> localFFs;
@@ -955,6 +1002,7 @@ void Banking::doMatchingClustering(){
                 rtree_hb.insert(points.begin(), points.end());
 
                 double distScale_hb = 1.0;
+                double avgNN_hb = 1.0;
                 {
                     double sumNN = 0;
                     int nSampled = std::min((int)localFFs.size(), 200);
@@ -970,8 +1018,8 @@ void Banking::doMatchingClustering(){
                             sumNN += HPWL(localFFs[si]->getNewCoor(), localFFs[nn2[oi].second]->getNewCoor());
                         }
                     }
-                    double avgNN = (cnt > 0) ? sumNN / cnt : 1.0;
-                    distScale_hb = (avgNN > 1e-9) ? 1.0 / avgNN : 1.0;
+                    avgNN_hb = (cnt > 0) ? sumNN / cnt : 1.0;
+                    distScale_hb = (avgNN_hb > 1e-9) ? 1.0 / avgNN_hb : 1.0;
                 }
 
                 lemon::SmartGraph g_hb;
@@ -985,9 +1033,12 @@ void Banking::doMatchingClustering(){
 
                 // Store optimal positions for v2.1 commit
                 std::unordered_map<size_t, Coor> optPMap_hb;
+                // Phase 4: store pre-computed legal space positions for commit
+                std::unordered_map<size_t, Coor> spaceMap_hb;
                 auto pairKey_hb = [&](size_t a, size_t b) -> size_t {
                     return std::min(a,b) * localFFs.size() + std::max(a,b);
                 };
+                double maxSpaceDist = avgNN_hb * spaceRadiusMult;
 
                 for(size_t i = 0; i < localFFs.size(); i++){
                     FF* ffA = localFFs[i];
@@ -1007,15 +1058,13 @@ void Banking::doMatchingClustering(){
                         Coor coorB = ffB->getNewCoor();
                         std::vector<FF*> pair_ffs = {ffA, ffB};
 
+                        // Compute candidate position (used by both v2.1 and legacy)
+                        Coor evalP;
                         if(useV21){
-                            // v2.1: L1 feasibility on ALL constituent FFs
-                            // Collect all constituent FFs from both MBFFs
                             std::vector<FF*> allCFs;
                             for(FF* mbff : pair_ffs)
                                 for(auto& cf : mbff->getClusterFF())
                                     allCFs.push_back(cf);
-
-                            // Check L1 ball intersection of constituent FFs
                             double xlo_w = -DBL_MAX, xhi_w = DBL_MAX;
                             double ylo_w = -DBL_MAX, yhi_w = DBL_MAX;
                             for(FF* cf : allCFs){
@@ -1027,18 +1076,36 @@ void Banking::doMatchingClustering(){
                                 ylo_w = std::max(ylo_w, cfc.y - r);
                                 yhi_w = std::min(yhi_w, cfc.y + r);
                             }
-
-                            Coor evalP;
-                            if(xlo_w <= xhi_w && ylo_w <= yhi_w){
+                            if(xlo_w <= xhi_w && ylo_w <= yhi_w)
                                 evalP = findWindowOptimal(pair_ffs, chooseCell,
                                     xlo_w, xhi_w, ylo_w, yhi_w);
-                            } else {
+                            else
                                 evalP = Coor((coorA.x + coorB.x) / 2.0,
                                              (coorA.y + coorB.y) / 2.0);
-                            }
+                        } else {
+                            evalP = Coor((coorA.x + coorB.x) / 2.0,
+                                         (coorA.y + coorB.y) / 2.0);
+                        }
 
+                        // Phase 4: space feasibility check
+                        Coor costEvalPos = evalP;
+                        if(spaceAware){
+                            Coor spaceCoor = mgr.legalizer->FindNearestLegalSpace(
+                                evalP, chooseCell, maxSpaceDist);
+                            if(spaceCoor.x == DBL_MAX){
+                                hb_space_missed++;
+                                continue;
+                            }
+                            hb_space_found++;
+                            costEvalPos = spaceCoor;
+                            spaceMap_hb[pairKey_hb(i, j)] = spaceCoor;
+                        }
+
+                        // Compute gain
+                        double gain;
+                        if(useV21){
                             double oldTNS_h = 0, newTNS_h = 0;
-                            computePinTNS(pair_ffs, chooseCell, evalP, oldTNS_h, newTNS_h);
+                            computePinTNS(pair_ffs, chooseCell, costEvalPos, oldTNS_h, newTNS_h);
                             double savings_h = 0;
                             for(FF* ff : pair_ffs){
                                 savings_h += mgr.beta * ff->getCell()->getGatePower()
@@ -1046,30 +1113,24 @@ void Banking::doMatchingClustering(){
                             }
                             savings_h -= mgr.beta * chooseCell->getGatePower()
                                        + mgr.gamma * chooseCell->getArea();
-                            double gain = savings_h - mgr.alpha * (newTNS_h - oldTNS_h);
-
-                            if(gain > 0){
-                                auto e = g_hb.addEdge(gnodes_hb[i], gnodes_hb[j]);
-                                weight_hb[e] = (long long)(gain * WEIGHT_SCALE);
-                                edgeCount_hb++;
-                                optPMap_hb[pairKey_hb(i, j)] = evalP;
-                            }
+                            gain = savings_h - mgr.alpha * (newTNS_h - oldTNS_h);
                         } else {
-                            Coor median((coorA.x + coorB.x) / 2.0,
-                                        (coorA.y + coorB.y) / 2.0);
-                            double gain = CostCompare(median, chooseCell, pair_ffs);
-
-                            if(gain > EDGE_MIN_GAIN){
-                                double adjGain = gain;
-                                if(DIST_BONUS > 0){
-                                    double dist = HPWL(coorA, coorB);
-                                    adjGain += gain * DIST_BONUS / (1.0 + dist * distScale_hb);
-                                }
-                                auto e = g_hb.addEdge(gnodes_hb[i], gnodes_hb[j]);
-                                weight_hb[e] = (long long)(adjGain * WEIGHT_SCALE);
-                                edgeCount_hb++;
-                            }
+                            gain = CostCompare(costEvalPos, chooseCell, pair_ffs);
                         }
+
+                        if(gain <= EDGE_MIN_GAIN) continue;
+
+                        double adjGain = gain;
+                        if(!useV21 && DIST_BONUS > 0){
+                            double dist = HPWL(coorA, coorB);
+                            adjGain += gain * DIST_BONUS / (1.0 + dist * distScale_hb);
+                        }
+                        adjGain *= slackMul(ffA, ffB);
+
+                        auto e = g_hb.addEdge(gnodes_hb[i], gnodes_hb[j]);
+                        weight_hb[e] = (long long)(adjGain * WEIGHT_SCALE);
+                        edgeCount_hb++;
+                        if(useV21) optPMap_hb[pairKey_hb(i, j)] = costEvalPos;
                     }
                 }
 
@@ -1107,7 +1168,14 @@ void Banking::doMatchingClustering(){
                     std::vector<FF*> pair_ffs = {ffA, ffB};
 
                     Coor fpTarget;
-                    if(useV21){
+                    if(spaceAware){
+                        auto it = spaceMap_hb.find(pairKey_hb(i, j));
+                        if(it != spaceMap_hb.end())
+                            fpTarget = it->second;
+                        else
+                            fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                            (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                    } else if(useV21){
                         auto it = optPMap_hb.find(pairKey_hb(i, j));
                         if(it != optPMap_hb.end())
                             fpTarget = it->second;
@@ -1118,7 +1186,11 @@ void Banking::doMatchingClustering(){
                         fpTarget = Coor((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
                                         (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
                     }
-                    Coor placeCoor = mgr.legalizer->FindPlace(fpTarget, chooseCell);
+                    // Re-validate: space may have been consumed by earlier commits
+                    Coor placeCoor = mgr.legalizer->FindNearestLegalSpace(
+                        fpTarget, chooseCell, avgNN_hb);
+                    if(placeCoor.x == DBL_MAX)
+                        placeCoor = mgr.legalizer->FindPlace(fpTarget, chooseCell);
                     if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
                         hb_dropped_place++;
                         continue;
@@ -1129,6 +1201,39 @@ void Banking::doMatchingClustering(){
                         hb_dropped_cost++;
                         continue;
                     }
+
+                    // Diagnostic: compute per-constituent displacement
+                    double maxCFDisp = 0;
+                    double sumCFDisp = 0;
+                    int nCFs = 0;
+                    for(FF* mbff : pair_ffs){
+                        for(auto& cf : mbff->getClusterFF()){
+                            FF* phys = cf->getPhysicalFF();
+                            Coor cfPos = phys ? phys->getNewCoor() : cf->getNewCoor();
+                            double d = HPWL(cfPos, placeCoor);
+                            sumCFDisp += d;
+                            maxCFDisp = std::max(maxCFDisp, d);
+                            nCFs++;
+                        }
+                    }
+                    hb_sumDisp += sumCFDisp;
+                    hb_maxDisp = std::max(hb_maxDisp, maxCFDisp);
+                    hb_nCFs += nCFs;
+
+                    // Diagnostic: cost component breakdown
+                    double powerSav = 0, areaSav = 0;
+                    for(FF* ff : pair_ffs){
+                        powerSav += mgr.beta * ff->getCell()->getGatePower();
+                        areaSav += mgr.gamma * ff->getCell()->getArea();
+                    }
+                    powerSav -= mgr.beta * chooseCell->getGatePower();
+                    areaSav -= mgr.gamma * chooseCell->getArea();
+                    double oldTNS_d = 0, newTNS_d = 0;
+                    computePinTNS(pair_ffs, chooseCell, placeCoor, oldTNS_d, newTNS_d);
+                    double tnsCost = mgr.alpha * (newTNS_d - oldTNS_d);
+                    hb_sumPowerSav += powerSav;
+                    hb_sumAreaSav += areaSav;
+                    hb_sumTNSCost += tnsCost;
 
                     FF* newFF = mgr.bankFF(placeCoor, chooseCell, pair_ffs);
                     mgr.legalizer->UpdateRows(newFF);
@@ -1147,7 +1252,22 @@ void Banking::doMatchingClustering(){
                       << " nodes=" << hb_nodes << " edges=" << hb_edges
                       << " matched=" << hb_matched << " committed=" << hb_committed
                       << " dropped_place=" << hb_dropped_place
-                      << " dropped_cost=" << hb_dropped_cost << std::endl;
+                      << " dropped_cost=" << hb_dropped_cost;
+            if(spaceAware)
+                std::cout << " space_found=" << hb_space_found
+                          << " space_missed=" << hb_space_missed;
+            std::cout << std::endl;
+            if(hb_committed > 0){
+                std::cout << "[MATCHING] " << targetBit << "bit diag:"
+                          << " avgCFDisp=" << hb_sumDisp / hb_nCFs
+                          << " maxCFDisp=" << hb_maxDisp
+                          << " nCFs=" << hb_nCFs
+                          << " powerSav=" << hb_sumPowerSav
+                          << " areaSav=" << hb_sumAreaSav
+                          << " tnsCost=" << hb_sumTNSCost
+                          << " netGain=" << (hb_sumPowerSav + hb_sumAreaSav - hb_sumTNSCost)
+                          << std::endl;
+            }
 
             // Rebuild legalizer to see committed matching results before greedy
             delete mgr.legalizer;

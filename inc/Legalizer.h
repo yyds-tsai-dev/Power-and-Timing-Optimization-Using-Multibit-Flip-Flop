@@ -36,7 +36,15 @@ public:
     void initial();
     void run();
     Coor FindPlace(const Coor &coor, Cell * cell);
+    Coor FindNearestLegalSpace(const Coor &coor, Cell* cell, double maxDist);
     void UpdateRows(FF* newFF);
+    // Phase 5: free a rect from the row/subrow state (inverse of UpdateRows' slicing).
+    // Used by postLGDecluster so the newly-debanked 1-bit FFs can reclaim the
+    // MBFF's footprint instead of searching around a phantom-occupied rect.
+    void FreeRect(const Coor &lgCoor, double width, double height);
+    // Phase 5: drop the Node tracking `ff` from legalizer->ffs so DP's GlobalSwap
+    // stops iterating over a stale entry whose FFPtr has been recycled by debankFF.
+    void RemoveNodeByFFPtr(FF* ff);
     // Phase 3A: slice rows for a synthetic placement footprint (coord + cell),
     // without binding to a real FF in mgr.FF_Map. Returns the index of the
     // stub Node appended to ffs so the merge phase can upgrade it in place.

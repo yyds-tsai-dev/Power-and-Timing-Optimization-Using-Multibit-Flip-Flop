@@ -120,6 +120,8 @@ public:
     // and it will delete old and insert new FF to FF_Map
     void assignSlot(FF* newFF);
     std::vector<FF*> debankFF(FF* MBFF, Cell* debankCellType);
+    void debankAll();
+    void postLGDecluster(); // Phase 5: undo bad banking decisions using LG-accurate positions
     // the FF after debank will be assign to debankCellType (maybe this can be a vector)
     void getNS(double& TNS, double& WNS, bool show); // this retunr TNS and WNS of whole design (all FF in FF_Map)
     double getTNS();
