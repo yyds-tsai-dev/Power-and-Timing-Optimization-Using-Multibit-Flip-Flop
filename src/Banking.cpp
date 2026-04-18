@@ -699,6 +699,25 @@ void Banking::doMatchingClustering(){
     };
     int libGate_skipped = 0;
 
+    // Phase 3Z Step 2: Safety-margin tightening on commit-time realGain.
+    // Original check: if(realGain < 0) drop. With margin, check becomes
+    // if(realGain < safetyMargin) drop — catches "pair looks good in matching
+    // math but ends up bad at actual legal coord".
+    // Both default 0.0 → bit-exact with pre-3Z behavior when unset.
+    double safetyMargin = 0.0;      // higher-bit
+    double safetyMargin2B = 0.0;    // 2-bit
+    {
+        const char* envSM = std::getenv("SAFETY_MARGIN");
+        if(envSM) safetyMargin = std::atof(envSM);
+        const char* envSM2 = std::getenv("SAFETY_MARGIN_2B");
+        if(envSM2) safetyMargin2B = std::atof(envSM2);
+    }
+    if(safetyMargin != 0.0 || safetyMargin2B != 0.0)
+        std::cout << "[MATCHING] safety margins: 2b=" << safetyMargin2B
+                  << " hb=" << safetyMargin << std::endl;
+    int hb_dropped_by_margin = 0;
+    int n_dropped_by_margin = 0;
+
     // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
     // so dist * distScale ≈ 1.0 for a typical neighbor distance
 
@@ -936,6 +955,10 @@ void Banking::doMatchingClustering(){
                 n_dropped_cost++;
                 continue;
             }
+            if(safetyMargin2B > 0.0 && realGain < safetyMargin2B){
+                n_dropped_by_margin++;
+                continue;
+            }
 
             FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
             mgr.legalizer->UpdateRows(newFF);
@@ -962,7 +985,8 @@ void Banking::doMatchingClustering(){
               << " nodes=" << total_nodes << " edges=" << total_edges
               << " matched=" << total_matched << " committed=" << n_committed
               << " dropped_place=" << n_dropped_place
-              << " dropped_cost=" << n_dropped_cost << std::endl;
+              << " dropped_cost=" << n_dropped_cost
+              << " dropped_margin=" << n_dropped_by_margin << std::endl;
     if(nEdgesChecked > 0)
         std::cout << "[MATCHING] risk-adaptive: " << nEdgesZeroed << "/" << nEdgesChecked
                   << " edges zeroed (" << (100.0*nEdgesZeroed/nEdgesChecked) << "%)" << std::endl;
@@ -1240,6 +1264,10 @@ void Banking::doMatchingClustering(){
                         hb_dropped_cost++;
                         continue;
                     }
+                    if(safetyMargin > 0.0 && realGain < safetyMargin){
+                        hb_dropped_by_margin++;
+                        continue;
+                    }
 
                     // Diagnostic: compute per-constituent displacement
                     double maxCFDisp = 0;
@@ -1291,7 +1319,8 @@ void Banking::doMatchingClustering(){
                       << " nodes=" << hb_nodes << " edges=" << hb_edges
                       << " matched=" << hb_matched << " committed=" << hb_committed
                       << " dropped_place=" << hb_dropped_place
-                      << " dropped_cost=" << hb_dropped_cost;
+                      << " dropped_cost=" << hb_dropped_cost
+                      << " dropped_margin=" << hb_dropped_by_margin;
             if(spaceAware)
                 std::cout << " space_found=" << hb_space_found
                           << " space_missed=" << hb_space_missed;
