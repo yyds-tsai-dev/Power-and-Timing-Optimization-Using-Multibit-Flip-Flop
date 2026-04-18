@@ -22,6 +22,15 @@
 
 class Node;
 class Row;
+
+// P4: top-K nearest legal slot probe result (read-only).
+// Used by Banking's defer-and-batch path (ALG1_2B) to compute NTU S_space
+// priority score D_{U,2} - D_{U,1} before committing any placement.
+struct LegalCandidate {
+    Coor coor;
+    double disp;
+};
+
 class Legalizer{
 private:
     Manager& mgr;
@@ -37,6 +46,10 @@ public:
     void run();
     Coor FindPlace(const Coor &coor, Cell * cell);
     Coor FindNearestLegalSpace(const Coor &coor, Cell* cell, double maxDist);
+    // P4: read-only top-2 legal-slot probe used for NTU Algorithm 1 priority.
+    // Returns up to 2 nearest legal coords sorted ascending by displacement.
+    // Does NOT mutate subrow reject caches (unlike FindPlace).
+    std::vector<LegalCandidate> FindTop2LegalCoors(const Coor &coor, Cell *cell);
     void UpdateRows(FF* newFF);
     // Phase 5: free a rect from the row/subrow state (inverse of UpdateRows' slicing).
     // Used by postLGDecluster so the newly-debanked 1-bit FFs can reclaim the
@@ -74,6 +87,8 @@ private:
     size_t FindClosestRow(const Coor &coor);
     static int FindClosestSubrow(Node *ff, Row *row);
     void PredictFFLGPlace(const Coor &coor, Cell* cell, size_t row_idx, bool &placeable, double &minDisplacement, Coor &newCoor);
+    // P4: top-2 variant of PredictFFLGPlace. Read-only: does not touch addRejectCell.
+    void PredictFFLGPlaceTop2(const Coor &coor, Cell* cell, size_t row_idx, std::vector<LegalCandidate> &top2);
     double PlaceFF(Node *ff, size_t row_idx, bool& placeable);
     bool ContinousAndEmpty(double startX, double startY, double w, double h, int row_idx);
     static double getDisplacement(const Coor &Coor1, const Coor &Coor2);

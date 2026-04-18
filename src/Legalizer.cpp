@@ -246,6 +246,81 @@ Coor Legalizer::FindNearestLegalSpace(const Coor &coor, Cell* cell, double maxDi
     return newCoor;
 }
 
+// P4: read-only top-2 legal-slot probe. Mirrors FindPlace's row-scan structure
+// but maintains best-2 (sorted asc by disp) instead of best-1, and prunes the
+// row sweep by top2[1].disp (falls back to DBL_MAX until 2 slots are known).
+// Does NOT mutate subrow reject caches — Banking's deferred batch must be able
+// to call this repeatedly across candidates without polluting later FindPlace
+// calls during the commit pass.
+std::vector<LegalCandidate> Legalizer::FindTop2LegalCoors(const Coor &coor, Cell *cell){
+    size_t closest_row_idx = FindClosestRow(coor);
+    std::vector<LegalCandidate> top2;
+    top2.reserve(2);
+
+    auto threshold = [&]() -> double {
+        return top2.size() < 2 ? DBL_MAX : top2[1].disp;
+    };
+
+    PredictFFLGPlaceTop2(coor, cell, closest_row_idx, top2);
+    int down_row_idx = (int)closest_row_idx - 1;
+    int up_row_idx = (int)closest_row_idx + 1;
+    while(down_row_idx >= 0 && std::abs(coor.y - rows[down_row_idx]->getStartCoor().y) < threshold()){
+        if(!rows[down_row_idx]->hasCell(cell)){
+            PredictFFLGPlaceTop2(coor, cell, down_row_idx, top2);
+        }
+        down_row_idx--;
+    }
+    while(up_row_idx < (int)rows.size() && std::abs(coor.y - rows[up_row_idx]->getStartCoor().y) < threshold()){
+        if(!rows[up_row_idx]->hasCell(cell)){
+            PredictFFLGPlaceTop2(coor, cell, up_row_idx, top2);
+        }
+        up_row_idx++;
+    }
+    return top2;
+}
+
+// P4 helper: read-only row sweep that folds valid coords into a size-2 sorted
+// buffer. Pruning mirrors PredictFFLGPlace (subrowEnd exceeds threshold → break)
+// but never touches subrow->addRejectCell.
+void Legalizer::PredictFFLGPlaceTop2(const Coor &coor, Cell* cell, size_t row_idx, std::vector<LegalCandidate> &top2){
+    const auto &subrows = rows[row_idx]->getSubrows();
+    auto pruneDisp = [&]() -> double {
+        return top2.size() < 2 ? DBL_MAX : top2[1].disp;
+    };
+    auto consider = [&](const Coor &c, double d){
+        // Dedup: a slot already in top2 (different row sweep hitting same site).
+        for(const auto &lc : top2){
+            if(std::abs(lc.coor.x - c.x) < 1e-6 && std::abs(lc.coor.y - c.y) < 1e-6) return;
+        }
+        if(top2.size() < 2){
+            top2.push_back({c, d});
+            if(top2.size() == 2 && top2[0].disp > top2[1].disp) std::swap(top2[0], top2[1]);
+        } else if(d < top2[1].disp){
+            top2[1] = {c, d};
+            if(top2[0].disp > top2[1].disp) std::swap(top2[0], top2[1]);
+        }
+    };
+
+    for(size_t i = 0; i < subrows.size(); i++){
+        const auto &subrow = subrows[i];
+        if(subrow->hasCell(cell)) continue;
+        double alignedStartX = rows[row_idx]->getStartCoor().x + std::ceil((int)(subrow->getStartX() - rows[row_idx]->getStartCoor().x) / rows[row_idx]->getSiteWidth()) * rows[row_idx]->getSiteWidth();
+        for(int x = alignedStartX; x <= subrow->getEndX() && x != rows[row_idx]->getEndX(); x += rows[row_idx]->getSiteWidth()){
+            Coor currCoor = Coor(x, rows[row_idx]->getStartCoor().y);
+            double displacement = getDisplacement(coor, currCoor);
+            if(displacement > pruneDisp()){
+                Coor subrowEndCoor = Coor(subrow->getEndX(), rows[row_idx]->getStartCoor().y);
+                if(getDisplacement(coor, subrowEndCoor) > pruneDisp()) break;
+                continue;
+            }
+            bool canPlace = ContinousAndEmpty(x, rows[row_idx]->getStartCoor().y, cell->getW(), cell->getH(), row_idx);
+            if(canPlace){
+                consider(currCoor, displacement);
+            }
+        }
+    }
+}
+
 void Legalizer::UpdateRows(FF* newFF){
     Node *ff = new Node();
     ff->setName(newFF->getInstanceName());
