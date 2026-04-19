@@ -2,9 +2,34 @@
 CXX = g++
 CXXFLAGS = -I ./inc -I ./lib -std=c++14 -fopenmp
 OPTFLAGS = -march=native -funroll-loops -finline-functions -ffast-math -O3
-DEBUGFLAGS = -DENABLE_DEBUG_DP -DENABLE_DEBUG_LGZ -DENABLE_DEBUG_CHECKER -DENABLE_DEBUG_TIMER -DENABLE_DEBUG_MS -DENABLE_DEBUG_BAN -DENABLE_DEBUG_MGR #-DNDEBUG(for assert) 
+DEBUGFLAGS = -DENABLE_DEBUG_DP -DENABLE_DEBUG_LGZ -DENABLE_DEBUG_CHECKER -DENABLE_DEBUG_TIMER -DENABLE_DEBUG_MS -DENABLE_DEBUG_BAN -DENABLE_DEBUG_MGR #-DNDEBUG(for assert)
 RELEASEFLAGS = -DNDEBUG
 WARNINGS = -g -Wall -static
+
+# OR-tools integration (Route A: window-local ILP banking).
+# USE_ORTOOLS=1 pulls in MILP path; default OFF → byte-exact Blossom fallback.
+USE_ORTOOLS ?= 0
+ORT_ROOT = third_party/ortools
+ifeq ($(USE_ORTOOLS),1)
+    CXXFLAGS += -std=c++17 -DUSE_ORTOOLS \
+                -DUSE_BOP -DUSE_CBC -DUSE_CLP -DUSE_GLOP -DUSE_HIGHS \
+                -DUSE_MATH_OPT -DUSE_PDLP -DUSE_SCIP \
+                -DOR_PROTO_DLL= -DPROTOBUF_USE_DLLS \
+                -DHAVE_CONFIG_H -DEIGEN_MPL2_ONLY \
+                -isystem $(ORT_ROOT)/include \
+                -isystem $(ORT_ROOT)/include/coin \
+                -isystem $(ORT_ROOT)/include/highs \
+                -isystem $(ORT_ROOT)/include/eigen3
+    # OR-tools ships dynamic .so libs; cannot combine with -static on the final link.
+    # Override WARNINGS to drop -static when USE_ORTOOLS=1. Binary needs rpath to ortools/lib64.
+    WARNINGS := $(filter-out -static,$(WARNINGS))
+    LINKER += -L$(ORT_ROOT)/lib64 \
+              -Wl,-rpath,$(abspath $(ORT_ROOT))/lib64 \
+              -Wl,--copy-dt-needed-entries \
+              -lortools
+    # -std=c++17 appears twice in CXXFLAGS (once above, once original c++14); c++17 wins last.
+    CXXFLAGS := $(filter-out -std=c++14,$(CXXFLAGS))
+endif
 
 # Valgrind for memory issue
 CHECKCC = valgrind
@@ -52,7 +77,7 @@ endif
 # directory for regression
 REGDIR = regression
 
-.PHONY: all check clean calc
+.PHONY: all check clean calc setup_ortools toy_mip
 
 # Name of the executable
 BIN = cadb_0015_final
@@ -161,6 +186,47 @@ cppcheck:
 
 calc:
 	(find src inc -type f -name "*.cpp" -o -name "*.h" && echo main.cpp) | xargs wc -l | tail -n 1
+
+# One-shot OR-tools setup: downloads AlmaLinux-8.10 prebuilt tarball, extracts
+# to third_party/, links `ortools` alias, and hides the bundled boost dir
+# (its presence would shadow system boost and break Banking.cpp's c++17 mix).
+# Run once before `make USE_ORTOOLS=1`. Idempotent.
+ORT_VERSION = 9.15.6755
+ORT_TARBALL = or-tools_x86_64_AlmaLinux-8.10_cpp_v$(ORT_VERSION).tar.gz
+ORT_URL = https://github.com/google/or-tools/releases/download/v9.15/$(ORT_TARBALL)
+ORT_EXTRACTED = third_party/or-tools_x86_64_AlmaLinux-8.10_cpp_v$(ORT_VERSION)
+setup_ortools:
+	mkdir -p third_party
+	@if [ ! -d "$(ORT_EXTRACTED)" ]; then \
+	  echo "Fetching $(ORT_URL)"; \
+	  curl -sSL --max-time 300 -o third_party/$(ORT_TARBALL) "$(ORT_URL)"; \
+	  tar xzf third_party/$(ORT_TARBALL) -C third_party/; \
+	  rm -f third_party/$(ORT_TARBALL); \
+	else echo "[setup_ortools] $(ORT_EXTRACTED) already present"; fi
+	ln -sfn $(notdir $(ORT_EXTRACTED)) third_party/ortools
+	@if [ -d "third_party/ortools/include/boost" ]; then \
+	  mv third_party/ortools/include/boost third_party/ortools/include/_bundled_boost_unused_by_public_api; \
+	  echo "[setup_ortools] hid bundled boost (public API does not need it)"; \
+	fi
+	@echo "[setup_ortools] done. Use: make USE_ORTOOLS=1"
+
+# Route A infrastructure smoke: toy set-partitioning MILP via OR-tools.
+# Runs independently of main binary; validates third_party/ortools integration.
+toy_mip: tools/toy_set_partition.cpp
+	$(CXX) -std=c++17 -O2 \
+	    -DUSE_BOP -DUSE_CBC -DUSE_CLP -DUSE_GLOP -DUSE_HIGHS \
+	    -DUSE_MATH_OPT -DUSE_PDLP -DUSE_SCIP \
+	    -DOR_PROTO_DLL= -DPROTOBUF_USE_DLLS \
+	    -DHAVE_CONFIG_H -DEIGEN_MPL2_ONLY \
+	    -isystem $(ORT_ROOT)/include \
+	    -isystem $(ORT_ROOT)/include/coin \
+	    -isystem $(ORT_ROOT)/include/highs \
+	    -isystem $(ORT_ROOT)/include/eigen3 \
+	    $< \
+	    -L$(ORT_ROOT)/lib64 -Wl,-rpath,$(abspath $(ORT_ROOT))/lib64 \
+	    -Wl,--copy-dt-needed-entries -lortools \
+	    -o tools/toy_set_partition
+	./tools/toy_set_partition
 
 boost:
 	chmod +x scripts/GetBoost.sh

@@ -1,1 +1,5 @@
 drawDie/drawDie
+
+# Route A: OR-tools prebuilt tree (download via `make setup_ortools`)
+third_party/
+tools/toy_set_partition
