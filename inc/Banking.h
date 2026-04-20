@@ -58,6 +58,17 @@ public:
     Coor ComputeOptimalPosition(Cell* chooseCell, const std::vector<FF*>& FFToBank);
     static double weightedMedian(std::vector<std::pair<double,double>>& coordWeights);
 
+    // RAII opt-in guard: while alive, ENABLES bin-density Δλ in CostCompare.
+    // Default behavior is OFF, since most CostCompare callers (graph-build,
+    // greedy 4-bit fallback, post-LG resynth) are over-pessimistic against the
+    // binTable — penalizing pairs whose violations the legalizer would resolve
+    // anyway. Wrap the matching commit Pass-3 realGain check (the only point
+    // where the binTable is incrementally accurate) with CommitBinAware.
+    static thread_local int commitBinAwareDepth;
+    struct CommitBinAware {
+        CommitBinAware()  { ++commitBinAwareDepth; }
+        ~CommitBinAware() { --commitBinAwareDepth; }
+    };
 };
 
 #endif

@@ -358,6 +358,45 @@ void Legalizer::RemoveNodeByFFPtr(FF* ff){
     }
 }
 
+// Hybrid Route A / Stage 1 — snapshot subrow vectors for every row that
+// UpdateRows(rect) would iterate. Matches UpdateRows' loop condition exactly
+// (row.y > lgCoor.y + height → break). Deep-copies each Subrow* so the snap
+// is independent of subsequent slicing() mutations.
+std::vector<RowSubrowSnap> Legalizer::SnapshotRowsForRect(
+    const Coor& lgCoor, double height) {
+    std::vector<RowSubrowSnap> out;
+    for(size_t i = 0; i < rows.size(); i++){
+        if(rows[i]->getStartCoor().y > lgCoor.y + height) break;
+        RowSubrowSnap snap;
+        snap.row_idx = i;
+        const auto& cur = rows[i]->getSubrows();
+        snap.subrows.reserve(cur.size());
+        for(auto* sr : cur) snap.subrows.push_back(new Subrow(*sr));
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+// Restore row subrows from a snap: delete current post-mutation pointers,
+// install snap's pre-mutation copies. Consumes the snap.
+void Legalizer::RestoreRowSubrowsFromSnap(std::vector<RowSubrowSnap>& snap){
+    for(auto& rs : snap){
+        auto& cur = rows[rs.row_idx]->getSubrows();
+        for(auto* sr : cur) delete sr;
+        cur = std::move(rs.subrows);
+    }
+    snap.clear();
+}
+
+// Discard a snap without installing — frees our copies, leaves the live row
+// state untouched. Use after a committed (non-rolled-back) UpdateRows.
+void Legalizer::DiscardRowSnap(std::vector<RowSubrowSnap>& snap){
+    for(auto& rs : snap){
+        for(auto* sr : rs.subrows) delete sr;
+    }
+    snap.clear();
+}
+
 // Phase 5: free a rect from row state. Inverse of UpdateRows' slicing.
 // Insert a new subrow covering [x0,x1] into each row whose startY falls in
 // [y0,y1), then sweep and merge any subrows that now abut each other. The

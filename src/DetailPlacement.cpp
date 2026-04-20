@@ -16,14 +16,34 @@ void DetailPlacement::run(){
     DEBUG_DP("Running detail placement!");
     BuildGlobalRtreeMaps();
 
+    // DP_SLOT_ASSIGN mode selector:
+    //   0 = off (pre-ship byte-exact)
+    //   2 = post-pass only (call DetailAssignmentMBFF after GS+CC loop)
+    //   3 = per-iter pre (call at start of each iter, before GS+CC)
+    //   4 = per-iter post (call at end of each iter, after GS+CC)
+    //   5 = pre + post pass (call once before loop + once after)
+    //   6 = per-iter pre + final post
+    int slotAssignMode = 2;
+    if(const char* e = std::getenv("DP_SLOT_ASSIGN")) slotAssignMode = std::atoi(e);
+    bool perIterPre  = (slotAssignMode == 3) || (slotAssignMode == 6);
+    bool perIterPost = (slotAssignMode == 4);
+    bool prePass     = (slotAssignMode == 5);
+    bool postPass    = (slotAssignMode == 2) || (slotAssignMode == 5) || (slotAssignMode == 6);
+
+    if(prePass) DetailAssignmentMBFF();
+
     const int MAX_ITER = 10;
     for(int iter = 0; iter < MAX_ITER; iter++){
+        if(perIterPre) DetailAssignmentMBFF();
         size_t swaps = GlobalSwap();
         size_t changes = ChangeCell();
+        if(perIterPost) DetailAssignmentMBFF();
         DEBUG_DP("Iter " << iter << ": swaps=" << swaps << " cellChanges=" << changes);
         if(swaps == 0 && changes == 0) break;
         if(changes > 0) BuildGlobalRtreeMaps();
     }
+
+    if(postPass) DetailAssignmentMBFF();
 }
 
 void DetailPlacement::BuildGlobalRtreeMaps(){
@@ -59,6 +79,10 @@ size_t DetailPlacement::GlobalSwap(){
     DEBUG_DP("Global Swap");
     int GS_K = 5;
     if(const char* e = std::getenv("GS_K")) GS_K = std::atoi(e);
+    // GS_MIN_GAIN: only accept swaps whose improvement exceeds this raw-cost
+    // threshold. Default 0.0 = strict improvement (pre-ship behavior).
+    double GS_MIN_GAIN = 0.0;
+    if(const char* e = std::getenv("GS_MIN_GAIN")) GS_MIN_GAIN = std::atof(e);
     size_t swapCount = 0;
     for(size_t id = 0; id < legalizer->ffs.size(); id++){
         Node *ff = legalizer->ffs[id];
@@ -72,7 +96,7 @@ size_t DetailPlacement::GlobalSwap(){
         RtreeMaps[ff->getCell()].query(bgi::nearest(queryPoint, GS_K), std::back_inserter(nearestResults));
 
         // Find best swap partner among K candidates
-        double bestImprovement = 0;
+        double bestImprovement = GS_MIN_GAIN;
         int bestIdx = -1;
         PointWithID bestPoint;
         for(auto& candidate : nearestResults){
@@ -135,6 +159,114 @@ size_t DetailPlacement::GlobalSwap(){
 
 void DetailPlacement::DetailAssignmentMBFF(){
     DEBUG_DP("DetailAssignmentMBFF");
+
+    // DP_SLOT_INTRA_ONLY=1 (default): pure per-MBFF label permutation. Each
+    // multi-bit MBFF's cluster FFs are reassigned to slots of the same MBFF
+    // via Hungarian on a k*k TNS-contribution cost matrix. Since the FF's
+    // physical coord doesn't change (only pin offset via D0/D1/Q0/Q1 changes),
+    // there is zero cross-MBFF cascade — the window accept pathology that
+    // blocks the cross-MBFF mode (tc2 +3.56%, hc01 +1.73%) is absent here.
+    bool intraOnly = true;
+    if(const char* e = std::getenv("DP_SLOT_INTRA_ONLY")) intraOnly = std::atoi(e) != 0;
+
+    if(intraOnly){
+        for(auto& pair : mgr.FF_Map){
+            FF* mbff = pair.second;
+            size_t bits = mbff->getCell()->getBits();
+            if(bits < 2) continue;
+            auto& clusterFFs = mbff->getClusterFF();
+            if(clusterFFs.size() != bits) continue;
+            bool anyEmpty = false;
+            for(size_t s = 0; s < bits; s++){
+                if(clusterFFs[s] == nullptr){ anyEmpty = true; break; }
+            }
+            if(anyEmpty) continue;
+
+            // Snapshot FFs indexed by current slot. addClusterFF overwrites by
+            // slot, so we need an immutable view during the Hungarian write-back.
+            std::vector<FF*> oldCluster(clusterFFs.begin(), clusterFFs.end());
+
+            // Build cost[i][j] = max(0, -newSlack) summed over curFF's D pin
+            // and all Q-downstream nextStage endpoints if FF at slot i moves
+            // to slot j of the same MBFF. Same per-pin TNS model as the
+            // cross-MBFF branch below.
+            std::vector<std::vector<double>> cost(bits, std::vector<double>(bits, 0));
+            #pragma omp parallel for num_threads(MAX_THREADS)
+            for(size_t idx = 0; idx < bits; idx++){
+                FF* curFF = oldCluster[idx];
+                for(size_t j = 0; j < bits; j++){
+                    PrevInstance prevInstance = curFF->getPrevInstance();
+                    std::string pinName = std::to_string(j);
+                    Coor newCoorD = mbff->getNewCoor() + mbff->getPinCoor("D" + pinName);
+                    double delta_hpwl = 0;
+                    Coor inputCoor;
+                    // D pin cost
+                    if(prevInstance.instance){
+                        if(prevInstance.cellType == CellType::IO){
+                            inputCoor = prevInstance.instance->getCoor();
+                            double old_hpwl = HPWL(inputCoor, curFF->getOriginalD());
+                            double new_hpwl = HPWL(inputCoor, newCoorD);
+                            delta_hpwl += old_hpwl - new_hpwl;
+                        }
+                        else if(prevInstance.cellType == CellType::GATE){
+                            inputCoor = prevInstance.instance->getCoor() + prevInstance.instance->getPinCoor(prevInstance.pinName);
+                            double old_hpwl = HPWL(inputCoor, curFF->getOriginalD());
+                            double new_hpwl = HPWL(inputCoor, newCoorD);
+                            delta_hpwl += old_hpwl - new_hpwl;
+                        }
+                        else{
+                            FF* inputFF = dynamic_cast<FF*>(prevInstance.instance);
+                            inputCoor = inputFF->getOriginalQ();
+                            Coor newCoorQ = inputFF->getPhysicalFF()->getNewCoor() + inputFF->getPhysicalFF()->getPinCoor("Q" + inputFF->getPhysicalPinName());
+                            double old_hpwl = HPWL(inputCoor, curFF->getOriginalD());
+                            double new_hpwl = HPWL(newCoorQ, newCoorD);
+                            delta_hpwl += old_hpwl - new_hpwl;
+                        }
+                    }
+                    double newSlack = curFF->getTimingSlack("D") + mgr.DisplacementDelay * delta_hpwl;
+                    cost[idx][j] = newSlack < 0 ? -newSlack : 0;
+
+                    // Q pin cost (all downstream endpoints)
+                    for(auto& nextFF : curFF->getNextStage()){
+                        Coor originalInput = curFF->getOriginalQ();
+                        Coor newInput = mbff->getNewCoor() + mbff->getPinCoor("Q" + pinName);
+                        if(nextFF.outputGate){
+                            inputCoor = nextFF.outputGate->getCoor() + nextFF.outputGate->getPinCoor(nextFF.pinName);
+                            double old_hpwl = HPWL(inputCoor, originalInput);
+                            double new_hpwl = HPWL(inputCoor, newInput);
+                            delta_hpwl = old_hpwl - new_hpwl;
+                        }
+                        else{
+                            Coor newCoorDNext = nextFF.ff->getPhysicalFF()->getNewCoor() + nextFF.ff->getPhysicalFF()->getPinCoor("D" + nextFF.ff->getPhysicalPinName());
+                            double old_hpwl = HPWL(nextFF.ff->getOriginalD(), originalInput);
+                            double new_hpwl = HPWL(newCoorDNext, newInput);
+                            delta_hpwl = old_hpwl - new_hpwl;
+                        }
+                        newSlack = (curFF->getOriginalQpinDelay() - mbff->getCell()->getQpinDelay()) + nextFF.ff->getTimingSlack("D") + mgr.DisplacementDelay * delta_hpwl;
+                        cost[idx][j] += newSlack < 0 ? -newSlack : 0;
+                    }
+                }
+            }
+
+            HungarianAlgorithm HungAlgo;
+            std::vector<int> assignment;
+            HungAlgo.Solve(cost, assignment);
+
+            // assignment[i] = new slot for FF currently in slot i. Apply as a
+            // full permutation write-back from oldCluster snapshot.
+            for(size_t i = 0; i < bits; i++){
+                int newSlot = assignment[i];
+                FF* curFF = oldCluster[i];
+                curFF->setPhysicalFF(mbff, newSlot);
+                mbff->addClusterFF(curFF, newSlot);
+            }
+        }
+        return;
+    }
+
+    // Cross-MBFF branch (DP_SLOT_INTRA_ONLY=0): original rtree-window sampling.
+    // Kept for thesis ablation; default off because the per-window accept test
+    // cascades on cross-MBFF moves (tc2 +3.56%, hc01 +1.73%).
     srand(2001);
     size_t max_clk_idx = 0;
     for(const auto &pair : mgr.FF_Map){
@@ -283,6 +415,16 @@ void DetailPlacement::DetailAssignmentMBFF(){
 
 size_t DetailPlacement::ChangeCell(){
     DEBUG_DP("Change Cell");
+    // CC_DISABLE=1 skips ChangeCell entirely. Used for A/B validation that
+    // ChangeCell's probing-without-locking isn't interfering with some other
+    // experiment. CC_MIN_GAIN imposes a strict-improvement threshold (raw
+    // cost units) on the cell-swap accept test; default 0 = pre-ship.
+    bool ccDisable = false;
+    double ccMinGain = 0.0;
+    if(const char* e = std::getenv("CC_DISABLE")) ccDisable = std::atoi(e) != 0;
+    if(const char* e = std::getenv("CC_MIN_GAIN")) ccMinGain = std::atof(e);
+    if(ccDisable) return 0;
+
     size_t changeCount = 0;
     vector<FF*> FFs;
     FFs.reserve(mgr.FF_Map.size());
@@ -304,7 +446,7 @@ size_t DetailPlacement::ChangeCell(){
                 curFF->setCell(targetCell);
                 double totalCost = curFF->getCost();
                 curFF->setCell(originalCell);
-                if(totalCost < bestCost){
+                if(totalCost < bestCost - ccMinGain){
                     bestCost = totalCost;
                     bestCell = targetCell;
                 }

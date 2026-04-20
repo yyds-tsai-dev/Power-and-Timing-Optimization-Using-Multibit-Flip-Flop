@@ -1,4 +1,7 @@
 #include "Manager.h"
+#include <boost/geometry/index/rtree.hpp>
+#include <lemon/smart_graph.h>
+#include <lemon/matching.h>
 Manager::Manager():
     alpha(0),
     beta(0),
@@ -76,20 +79,24 @@ void Manager::preLegalize(){
 }
 
 void Manager::banking(){
+    binTable.invalidate();
     Banking banking(*this);
     banking.run();
 }
 
 void Manager::postBankingOptimize(){
+    binTable.invalidate();
     postBankingOptimizer postOptimize(*this);
     postOptimize.run();
 }
 
 void Manager::legalize(){
     legalizer->run();
+    binTable.invalidate();
 }
 
 void Manager::detailplacement(){
+    binTable.invalidate();
     DetailPlacement detailplacer(*this);
     detailplacer.run();
 }
@@ -263,6 +270,18 @@ FF* Manager::bankFF(Coor newbankCoor, Cell* bankCellType, std::vector<FF*> FFToB
         }
     }
 
+    // Snapshot rect data BEFORE deleteFF / getNewFF (which can recycle FFToBank
+    // pointers via FFGarbageCollector and overwrite their coord). Keeps original
+    // call ordering byte-exact when binTable is OFF.
+    std::vector<BinDensityTable::Rect> removedRects;
+    if(binTable.ready()){
+        removedRects.reserve(FFToBank.size());
+        for(FF* m : FFToBank){
+            Coor c = m->getNewCoor();
+            removedRects.push_back({c.x, c.y, m->getW(), m->getH()});
+        }
+    }
+
     // delete all MBFF to be cluster from FF_Map
     for(auto& MBFF : FFToBank){
         FF_Map.erase(MBFF->getInstanceName());
@@ -282,6 +301,12 @@ FF* Manager::bankFF(Coor newbankCoor, Cell* bankCellType, std::vector<FF*> FFToB
     newFF->setFixed(false);
     FF_Map[newName] = newFF;
 
+    if(binTable.ready()){
+        BinDensityTable::Rect addedR{newbankCoor.x, newbankCoor.y,
+                                     bankCellType->getW(), bankCellType->getH()};
+        binTable.applyMutation(removedRects, {addedR});
+    }
+
     if(bit == 1){ // bank single bit FF
         newFF->addClusterFF(FFs[0], 0);
         FFs[0]->setPhysicalFF(newFF, 0);
@@ -296,9 +321,95 @@ FF* Manager::bankFF(Coor newbankCoor, Cell* bankCellType, std::vector<FF*> FFToB
     return newFF;
 }
 
+// Hybrid Route A / Stage 1 — rollback-capable banking.
+// Mirrors bankFF() but defers ALL FF_Map mutations and wrapper deleteFF() to
+// commitFinalizeBank. See Manager.h::BankUndo for rationale (unordered_map
+// bucket state cannot be rolled back after an insert/erase, so rollback must
+// be a no-op on FF_Map).
+FF* Manager::bankFF_deferred(Coor newbankCoor, Cell* bankCellType,
+                             const std::vector<FF*>& FFToBank,
+                             BankUndo& undo){
+    // Enumerate constituent inner FFs (same traversal as bankFF).
+    std::vector<FF*> FFs(bankCellType->getBits());
+    int bit = 0;
+    int clkIdx = FFToBank[0]->getClkIdx();
+    for(auto* MBFF : FFToBank){
+        assert(clkIdx == MBFF->getClkIdx() && "different clk cannot be banked together");
+        std::vector<FF*>& clusterFF = MBFF->getClusterFF();
+        for(auto* ff : clusterFF){
+            FFs[bit] = ff;
+            BankUndo::InnerState is;
+            is.innerFF = ff;
+            is.oldPhysical = ff->getPhysicalFF();
+            is.oldSlot = ff->getSlot();
+            undo.innerStates.push_back(is);
+            bit++;
+        }
+    }
+    assert(bit == bankCellType->getBits() && "Floating input is allowed???");
+
+    // Stage wrapper FF_Map erasures; actual erase happens only on finalize.
+    for(auto* MBFF : FFToBank){
+        undo.pendingEraseNames.push_back(MBFF->getInstanceName());
+        undo.pendingInsertWrappers.push_back(MBFF);
+    }
+
+    // Build the new MBFF (same as bankFF). Name is reserved via getNewFFName
+    // immediately so it matches bankFF's naming order; actual FF_Map insert is
+    // deferred to commitFinalizeBank.
+    FF* newFF = getNewFF();
+    std::string newName = getNewFFName("FF_" + std::to_string(bit) + "_");
+    newFF->setInstanceName(newName);
+    newFF->setCoor(newbankCoor);
+    newFF->setNewCoor(newbankCoor);
+    newFF->setCell(bankCellType);
+    newFF->setClusterSize(bit);
+    newFF->setClkIdx(clkIdx);
+    newFF->setFixed(false);
+    undo.newMBFF = newFF;
+    undo.newName = newName;
+
+    if(bit == 1){ // bank single bit FF (mirrors bankFF's early return)
+        newFF->addClusterFF(FFs[0], 0);
+        FFs[0]->setPhysicalFF(newFF, 0);
+        return newFF;
+    }
+
+    for(size_t i=0;i<FFs.size();i++){
+        FFs[i]->setPhysicalFF(newFF, i);
+        newFF->addClusterFF(FFs[i], i);
+    }
+    assignSlot(newFF);
+    return newFF;
+}
+
+void Manager::rollbackBank(BankUndo& undo){
+    // FF_Map is untouched on rollback (nothing was inserted or erased).
+    // 1. Restore each inner FF's physicalFF pointer + slot.
+    for(auto& is : undo.innerStates) is.innerFF->setPhysicalFF(is.oldPhysical, is.oldSlot);
+    // 2. Recycle the new MBFF (clear + push to GC).
+    if(undo.newMBFF) deleteFF(undo.newMBFF);
+    undo.newMBFF = nullptr;
+    undo.newName.clear();
+    undo.pendingInsertWrappers.clear();
+    undo.pendingEraseNames.clear();
+    undo.innerStates.clear();
+}
+
+void Manager::commitFinalizeBank(BankUndo& undo){
+    // Apply deferred FF_Map mutations exactly once, in the order bankFF would:
+    // erase wrappers first, then insert the new MBFF.
+    for(const std::string& name : undo.pendingEraseNames) FF_Map.erase(name);
+    if(undo.newMBFF && !undo.newName.empty()) FF_Map[undo.newName] = undo.newMBFF;
+    for(FF* f : undo.pendingInsertWrappers) deleteFF(f);
+    undo.pendingInsertWrappers.clear();
+    undo.pendingEraseNames.clear();
+    undo.innerStates.clear();
+}
+
 /**
  * @brief For merged MBFF, try to assign slot based on the slack, do stable matching
- * 
+ *
  * @param newFF The merged MBFF
  */
 void Manager::assignSlot(FF* newFF){
@@ -409,8 +520,19 @@ std::vector<FF*> Manager::debankFF(FF* MBFF, Cell* debankCellType){
         outputFF.push_back(newFF);
     }
 
+    std::vector<BinDensityTable::Rect> removedR, addedR;
+    if(binTable.ready()){
+        Coor mc = MBFF->getNewCoor();
+        removedR.push_back({mc.x, mc.y, MBFF->getW(), MBFF->getH()});
+        addedR.reserve(outputFF.size());
+        for(FF* of : outputFF){
+            Coor oc = of->getNewCoor();
+            addedR.push_back({oc.x, oc.y, of->getW(), of->getH()});
+        }
+    }
     FF_Map.erase(MBFF->getInstanceName());
     deleteFF(MBFF);
+    if(binTable.ready()) binTable.applyMutation(removedR, addedR);
 
     return outputFF;
 }
@@ -439,6 +561,7 @@ void Manager::postLGDecluster(){
     double margin = 0.0;
     if(const char* envM = std::getenv("POST_LG_DECLUSTER_MARGIN")) margin = std::atof(envM);
 
+    binTable.invalidate();
     Cell* oneBitCell = Bit_FF_Map[1][0];
 
     // Lambda: ΔC of declustering one MBFF into N copies of oneBitCell.
@@ -572,6 +695,631 @@ void Manager::postLGDecluster(){
     }
     std::cout << "[PostLGDecluster] placed_ok=" << okCnt
               << " placed_fallback=" << failCnt << std::endl;
+}
+
+// Placement-informed re-banking (v1).
+// After LG, for each 4-bit MBFF, enumerate the 3 ways of splitting its 4
+// constituents into 2+2 pairs, predict cost (alpha*TNS + beta*power + gamma*area)
+// of each, and commit the best alternative if it improves over the current
+// 4-bit arrangement. Thesis direction: pre-LG banking uses predicted positions;
+// LG snaps to actual legal coords, shifting the cost landscape; post-LG remix
+// exploits that shift.
+void Manager::unbankRebank(){
+    const char* envOn = std::getenv("UNBANK_REBANK");
+    if(!envOn || std::atoi(envOn) == 0) return;
+    double margin = 0.0;
+    if(const char* envM = std::getenv("UR_MARGIN")) margin = std::atof(envM);
+
+    binTable.invalidate();
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+    auto itTwo = Bit_FF_Map.find(2);
+    if(itTwo == Bit_FF_Map.end() || itTwo->second.empty()){
+        std::cout << "[UNBANK_REBANK] no 2-bit cell available, skip" << std::endl;
+        return;
+    }
+    Cell* twoBitCell = itTwo->second[0];
+
+    // Upstream coor used in c's D-side HPWL (mirror of FF::getSlack new_hpwl).
+    auto upstreamCoorD = [](FF* c) -> Coor {
+        PrevInstance prev = c->getPrevInstance();
+        if(!prev.instance) return Coor{0.0, 0.0};
+        if(prev.cellType == CellType::IO) return prev.instance->getCoor();
+        if(prev.cellType == CellType::GATE)
+            return prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
+        FF* inputFF = dynamic_cast<FF*>(prev.instance);
+        return inputFF->getPhysicalFF()->getNewCoor()
+             + inputFF->getPhysicalFF()->getPinCoor("Q" + inputFF->getPhysicalPinName());
+    };
+
+    // Cost of placing `consts` into an MBFF of cell `C` at position `P`.
+    // Constituent i -> slot i. alpha*TNS predicted as delta from current
+    // getSlack() under the assumption that only the MBFF's constituents move.
+    auto predictMBFFCost = [&](const std::vector<FF*>& consts, const Coor& P, Cell* C) -> double {
+        double cost = beta * C->getGatePower() + gamma * C->getArea();
+        for(size_t slot = 0; slot < consts.size(); ++slot){
+            FF* c = consts[slot];
+            std::string slotStr = (C->getBits() == 1) ? "" : std::to_string(slot);
+            Coor cDnew = P + C->getPinCoor("D" + slotStr);
+            Coor cQnew = P + C->getPinCoor("Q" + slotStr);
+            Cell*  curCell = c->getPhysicalFF()->getCell();
+            std::string curSlot = c->getPhysicalPinName();
+            Coor cDcur = c->getPhysicalFF()->getNewCoor() + c->getPhysicalFF()->getPinCoor("D" + curSlot);
+            Coor cQcur = c->getPhysicalFF()->getNewCoor() + c->getPhysicalFF()->getPinCoor("Q" + curSlot);
+
+            double cCurSlack = c->getSlack();
+            Coor upCoor = upstreamCoorD(c);
+            double dHpwlD = HPWL(upCoor, cDcur) - HPWL(upCoor, cDnew);
+            double cNewSlack = cCurSlack + DisplacementDelay * dHpwlD;
+            cost += alpha * std::max(0.0, -cNewSlack);
+
+            double qDelayBenefit = curCell->getQpinDelay() - C->getQpinDelay();
+            for(auto& next : c->getNextStage()){
+                double nextCur = next.ff->getSlack();
+                Coor loadCoor;
+                double deltaQ;
+                if(next.outputGate){
+                    loadCoor = next.outputGate->getCoor()
+                             + next.outputGate->getPinCoor(next.pinName);
+                    deltaQ = qDelayBenefit;
+                } else {
+                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                             + next.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + next.ff->getPhysicalPinName());
+                    deltaQ = 0.0;
+                }
+                double dHpwlQ = HPWL(loadCoor, cQcur) - HPWL(loadCoor, cQnew);
+                double predSlack = nextCur + deltaQ + DisplacementDelay * dHpwlQ;
+                cost += alpha * std::max(0.0, -predSlack);
+            }
+        }
+        return cost;
+    };
+
+    std::vector<FF*> candidates;
+    candidates.reserve(FF_Map.size());
+    for(auto& pr : FF_Map){
+        if(pr.second->getCell()->getBits() == 4)
+            candidates.push_back(pr.second);
+    }
+    std::cout << "[UNBANK_REBANK] 4bit_candidates=" << candidates.size()
+              << " margin=" << margin << std::endl;
+
+    const int pairings[3][4] = {
+        {0, 1, 2, 3}, // {0,1} + {2,3}
+        {0, 2, 1, 3}, // {0,2} + {1,3}
+        {0, 3, 1, 2}  // {0,3} + {1,2}
+    };
+
+    int tried = 0, committed = 0, fpFail = 0;
+    double predictedGain = 0;
+
+    for(FF* mbff : candidates){
+        std::vector<FF*> cluster = mbff->getClusterFF(); // copy
+        if((int)cluster.size() != 4) continue;
+        tried++;
+
+        double curCost = predictMBFFCost(cluster, mbff->getNewCoor(), mbff->getCell());
+
+        auto targetFor = [&](FF* a, FF* b) -> Coor {
+            Coor o0 = twoBitCell->getPinCoor("D0");
+            Coor o1 = twoBitCell->getPinCoor("D1");
+            Coor dA = a->getPhysicalFF()->getNewCoor() + a->getPhysicalFF()->getPinCoor("D" + a->getPhysicalPinName());
+            Coor dB = b->getPhysicalFF()->getNewCoor() + b->getPhysicalFF()->getPinCoor("D" + b->getPhysicalPinName());
+            return Coor{ (dA.x + dB.x - o0.x - o1.x) * 0.5,
+                         (dA.y + dB.y - o0.y - o1.y) * 0.5 };
+        };
+
+        double bestAltCost = DBL_MAX;
+        int bestP = -1;
+        Coor bestP1{0,0}, bestP2{0,0};
+        for(int p = 0; p < 3; ++p){
+            FF* a = cluster[pairings[p][0]];
+            FF* b = cluster[pairings[p][1]];
+            FF* c = cluster[pairings[p][2]];
+            FF* d = cluster[pairings[p][3]];
+            Coor P1 = targetFor(a, b);
+            Coor P2 = targetFor(c, d);
+            double altCost = predictMBFFCost({a, b}, P1, twoBitCell)
+                           + predictMBFFCost({c, d}, P2, twoBitCell);
+            if(altCost < bestAltCost){
+                bestAltCost = altCost;
+                bestP = p;
+                bestP1 = P1;
+                bestP2 = P2;
+            }
+        }
+
+        double delta = bestAltCost - curCost;
+        if(delta >= -margin) continue;
+
+        Coor mbffOldCoor = mbff->getNewCoor();
+        double mbffW = mbff->getCell()->getW();
+        double mbffH = mbff->getCell()->getH();
+
+        int idx_a = pairings[bestP][0];
+        int idx_b = pairings[bestP][1];
+        int idx_c = pairings[bestP][2];
+        int idx_d = pairings[bestP][3];
+
+        legalizer->FreeRect(mbffOldCoor, mbffW, mbffH);
+        legalizer->RemoveNodeByFFPtr(mbff);
+        std::vector<FF*> debanked = debankFF(mbff, oneBitCell);
+        // debanked[i] wraps the constituent at slot i (iteration order preserved).
+
+        auto tryBank2 = [&](FF* w1, FF* w2, const Coor& tgt) -> bool {
+            Coor placed = legalizer->FindPlace(tgt, twoBitCell);
+            if(placed.x == DBL_MAX){
+                placed = legalizer->FindNearestLegalSpace(tgt, twoBitCell, 4 * mbffW);
+            }
+            if(placed.x == DBL_MAX) return false;
+            FF* newMBFF = bankFF(placed, twoBitCell, {w1, w2});
+            newMBFF->setIsLegalize(true);
+            legalizer->UpdateRows(newMBFF);
+            return true;
+        };
+
+        bool ok1 = tryBank2(debanked[idx_a], debanked[idx_b], bestP1);
+        bool ok2 = tryBank2(debanked[idx_c], debanked[idx_d], bestP2);
+
+        if(ok1 && ok2){
+            committed++;
+            predictedGain += -delta;
+        } else {
+            fpFail++;
+            // Place whatever 1-bits are left (their wrappers still in FF_Map).
+            auto place1 = [&](FF* w){
+                if(FF_Map.count(w->getInstanceName()) == 0) return;
+                Coor placed = legalizer->FindPlace(w->getNewCoor(), oneBitCell);
+                if(placed.x == DBL_MAX){
+                    placed = legalizer->FindNearestLegalSpace(w->getNewCoor(), oneBitCell, 4 * mbffW);
+                }
+                if(placed.x == DBL_MAX) placed = w->getNewCoor();
+                w->setCoor(placed);
+                w->setNewCoor(placed);
+                w->setIsLegalize(true);
+                legalizer->UpdateRows(w);
+            };
+            if(!ok1){ place1(debanked[idx_a]); place1(debanked[idx_b]); }
+            if(!ok2){ place1(debanked[idx_c]); place1(debanked[idx_d]); }
+        }
+    }
+
+    std::cout << "[UNBANK_REBANK] tried=" << tried
+              << " committed=" << committed
+              << " fpFail=" << fpFail
+              << " predictedGain=" << predictedGain << std::endl;
+}
+
+// v2: global post-LG re-banking.
+// 1) Debank every MBFF -> all constituents become 1-bit wrappers at post-LG D-pin coord.
+// 2) Build rtree over newly-debanked 1-bits (pre-existing singletons untouched).
+// 3) For each wrapper's kmax nearest neighbors (same clk, within radius), compute
+//    \u0394C(pair as 2-bit) - \u0394C(each as 1-bit) and add an edge if < 0.
+// 4) LEMON MaxWeightedMatching -> pairings.
+// 5) Commit matches in priority order (most negative \u0394C first) via FindPlace + bankFF.
+// 6) Unmatched newly-debanked 1-bits are placed as 1-bit via FindPlace.
+void Manager::unbankRebankGlobal(){
+    const char* envOn = std::getenv("UNBANK_REBANK_V2");
+    if(!envOn || std::atoi(envOn) == 0) return;
+    double margin = 0.0;
+    if(const char* e = std::getenv("UR2_MARGIN")) margin = std::atof(e);
+    double radiusMul = 3.0;
+    if(const char* e = std::getenv("UR2_RADIUS_MUL")) radiusMul = std::atof(e);
+    int kmax = 15;
+    if(const char* e = std::getenv("UR2_KMAX")) kmax = std::atoi(e);
+
+    binTable.invalidate();
+
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+    auto itTwo = Bit_FF_Map.find(2);
+    if(itTwo == Bit_FF_Map.end() || itTwo->second.empty()){
+        std::cout << "[UR_V2] no 2-bit cell, skip" << std::endl;
+        return;
+    }
+    Cell* twoBitCell = itTwo->second[0];
+    double radius = std::max(twoBitCell->getW(), twoBitCell->getH()) * radiusMul;
+
+    auto upstreamCoorD = [](FF* c) -> Coor {
+        PrevInstance prev = c->getPrevInstance();
+        if(!prev.instance) return Coor{0.0, 0.0};
+        if(prev.cellType == CellType::IO) return prev.instance->getCoor();
+        if(prev.cellType == CellType::GATE)
+            return prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
+        FF* inputFF = dynamic_cast<FF*>(prev.instance);
+        return inputFF->getPhysicalFF()->getNewCoor()
+             + inputFF->getPhysicalFF()->getPinCoor("Q" + inputFF->getPhysicalPinName());
+    };
+    auto predictMBFFCost = [&](const std::vector<FF*>& consts, const Coor& P, Cell* C) -> double {
+        double cost = beta * C->getGatePower() + gamma * C->getArea();
+        for(size_t slot = 0; slot < consts.size(); ++slot){
+            FF* c = consts[slot];
+            std::string slotStr = (C->getBits() == 1) ? "" : std::to_string(slot);
+            Coor cDnew = P + C->getPinCoor("D" + slotStr);
+            Coor cQnew = P + C->getPinCoor("Q" + slotStr);
+            Cell* curCell = c->getPhysicalFF()->getCell();
+            std::string curSlot = c->getPhysicalPinName();
+            Coor cDcur = c->getPhysicalFF()->getNewCoor() + c->getPhysicalFF()->getPinCoor("D" + curSlot);
+            Coor cQcur = c->getPhysicalFF()->getNewCoor() + c->getPhysicalFF()->getPinCoor("Q" + curSlot);
+            double cCurSlack = c->getSlack();
+            Coor upCoor = upstreamCoorD(c);
+            double dHpwlD = HPWL(upCoor, cDcur) - HPWL(upCoor, cDnew);
+            double cNewSlack = cCurSlack + DisplacementDelay * dHpwlD;
+            cost += alpha * std::max(0.0, -cNewSlack);
+            double qDelayBenefit = curCell->getQpinDelay() - C->getQpinDelay();
+            for(auto& next : c->getNextStage()){
+                double nextCur = next.ff->getSlack();
+                Coor loadCoor;
+                double deltaQ;
+                if(next.outputGate){
+                    loadCoor = next.outputGate->getCoor() + next.outputGate->getPinCoor(next.pinName);
+                    deltaQ = qDelayBenefit;
+                } else {
+                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                             + next.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + next.ff->getPhysicalPinName());
+                    deltaQ = 0.0;
+                }
+                double dHpwlQ = HPWL(loadCoor, cQcur) - HPWL(loadCoor, cQnew);
+                double predSlack = nextCur + deltaQ + DisplacementDelay * dHpwlQ;
+                cost += alpha * std::max(0.0, -predSlack);
+            }
+        }
+        return cost;
+    };
+
+    // Step 1: snapshot MBFFs, free their legalizer state
+    std::vector<FF*> mbffs;
+    mbffs.reserve(FF_Map.size());
+    for(auto& pr : FF_Map){
+        if(pr.second->getCell()->getBits() > 1) mbffs.push_back(pr.second);
+    }
+    std::cout << "[UR_V2] mbffs=" << mbffs.size()
+              << " radius=" << radius
+              << " kmax=" << kmax << " margin=" << margin << std::endl;
+    for(FF* m : mbffs){
+        legalizer->FreeRect(m->getNewCoor(), m->getCell()->getW(), m->getCell()->getH());
+        legalizer->RemoveNodeByFFPtr(m);
+    }
+
+    // Step 2: debank all, collect newly-debanked 1-bits
+    std::vector<FF*> pool;
+    pool.reserve(mbffs.size() * 2);
+    for(FF* m : mbffs){
+        std::vector<FF*> newOnes = debankFF(m, oneBitCell);
+        for(FF* w : newOnes) pool.push_back(w);
+    }
+    std::cout << "[UR_V2] pool=" << pool.size() << std::endl;
+
+    // Step 3: rtree
+    namespace bgi = boost::geometry::index;
+    std::vector<PointWithID> points;
+    points.reserve(pool.size());
+    for(size_t i = 0; i < pool.size(); ++i){
+        Coor c = pool[i]->getNewCoor();
+        points.emplace_back(Point(c.x, c.y), (int)i);
+    }
+    bgi::rtree<PointWithID, bgi::quadratic<16>> rtree(points.begin(), points.end());
+
+    // Step 4: build LEMON graph
+    lemon::SmartGraph g;
+    std::vector<lemon::SmartGraph::Node> gnodes(pool.size());
+    for(size_t i = 0; i < pool.size(); ++i) gnodes[i] = g.addNode();
+    lemon::SmartGraph::EdgeMap<long long> weight(g);
+
+    struct PairInfo { size_t i, j; Coor tgt; double dC; };
+    std::vector<PairInfo> pairs;
+    pairs.reserve(pool.size() * kmax / 2);
+    const long long scale = 1000;
+
+    for(size_t i = 0; i < pool.size(); ++i){
+        FF* wi = pool[i];
+        Coor ci = wi->getNewCoor();
+        FF* ii = wi->getClusterFF()[0];
+        int clki = wi->getClkIdx();
+        double costI = predictMBFFCost({ii}, ci, oneBitCell);
+
+        std::vector<PointWithID> knn;
+        rtree.query(bgi::nearest(Point(ci.x, ci.y), kmax + 1), std::back_inserter(knn));
+        for(auto& q : knn){
+            size_t j = (size_t)q.second;
+            if(j <= i) continue;
+            FF* wj = pool[j];
+            if(wj->getClkIdx() != clki) continue;
+            Coor cj = wj->getNewCoor();
+            if(HPWL(ci, cj) > radius) continue;
+            FF* ij = wj->getClusterFF()[0];
+
+            double costJ = predictMBFFCost({ij}, cj, oneBitCell);
+            Coor o0 = twoBitCell->getPinCoor("D0");
+            Coor o1 = twoBitCell->getPinCoor("D1");
+            Coor dA = ci + oneBitCell->getPinCoor("D");
+            Coor dB = cj + oneBitCell->getPinCoor("D");
+            Coor target{ (dA.x + dB.x - o0.x - o1.x) * 0.5,
+                         (dA.y + dB.y - o0.y - o1.y) * 0.5 };
+            double costPair = predictMBFFCost({ii, ij}, target, twoBitCell);
+            double dC = costPair - costI - costJ;
+            if(dC >= -margin) continue;
+
+            auto e = g.addEdge(gnodes[i], gnodes[j]);
+            weight[e] = (long long)(-dC * scale);
+            pairs.push_back({i, j, target, dC});
+        }
+    }
+    std::cout << "[UR_V2] edges=" << pairs.size() << std::endl;
+
+    // Step 5: run matching
+    lemon::MaxWeightedMatching<lemon::SmartGraph,
+        lemon::SmartGraph::EdgeMap<long long>> mwm(g, weight);
+    mwm.run();
+
+    // Step 6: collect + sort matched pairs (most negative \u0394C first)
+    std::vector<bool> claimed(pool.size(), false);
+    std::vector<PairInfo> matched;
+    matched.reserve(pairs.size() / 2);
+    for(auto& p : pairs){
+        auto mate = mwm.mate(gnodes[p.i]);
+        if(mate != lemon::INVALID && mate == gnodes[p.j]
+           && !claimed[p.i] && !claimed[p.j]){
+            claimed[p.i] = claimed[p.j] = true;
+            matched.push_back(p);
+        }
+    }
+    std::sort(matched.begin(), matched.end(), [](const PairInfo& a, const PairInfo& b){
+        return a.dC < b.dC;
+    });
+    std::cout << "[UR_V2] matched=" << matched.size() << std::endl;
+
+    // Step 7: commit in priority order
+    int committed = 0, fpFail = 0;
+    double totalGain = 0;
+    for(auto& p : matched){
+        FF* wi = pool[p.i];
+        FF* wj = pool[p.j];
+        Coor placed = legalizer->FindPlace(p.tgt, twoBitCell);
+        if(placed.x == DBL_MAX){
+            placed = legalizer->FindNearestLegalSpace(p.tgt, twoBitCell, 4 * twoBitCell->getW());
+        }
+        if(placed.x == DBL_MAX){
+            fpFail++;
+            claimed[p.i] = claimed[p.j] = false;
+            continue;
+        }
+        FF* newMBFF = bankFF(placed, twoBitCell, {wi, wj});
+        newMBFF->setIsLegalize(true);
+        legalizer->UpdateRows(newMBFF);
+        committed++;
+        totalGain += -p.dC;
+    }
+
+    // Step 8: place unmatched 1-bits (still live in FF_Map)
+    int place1ok = 0, place1fallback = 0;
+    for(size_t i = 0; i < pool.size(); ++i){
+        if(claimed[i]) continue;
+        FF* w = pool[i];
+        if(FF_Map.count(w->getInstanceName()) == 0) continue;
+        Coor placed = legalizer->FindPlace(w->getNewCoor(), oneBitCell);
+        if(placed.x == DBL_MAX){
+            placed = legalizer->FindNearestLegalSpace(w->getNewCoor(), oneBitCell, 4 * oneBitCell->getW());
+        }
+        if(placed.x == DBL_MAX){
+            placed = w->getNewCoor();
+            place1fallback++;
+        } else {
+            place1ok++;
+        }
+        w->setCoor(placed);
+        w->setNewCoor(placed);
+        w->setIsLegalize(true);
+        legalizer->UpdateRows(w);
+    }
+
+    std::cout << "[UR_V2] committed=" << committed
+              << " fpFail=" << fpFail
+              << " place1ok=" << place1ok
+              << " place1fallback=" << place1fallback
+              << " totalGain=" << totalGain << std::endl;
+}
+
+// P7: Post-LG Targeted Iterative Refinement.
+// Picks top-K MBFFs with worst negative-slack concentration post-LG, debanks
+// them into 1-bit wrappers, and re-matches among THIS pool only (untouched
+// MBFFs outside the pool keep their LG state). Edge weights use the real
+// Banking::CostCompare — NOT the crude predictMBFFCost that torched UR v2.
+// Thesis novelty: cost-attribution-driven post-LG MBFF re-synthesis with
+// validated per-pair cost (vs predict) on a targeted worst-cost subset
+// (vs global).
+void Manager::postLGResynth(){
+    const char* envOn = std::getenv("POST_LG_RESYNTH");
+    if(!envOn || std::atoi(envOn) == 0) return;
+
+    binTable.invalidate();
+    int topK = 500;
+    if(const char* e = std::getenv("PLR_TOPK")) topK = std::atoi(e);
+    double margin = 0.0;
+    if(const char* e = std::getenv("PLR_MARGIN")) margin = std::atof(e);
+    double radiusMul = 5.0;
+    if(const char* e = std::getenv("PLR_RADIUS_MUL")) radiusMul = std::atof(e);
+    int kmax = 10;
+    if(const char* e = std::getenv("PLR_KMAX")) kmax = std::atoi(e);
+
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+    auto itTwo = Bit_FF_Map.find(2);
+    if(itTwo == Bit_FF_Map.end() || itTwo->second.empty()){
+        std::cout << "[P7] no 2-bit cell, skip" << std::endl;
+        return;
+    }
+    Cell* twoBitCell = itTwo->second[0];
+    double radius = std::max(twoBitCell->getW(), twoBitCell->getH()) * radiusMul;
+
+    // Step 1: score 2-bit MBFFs by negative-slack concentration.
+    std::vector<std::pair<double, FF*>> scored;
+    scored.reserve(FF_Map.size());
+    for(auto& kv : FF_Map){
+        FF* m = kv.second;
+        if(m->getCell()->getBits() != 2) continue;
+        double badness = 0;
+        for(FF* cf : m->getClusterFF()){
+            if(!cf) continue;
+            double s;
+            try { s = cf->getSlack(); }
+            catch(...) { continue; }
+            if(s < 0) badness += -s;
+        }
+        if(badness > 0) scored.emplace_back(badness, m);
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const std::pair<double,FF*>& a, const std::pair<double,FF*>& b){
+                  return a.first > b.first;
+              });
+    if((int)scored.size() > topK) scored.resize(topK);
+    std::cout << "[P7] topK=" << topK << " radius=" << radius
+              << " kmax=" << kmax << " margin=" << margin
+              << " selected=" << scored.size() << std::endl;
+    if(scored.empty()) return;
+
+    // Step 2: free legalizer state + debank the selected MBFFs.
+    std::vector<FF*> mbffs;
+    mbffs.reserve(scored.size());
+    for(auto& p : scored) mbffs.push_back(p.second);
+    for(FF* m : mbffs){
+        legalizer->FreeRect(m->getNewCoor(), m->getCell()->getW(), m->getCell()->getH());
+        legalizer->RemoveNodeByFFPtr(m);
+    }
+    std::vector<FF*> pool;
+    pool.reserve(mbffs.size() * 2);
+    for(FF* m : mbffs){
+        auto ones = debankFF(m, oneBitCell);
+        for(FF* w : ones) pool.push_back(w);
+    }
+    std::cout << "[P7] pool=" << pool.size() << std::endl;
+
+    // Step 3: rtree over the debanked pool.
+    namespace bgi = boost::geometry::index;
+    std::vector<PointWithID> points;
+    points.reserve(pool.size());
+    for(size_t i = 0; i < pool.size(); ++i){
+        Coor c = pool[i]->getNewCoor();
+        points.emplace_back(Point(c.x, c.y), (int)i);
+    }
+    bgi::rtree<PointWithID, bgi::quadratic<16>> rtree(points.begin(), points.end());
+
+    // Step 4: build LEMON graph with Banking::CostCompare as edge weight.
+    Banking banker(*this);
+    lemon::SmartGraph g;
+    std::vector<lemon::SmartGraph::Node> gnodes(pool.size());
+    for(size_t i = 0; i < pool.size(); ++i) gnodes[i] = g.addNode();
+    lemon::SmartGraph::EdgeMap<long long> weight(g);
+
+    struct PairInfo { size_t i, j; Coor tgt; double gain; };
+    std::vector<PairInfo> pairs;
+    pairs.reserve(pool.size() * kmax / 2);
+    const long long scale = 1000;
+
+    for(size_t i = 0; i < pool.size(); ++i){
+        FF* wi = pool[i];
+        Coor ci = wi->getNewCoor();
+        int clki = wi->getClkIdx();
+
+        std::vector<PointWithID> knn;
+        rtree.query(bgi::nearest(Point(ci.x, ci.y), kmax + 1), std::back_inserter(knn));
+        for(auto& q : knn){
+            size_t j = (size_t)q.second;
+            if(j <= i) continue;
+            FF* wj = pool[j];
+            if(wj->getClkIdx() != clki) continue;
+            Coor cj = wj->getNewCoor();
+            if(HPWL(ci, cj) > radius) continue;
+
+            Coor tgt((ci.x + cj.x) / 2.0, (ci.y + cj.y) / 2.0);
+            std::vector<FF*> pair = {wi, wj};
+            double gain = banker.CostCompare(tgt, twoBitCell, pair);
+            if(gain <= margin) continue;
+
+            auto e = g.addEdge(gnodes[i], gnodes[j]);
+            weight[e] = (long long)(gain * scale);
+            pairs.push_back({i, j, tgt, gain});
+        }
+    }
+    std::cout << "[P7] edges=" << pairs.size() << std::endl;
+
+    // Step 5: max-weight matching.
+    lemon::MaxWeightedMatching<lemon::SmartGraph,
+        lemon::SmartGraph::EdgeMap<long long>> mwm(g, weight);
+    mwm.run();
+
+    // Step 6: collect matched pairs (sort by gain descending).
+    std::vector<bool> claimed(pool.size(), false);
+    std::vector<PairInfo> matched;
+    matched.reserve(pairs.size() / 2);
+    for(auto& p : pairs){
+        auto mate = mwm.mate(gnodes[p.i]);
+        if(mate != lemon::INVALID && mate == gnodes[p.j]
+           && !claimed[p.i] && !claimed[p.j]){
+            claimed[p.i] = claimed[p.j] = true;
+            matched.push_back(p);
+        }
+    }
+    std::sort(matched.begin(), matched.end(),
+              [](const PairInfo& a, const PairInfo& b){ return a.gain > b.gain; });
+    std::cout << "[P7] matched=" << matched.size() << std::endl;
+
+    // Step 7: commit in priority order, re-verify at actual placement coord.
+    int committed = 0, fpFail = 0, costFail = 0;
+    double totalGain = 0;
+    for(auto& p : matched){
+        FF* wi = pool[p.i];
+        FF* wj = pool[p.j];
+        Coor placed = legalizer->FindPlace(p.tgt, twoBitCell);
+        if(placed.x == DBL_MAX){
+            placed = legalizer->FindNearestLegalSpace(p.tgt, twoBitCell, 4 * twoBitCell->getW());
+        }
+        if(placed.x == DBL_MAX){
+            fpFail++;
+            claimed[p.i] = claimed[p.j] = false;
+            continue;
+        }
+        std::vector<FF*> pair = {wi, wj};
+        double realGain = banker.CostCompare(placed, twoBitCell, pair);
+        if(realGain <= margin){
+            costFail++;
+            claimed[p.i] = claimed[p.j] = false;
+            continue;
+        }
+        FF* newMBFF = bankFF(placed, twoBitCell, pair);
+        newMBFF->setIsLegalize(true);
+        legalizer->UpdateRows(newMBFF);
+        committed++;
+        totalGain += realGain;
+    }
+
+    // Step 8: place unmatched 1-bits back into the freed rows.
+    int place1ok = 0, place1fallback = 0;
+    for(size_t i = 0; i < pool.size(); ++i){
+        if(claimed[i]) continue;
+        FF* w = pool[i];
+        if(FF_Map.count(w->getInstanceName()) == 0) continue;
+        Coor placed = legalizer->FindPlace(w->getNewCoor(), oneBitCell);
+        if(placed.x == DBL_MAX){
+            placed = legalizer->FindNearestLegalSpace(w->getNewCoor(), oneBitCell, 4 * oneBitCell->getW());
+        }
+        if(placed.x == DBL_MAX){
+            placed = w->getNewCoor();
+            place1fallback++;
+        } else {
+            place1ok++;
+        }
+        w->setCoor(placed);
+        w->setNewCoor(placed);
+        w->setIsLegalize(true);
+        legalizer->UpdateRows(w);
+    }
+
+    std::cout << "[P7] committed=" << committed
+              << " fpFail=" << fpFail
+              << " costFail=" << costFail
+              << " place1ok=" << place1ok
+              << " place1fallback=" << place1fallback
+              << " totalGain=" << totalGain << std::endl;
 }
 
 

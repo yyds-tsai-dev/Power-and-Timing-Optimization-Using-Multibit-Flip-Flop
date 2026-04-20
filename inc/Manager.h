@@ -26,6 +26,7 @@
 #include "PrettyTable.h"
 #include "PostBankingOptimizer.h"
 #include "Checker.h"
+#include "BinDensityTable.h"
 
 #ifdef ENABLE_DEBUG_MGR
 #define DEBUG_MGR(message) std::cout << "[MANAGER] " << message << std::endl
@@ -92,6 +93,10 @@ public:
     // IO filename
     std::string input_filename;
 
+    // Bin-density table for incremental Δλ in CostCompare. Lazily built on
+    // first query when BIN_DENSITY_AWARE=1; maintained by bankFF / debankFF.
+    BinDensityTable binTable;
+
 public:
     Manager();
     ~Manager();
@@ -118,10 +123,43 @@ public:
     // given newbankCoor (left down) and target celltype
     // it will bank all the FF in vector (can be MBFF in FFToBank)
     // and it will delete old and insert new FF to FF_Map
+
+    // Hybrid Route A / Stage 1 — rollback-capable banking.
+    // Mirrors bankFF() EXCEPT all FF_Map mutations and wrapper deleteFF() are
+    // DEFERRED. On rollback: nothing is inserted into or erased from FF_Map —
+    // only per-FF physicalFF state and the newMBFF pointer are restored. This
+    // is load-bearing for bit-exactness: a rollback must leave the FF_Map's
+    // internal bucket/chain state byte-identical to pre-call, and std::
+    // unordered_map does not guarantee hash-state rollback across insert/erase.
+    //
+    // Callers must pair each bankFF_deferred with exactly one of:
+    //   rollbackBank(undo)          → restores physicalFF, recycles new FF
+    //   commitFinalizeBank(undo)    → inserts/erases FF_Map, fires deferred deletes
+    struct BankUndo {
+        FF* newMBFF = nullptr;                                // returned MBFF (brand-new, GC-sourced)
+        std::string newName;                                  // its instance name (to be inserted on commit)
+        std::vector<FF*> pendingInsertWrappers;               // pending deletion after finalize
+        std::vector<std::string> pendingEraseNames;           // wrapper names to erase from FF_Map on commit
+        struct InnerState {
+            FF* innerFF;
+            FF* oldPhysical;
+            int oldSlot;
+        };
+        std::vector<InnerState> innerStates;                  // per-bit old physicalFF / slot
+    };
+    FF* bankFF_deferred(Coor newbankCoor, Cell* bankCellType,
+                        const std::vector<FF*>& FFToBank,
+                        BankUndo& undo);
+    void rollbackBank(BankUndo& undo);
+    void commitFinalizeBank(BankUndo& undo);
+
     void assignSlot(FF* newFF);
     std::vector<FF*> debankFF(FF* MBFF, Cell* debankCellType);
     void debankAll();
     void postLGDecluster(); // Phase 5: undo bad banking decisions using LG-accurate positions
+    void unbankRebank();    // v1: debank 4-bit MBFFs and re-bank constituents as 2x 2-bit if \u0394C < 0
+    void unbankRebankGlobal(); // v2: debank ALL MBFFs and run LEMON max-weight matching on constituents at post-LG coords
+    void postLGResynth(); // P7: pick top-K worst MBFFs by neg-slack concentration, debank + LEMON rematch with real Banking::CostCompare weights
     // the FF after debank will be assign to debankCellType (maybe this can be a vector)
     void getNS(double& TNS, double& WNS, bool show); // this retunr TNS and WNS of whole design (all FF in FF_Map)
     double getTNS();

@@ -54,6 +54,15 @@ int main(int argc, char *argv[]){
     STAGE("postLGDecluster",   mgr.postLGDecluster());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
 
+    STAGE("unbankRebank",      mgr.unbankRebank());
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+
+    STAGE("unbankRebankGlobal", mgr.unbankRebankGlobal());
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+
+    STAGE("postLGResynth",     mgr.postLGResynth());
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+
     STAGE("detailplacement",   mgr.detailplacement());
     if(!production){
         mgr.getOverallCost(cost_verbose, 1);

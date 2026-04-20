@@ -1,5 +1,6 @@
 #include "Banking.h"
 #include "ConflictPartition.h"
+#include "MILPBanking.h"
 #include <omp.h>
 #include <chrono>
 #include <unordered_set>
@@ -79,11 +80,22 @@ void runP4SA(Banking& banking, Manager& mgr, std::vector<MatchCandidate>& cands)
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<double> u01(0.0, 1.0);
 
-    // Initialize realGain vector (CostCompare at fpTarget for each candidate).
+    // Option A accurate evaluator: anchor CostCompare at the actual Top-1
+    // legal slot Pass 3 will commit to. CostCompare at fpTarget (median) is
+    // optimistic for promotes because it ignores legalization displacement.
+    // FindTop2LegalCoors is read-only (no row-state mutation) — safe in SA.
+    int n_no_slot = 0;
+    auto evalAt = [&](const Coor& fp, Cell* cell, const std::vector<FF*>& ffs) -> double {
+        auto top2 = mgr.legalizer->FindTop2LegalCoors(fp, cell);
+        if(top2.empty()){ n_no_slot++; return -DBL_MAX; }
+        return banking.CostCompare(top2[0].coor, cell, ffs);
+    };
+
+    // Initialize realGain vector at actual legal slots.
     std::vector<double> gain(cands.size(), -DBL_MAX);
     for(size_t i = 0; i < cands.size(); i++){
         if(cands[i].ffs.empty()) continue;
-        gain[i] = banking.CostCompare(cands[i].fpTarget, cands[i].cell, cands[i].ffs);
+        gain[i] = evalAt(cands[i].fpTarget, cands[i].cell, cands[i].ffs);
     }
 
     int n_swap_t=0, n_swap_a=0, n_prom_t=0, n_prom_a=0, n_dem_t=0, n_dem_a=0;
@@ -111,8 +123,8 @@ void runP4SA(Banking& banking, Manager& mgr, std::vector<MatchCandidate>& cands)
             std::swap(newA[fai], newB[fbi]);
             Coor fpA = medianFFCoor(newA);
             Coor fpB = medianFFCoor(newB);
-            double gA = banking.CostCompare(fpA, cands[a].cell, newA);
-            double gB = banking.CostCompare(fpB, cands[b].cell, newB);
+            double gA = evalAt(fpA, cands[a].cell, newA);
+            double gB = evalAt(fpB, cands[b].cell, newB);
             double delta = (gA + gB) - (gain[a] + gain[b]);
             n_swap_t++;
             if(accept(delta)){
@@ -137,7 +149,7 @@ void runP4SA(Banking& banking, Manager& mgr, std::vector<MatchCandidate>& cands)
             for(FF* f : cands[a].ffs) merged.push_back(f);
             for(FF* f : cands[b].ffs) merged.push_back(f);
             Coor fp = medianFFCoor(merged);
-            double gNew = banking.CostCompare(fp, cell4, merged);
+            double gNew = evalAt(fp, cell4, merged);
             double delta = gNew - (gain[a] + gain[b]);
             n_prom_t++;
             if(accept(delta)){
@@ -172,8 +184,8 @@ void runP4SA(Banking& banking, Manager& mgr, std::vector<MatchCandidate>& cands)
             else {                          pa = {f0,f3}; pb = {f1,f2}; }
             Coor fpa = medianFFCoor(pa);
             Coor fpb = medianFFCoor(pb);
-            double ga = banking.CostCompare(fpa, cell2, pa);
-            double gb = banking.CostCompare(fpb, cell2, pb);
+            double ga = evalAt(fpa, cell2, pa);
+            double gb = evalAt(fpb, cell2, pb);
             double delta = (ga + gb) - gain[a];
             n_dem_t++;
             if(accept(delta)){
@@ -208,6 +220,7 @@ void runP4SA(Banking& banking, Manager& mgr, std::vector<MatchCandidate>& cands)
               << " promote " << n_prom_a << "/" << n_prom_t
               << " demote " << n_dem_a << "/" << n_dem_t
               << " cands " << before << "->" << cands.size()
+              << " no_slot=" << n_no_slot
               << " final_T=" << T
               << " iters=" << iters << "\n";
 }
@@ -460,8 +473,32 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
     double deltaTNS = newTNS - oldTNS; // positive = TNS worsened
     costOptimize -= mgr.alpha * deltaTNS;
     if(downPtr) costOptimize -= downGamma * mgr.alpha * downMargin;
+
+    // Option (iii) bin-density Δλ. Gated; default off for byte-exact fallback.
+    // Uses BinDensityTable to estimate the violation-bin count delta of removing
+    // FFToBank wrappers from FF_Map and adding a single MBFF of chooseCell at
+    // clusterCoor. dViol > 0 means MORE violations after bank — penalize gain.
+    static const double binWeight = [](){
+        const char* en = std::getenv("BIN_DENSITY_AWARE");
+        if(!en || std::string(en) == "0") return 0.0;
+        const char* w = std::getenv("BIN_DENSITY_WEIGHT");
+        return w ? std::atof(w) : 1.0;
+    }();
+    if(binWeight > 0.0 && Banking::commitBinAwareDepth > 0){
+        // Bin-aware applies ONLY at matching-commit Pass-3 realGain checks
+        // (caller wraps with Banking::CommitBinAware). All other CostCompare
+        // sites — graph build, greedy 4-bit fallback, post-LG paths — leave
+        // commitBinAwareDepth=0 and therefore see no Δλ adjustment, since
+        // those sites either need path-independent costs (graph) or operate
+        // on a stale binTable (greedy fallback runs after legalize).
+        if(!mgr.binTable.ready()) mgr.binTable.build(mgr);
+        int dViol = mgr.binTable.estimateViolationDelta(FFToBank, clusterCoor, chooseCell);
+        costOptimize -= binWeight * mgr.lambda * dViol;
+    }
     return costOptimize;
 }
+
+thread_local int Banking::commitBinAwareDepth = 0;
 
 double Banking::weightedMedian(std::vector<std::pair<double,double>>& cw){
     // cw = {(coordinate, weight)}. Returns weighted median.
@@ -829,6 +866,31 @@ void Banking::doMatchingClustering(){
         std::cout << "[MATCHING] No 2-bit cell in library, falling back to greedy" << std::endl;
         doClustering();
         return;
+    }
+
+    // [RA/2] Route A prototype dump: enumerate 1-bit + pruned 2-bit candidates
+    // on a deterministic FF subset and print histograms. Read-only; does not
+    // touch banking state. Gated on MILP_PROTOTYPE=1.
+    {
+        const char* prot = std::getenv("MILP_PROTOTYPE");
+        if(prot && std::string(prot) != "0"){
+            MILPBanking proto(mgr, *this);
+            proto.prototypeDump();
+        }
+    }
+
+    // [RA/4] Route A production: row-band windowed MILP set-partition banking.
+    // Runs instead of the legacy matching commit when MILP_PROD=1. Mutates
+    // FF_Map + legalizer row state; returns after committing all selected
+    // pairs/quads. Any FF left unbanked remains 1-bit (same semantics as the
+    // legacy path dropping unmatched FFs).
+    {
+        const char* pro = std::getenv("MILP_PROD");
+        if(pro && std::string(pro) != "0"){
+            MILPBanking prod(mgr, *this);
+            prod.runProduction();
+            return;
+        }
     }
 
     // Tunable matching parameters via env vars.
@@ -1646,7 +1708,11 @@ void Banking::doMatchingClustering(){
                     n_dropped_place++;
                     continue;
                 }
-                double realGain = CostCompare(placeCoor, c.cell, c.ffs);
+                double realGain;
+                {
+                    Banking::CommitBinAware _cba;
+                    realGain = CostCompare(placeCoor, c.cell, c.ffs);
+                }
                 if(realGain < 0){
                     local_dropped_cost++;
                     n_dropped_cost++;
@@ -1732,7 +1798,11 @@ void Banking::doMatchingClustering(){
                     continue;
                 }
 
-                double realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+                double realGain;
+                {
+                    Banking::CommitBinAware _cba;
+                    realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+                }
                 if(realGain < 0){
                     n_dropped_cost++;
                     continue;
@@ -2192,7 +2262,11 @@ void Banking::doMatchingClustering(){
                             continue;
                         }
 
-                        double realGain = CostCompare(placeCoor, c.cell, c.ffs);
+                        double realGain;
+                        {
+                            Banking::CommitBinAware _cba;
+                            realGain = CostCompare(placeCoor, c.cell, c.ffs);
+                        }
                         if(realGain < 0){
                             hb_dropped_cost++;
                             continue;
@@ -2306,7 +2380,11 @@ void Banking::doMatchingClustering(){
                             continue;
                         }
 
-                        double realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
+                        double realGain;
+                        {
+                            Banking::CommitBinAware _cba;
+                            realGain = CostCompare(placeCoor, chooseCell, pair_ffs);
+                        }
                         if(realGain < 0){
                             hb_dropped_cost++;
                             continue;
@@ -2494,6 +2572,18 @@ void Banking::doMatchingClustering(){
 
     double t_total_ms = ms_fn(t_total, tic());
     std::cout << "[MATCHING] total=" << t_total_ms << "ms" << std::endl;
+
+    // Hybrid Route A (Stage 1+): post-matching Layer 1 improver. Runs AFTER
+    // all Layer 0 matching phases (2-bit + HB + greedy fallback) complete, on
+    // the 1-bit FFs that remain unbanked. Gated on HYBRID_MILP=1. Safe to run
+    // alongside existing knobs — it only mutates state under its own gate.
+    {
+        const char* hm = std::getenv("HYBRID_MILP");
+        if(hm && std::string(hm) != "0"){
+            MILPBanking hybrid(mgr, *this);
+            hybrid.runHybrid();
+        }
+    }
 }
 
 void Banking::restoreUnclusterFFCoor(){

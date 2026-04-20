@@ -31,6 +31,16 @@ struct LegalCandidate {
     double disp;
 };
 
+// Hybrid Route A / Stage 1 — per-row subrow snapshot used to roll back a
+// UpdateRows() mutation. SnapshotRowsForRect() deep-copies the subrow vector
+// of every row UpdateRows would iterate for a given rect; RestoreRowSubrows
+// swaps the copies back in and frees the post-UpdateRows pointers. Snap
+// owns the Subrow* copies until one of Restore/Discard is called.
+struct RowSubrowSnap {
+    size_t row_idx;
+    std::vector<Subrow*> subrows;   // deep copies; snap owns
+};
+
 class Legalizer{
 private:
     Manager& mgr;
@@ -58,6 +68,12 @@ public:
     // Phase 5: drop the Node tracking `ff` from legalizer->ffs so DP's GlobalSwap
     // stops iterating over a stale entry whose FFPtr has been recycled by debankFF.
     void RemoveNodeByFFPtr(FF* ff);
+    // Hybrid Route A / Stage 1 — snapshot / restore the subrow vectors that
+    // UpdateRows(ffRect) would mutate. Pair with UpdateRows to roll back row
+    // state. DiscardRowSnap frees the snap without installing it.
+    std::vector<RowSubrowSnap> SnapshotRowsForRect(const Coor& lgCoor, double height);
+    void RestoreRowSubrowsFromSnap(std::vector<RowSubrowSnap>& snap);
+    void DiscardRowSnap(std::vector<RowSubrowSnap>& snap);
     // Phase 3A: slice rows for a synthetic placement footprint (coord + cell),
     // without binding to a real FF in mgr.FF_Map. Returns the index of the
     // stub Node appended to ffs so the merge phase can upgrade it in place.
