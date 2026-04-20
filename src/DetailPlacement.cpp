@@ -168,82 +168,62 @@ void DetailPlacement::DetailAssignmentMBFF(){
     // blocks the cross-MBFF mode (tc2 +3.56%, hc01 +1.73%) is absent here.
     bool intraOnly = true;
     if(const char* e = std::getenv("DP_SLOT_INTRA_ONLY")) intraOnly = std::atoi(e) != 0;
+    const bool forceReject = []{ const char *e = std::getenv("DP_SLOT_FORCE_REJECT"); return e && std::atoi(e) != 0; }();
 
     if(intraOnly){
-        for(auto& pair : mgr.FF_Map){
-            FF* mbff = pair.second;
-            size_t bits = mbff->getCell()->getBits();
-            if(bits < 2) continue;
-            auto& clusterFFs = mbff->getClusterFF();
-            if(clusterFFs.size() != bits) continue;
-            bool anyEmpty = false;
-            for(size_t s = 0; s < bits; s++){
-                if(clusterFFs[s] == nullptr){ anyEmpty = true; break; }
-            }
-            if(anyEmpty) continue;
+        size_t totalWindows = 0, totalAccept = 0, totalReject = 0;
+        double totalDelta = 0.0;
+        for(const auto &kv : mgr.FF_Map){
+            FF* mbff = kv.second;
+            if(!mbff || !mbff->getCell() || mbff->getCell()->getBits() < 2) continue;
+            std::vector<FF*> FFs = mbff->getClusterFF();
+            size_t n = FFs.size();
+            if(n < 2) continue;
 
-            // Snapshot FFs indexed by current slot. addClusterFF overwrites by
-            // slot, so we need an immutable view during the Hungarian write-back.
-            std::vector<FF*> oldCluster(clusterFFs.begin(), clusterFFs.end());
+            struct Snap { FF* inner; FF* phy; int slot; };
+            std::vector<Snap> snaps(n);
+            for(size_t i=0;i<n;i++) snaps[i] = {FFs[i], FFs[i]->getPhysicalFF(), (int)i};
+            std::vector<FF*> savedCluster = mbff->getClusterFF();
 
-            // Build cost[i][j] = max(0, -newSlack) summed over curFF's D pin
-            // and all Q-downstream nextStage endpoints if FF at slot i moves
-            // to slot j of the same MBFF. Same per-pin TNS model as the
-            // cross-MBFF branch below.
-            std::vector<std::vector<double>> cost(bits, std::vector<double>(bits, 0));
-            #pragma omp parallel for num_threads(MAX_THREADS)
-            for(size_t idx = 0; idx < bits; idx++){
-                FF* curFF = oldCluster[idx];
-                for(size_t j = 0; j < bits; j++){
+            double preCost = mbff->getCost();
+
+            std::vector<std::vector<double>> cost(n, std::vector<double>(n, 0.0));
+            for(size_t i=0;i<n;i++){
+                FF* curFF = FFs[i];
+                for(size_t j=0;j<n;j++){
                     PrevInstance prevInstance = curFF->getPrevInstance();
                     std::string pinName = std::to_string(j);
                     Coor newCoorD = mbff->getNewCoor() + mbff->getPinCoor("D" + pinName);
                     double delta_hpwl = 0;
                     Coor inputCoor;
-                    // D pin cost
                     if(prevInstance.instance){
                         if(prevInstance.cellType == CellType::IO){
                             inputCoor = prevInstance.instance->getCoor();
-                            double old_hpwl = HPWL(inputCoor, curFF->getOriginalD());
-                            double new_hpwl = HPWL(inputCoor, newCoorD);
-                            delta_hpwl += old_hpwl - new_hpwl;
-                        }
-                        else if(prevInstance.cellType == CellType::GATE){
+                            delta_hpwl += HPWL(inputCoor, curFF->getOriginalD()) - HPWL(inputCoor, newCoorD);
+                        } else if(prevInstance.cellType == CellType::GATE){
                             inputCoor = prevInstance.instance->getCoor() + prevInstance.instance->getPinCoor(prevInstance.pinName);
-                            double old_hpwl = HPWL(inputCoor, curFF->getOriginalD());
-                            double new_hpwl = HPWL(inputCoor, newCoorD);
-                            delta_hpwl += old_hpwl - new_hpwl;
-                        }
-                        else{
+                            delta_hpwl += HPWL(inputCoor, curFF->getOriginalD()) - HPWL(inputCoor, newCoorD);
+                        } else {
                             FF* inputFF = dynamic_cast<FF*>(prevInstance.instance);
                             inputCoor = inputFF->getOriginalQ();
                             Coor newCoorQ = inputFF->getPhysicalFF()->getNewCoor() + inputFF->getPhysicalFF()->getPinCoor("Q" + inputFF->getPhysicalPinName());
-                            double old_hpwl = HPWL(inputCoor, curFF->getOriginalD());
-                            double new_hpwl = HPWL(newCoorQ, newCoorD);
-                            delta_hpwl += old_hpwl - new_hpwl;
+                            delta_hpwl += HPWL(inputCoor, curFF->getOriginalD()) - HPWL(newCoorQ, newCoorD);
                         }
                     }
                     double newSlack = curFF->getTimingSlack("D") + mgr.DisplacementDelay * delta_hpwl;
-                    cost[idx][j] = newSlack < 0 ? -newSlack : 0;
-
-                    // Q pin cost (all downstream endpoints)
+                    cost[i][j] = newSlack < 0 ? -newSlack : 0;
                     for(auto& nextFF : curFF->getNextStage()){
                         Coor originalInput = curFF->getOriginalQ();
                         Coor newInput = mbff->getNewCoor() + mbff->getPinCoor("Q" + pinName);
                         if(nextFF.outputGate){
                             inputCoor = nextFF.outputGate->getCoor() + nextFF.outputGate->getPinCoor(nextFF.pinName);
-                            double old_hpwl = HPWL(inputCoor, originalInput);
-                            double new_hpwl = HPWL(inputCoor, newInput);
-                            delta_hpwl = old_hpwl - new_hpwl;
-                        }
-                        else{
-                            Coor newCoorDNext = nextFF.ff->getPhysicalFF()->getNewCoor() + nextFF.ff->getPhysicalFF()->getPinCoor("D" + nextFF.ff->getPhysicalPinName());
-                            double old_hpwl = HPWL(nextFF.ff->getOriginalD(), originalInput);
-                            double new_hpwl = HPWL(newCoorDNext, newInput);
-                            delta_hpwl = old_hpwl - new_hpwl;
+                            delta_hpwl = HPWL(inputCoor, originalInput) - HPWL(inputCoor, newInput);
+                        } else {
+                            newCoorD = nextFF.ff->getPhysicalFF()->getNewCoor() + nextFF.ff->getPhysicalFF()->getPinCoor("D" + nextFF.ff->getPhysicalPinName());
+                            delta_hpwl = HPWL(nextFF.ff->getOriginalD(), originalInput) - HPWL(newCoorD, newInput);
                         }
                         newSlack = (curFF->getOriginalQpinDelay() - mbff->getCell()->getQpinDelay()) + nextFF.ff->getTimingSlack("D") + mgr.DisplacementDelay * delta_hpwl;
-                        cost[idx][j] += newSlack < 0 ? -newSlack : 0;
+                        cost[i][j] += newSlack < 0 ? -newSlack : 0;
                     }
                 }
             }
@@ -252,15 +232,26 @@ void DetailPlacement::DetailAssignmentMBFF(){
             std::vector<int> assignment;
             HungAlgo.Solve(cost, assignment);
 
-            // assignment[i] = new slot for FF currently in slot i. Apply as a
-            // full permutation write-back from oldCluster snapshot.
-            for(size_t i = 0; i < bits; i++){
-                int newSlot = assignment[i];
-                FF* curFF = oldCluster[i];
-                curFF->setPhysicalFF(mbff, newSlot);
-                mbff->addClusterFF(curFF, newSlot);
+            for(size_t i=0;i<n;i++){
+                FFs[i]->setPhysicalFF(mbff, assignment[i]);
+                mbff->addClusterFF(FFs[i], assignment[i]);
+            }
+            double postCost = mbff->getCost();
+
+            totalWindows++;
+            if(!forceReject && postCost < preCost){
+                totalAccept++;
+                totalDelta += (preCost - postCost);
+            } else {
+                for(auto& s : snaps) s.inner->setPhysicalFF(s.phy, s.slot);
+                for(size_t s=0;s<savedCluster.size();s++) if(savedCluster[s]) mbff->addClusterFF(savedCluster[s], s);
+                totalReject++;
             }
         }
+        std::cerr << "[DP_SLOT_INTRA] windows=" << totalWindows
+                  << " accept=" << totalAccept
+                  << " reject=" << totalReject
+                  << " gain=" << totalDelta << "\n";
         return;
     }
 
