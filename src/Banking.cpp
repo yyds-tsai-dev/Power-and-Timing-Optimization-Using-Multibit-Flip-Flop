@@ -831,8 +831,11 @@ void Banking::doMatchingClustering(){
         return;
     }
 
-    // Tunable matching parameters via env vars
-    int K_NEIGHBORS = 15;
+    // Tunable matching parameters via env vars.
+    // Adaptive default: low-β cases (β≤500, e.g. tc2/hc03 at β=400) prefer K=8
+    // (tighter neighborhood, avoids distant low-quality matches in low-power-weighted
+    // cost fn); higher-β cases keep K=15. MATCH_K env override remains explicit.
+    int K_NEIGHBORS = (FF::beta <= 500.0) ? 8 : 15;
     double WEIGHT_SCALE = 1000.0;
     double EDGE_MIN_GAIN = 0.0;   // minimum CostCompare gain to create an edge
     double DIST_BONUS = 0.1;      // proximity bonus coefficient

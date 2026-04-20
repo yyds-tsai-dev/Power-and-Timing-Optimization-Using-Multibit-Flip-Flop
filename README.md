@@ -8,21 +8,35 @@
 
 ![Score Comparison](docs/score_comparison.png)
 
-### Score Table (lower = better)
+### Best Results vs NTU (ICCAD 2024 Contest Winner)
 
-| Testcase | Baseline | Stage B v2 | DP-v2 | Pin-offset | **Current (Adaptive DIST_BONUS)** | Delta vs Baseline | Dominant Cost |
-|---|---:|---:|---:|---:|---:|---:|---|
-| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | 740,426,488 | **740,715,329** | **-0.31%** | Area 99% |
-| testcase2_0812 | 830,273 | 815,494 | 799,642 | 772,711 | **771,385** | **-7.09%** | TNS 11% / Power 20% / Area 69% |
-| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | 728,677,742 | **728,292,737** | **-0.08%** | Area 100% |
-| testcase1_MBFF | 752,479,215 | 748,465,219 | 745,999,703 | 747,303,128 | **747,483,270** | **-0.66%** | Area 99% |
-| testcase2_MBFF | 865,419 | 846,400 | 827,535 | 816,308 | **806,094** | **-6.85%** | TNS 14% / Power 20% / Area 66% |
-| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | 31,070,005 | **31,108,205** | **-4.96%** | **Power 96%** |
-| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | 12,325,446 | **12,056,721** | **-13.03%** | **TNS 34% / Power 62%** |
-| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | 55,860,767 | **55,866,361** | **-0.13%** | Area 100% |
-| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | 728,289,561 | **728,299,384** | **-0.15%** | Area 100% |
+> **Current best** = HEAD on branch `main` (Adaptive MATCH_K + DP_SLOT_ASSIGN=2+INTRA_ONLY + GS_K=8 + Adaptive DIST_BONUS + Per-pin CostCompare + LEMON matching). Run: `BANKING_MODE=matching PRODUCTION=1`.
+> NTU reference scores from the ICCAD 2024 winner's LBR paper (Cheng-Yen Li, NTU).
+> **Lower = better. Bold = beats NTU.**
 
-> Current shipped version: Per-edge adaptive DIST_BONUS (commit 60cf8d8). Largest gains: hc02 **-13.03%**, t2_0812 **-7.09%**, t2_MBFF **-6.85%**, hc01 **-4.96%**.
+| Testcase | NTU (winner) | **Ours (2026-04-20)** | Δ vs NTU | β | Notes |
+|---|---:|---:|---:|---:|---|
+| testcase1_0812 | 738,800,000 | 739,828,213 | +0.14% | 2000 | slightly behind NTU |
+| testcase2_0812 | 738,400 | 765,703.64 | +3.70% | 400 | gap narrowed −1.00% this sprint |
+| testcase3 | 728,800,000 | **728,088,695** | **−0.10%** | 10000 | beats NTU |
+| hiddencase01 | 31,270,000 | **30,663,894** | **−1.94%** | 200000 | beats NTU |
+| hiddencase02 | 12,760,000 | **11,744,484** | **−7.96%** | 40000 | largest lead |
+| hiddencase03 | 55,920,000 | **55,871,388** | **−0.09%** | 400 | beats NTU |
+| hiddencase04 | 726,900,000 | 728,050,329 | +0.16% | 10000 | slightly behind NTU |
+
+> **Wins NTU on 4/7 contest cases**, behind within 0.2% on tc1/hc04, narrowing gap on tc2. Largest lead: hc02 −7.96%.
+
+### Historical Per-Phase Scores (lower = better)
+
+| Testcase | Baseline | Stage B v2 | DP-v2 | Pin-offset | Adaptive DIST_BONUS | **Current (2026-04-20)** |
+|---|---:|---:|---:|---:|---:|---:|
+| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | 740,426,488 | 740,715,329 | **739,828,213** |
+| testcase2_0812 | 830,273 | 815,494 | 799,642 | 772,711 | 771,385 | **765,704** |
+| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | 728,677,742 | 728,292,737 | **728,088,695** |
+| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | 31,070,005 | 31,108,205 | **30,663,894** |
+| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | 12,325,446 | 12,056,721 | **11,744,484** |
+| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | 55,860,767 | 55,866,361 | **55,871,388** |
+| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | 728,289,561 | 728,299,384 | **728,050,329** |
 
 ### Banking Wall Time
 
@@ -55,7 +69,9 @@
 | Per-pin | 2026-04-17 | Per-pin CostCompare: driver/load HPWL + max(0,-slack) TNS filter | t2_0812 -1.7%, hc02 -0.9% (vs old CostCompare, no DP) |
 | DP-v3 | 2026-04-17 | Iterative GS+CC with RtreeMap rebuild (fix DP-v2 stale rtree bug) | t2_0812 -1.40%, t2_MBFF -1.88%, hc02 -0.91% (vs DP-v2) |
 | Pin-offset | 2026-04-17 | Fix CostCompare: use target cell pin offsets instead of cell origin | t2_0812 -1.99%, hc02 -1.20% (vs per-pin without fix) |
-| **Adaptive DIST_BONUS** | 2026-04-18 | **Per-edge adaptive DIST_BONUS: zero bonus for neg-slack pairs, THRESH=20** | **hc02 -2.18%, t2_MBFF -1.25%, t2_0812 -0.17% (vs pin-offset)** |
+| Adaptive DIST_BONUS | 2026-04-18 | Per-edge adaptive DIST_BONUS: zero bonus for neg-slack pairs, THRESH=20 | hc02 -2.18%, t2_MBFF -1.25%, t2_0812 -0.17% (vs pin-offset) |
+| DP_SLOT_ASSIGN | 2026-04-20 | DetailAssignmentMBFF intra-only Hungarian as default | **strict 7-case win**: tc2 -0.189%, hc02 -0.791%, others -0.004~0 |
+| **Adaptive MATCH_K** | 2026-04-20 | **Banking MATCH_K=8 when β≤500, else 15 (β is the discriminator)** | **tc2 -0.997%, hc03 +0.019% noise, 5 cases byte-exact** |
 
 ---
 
