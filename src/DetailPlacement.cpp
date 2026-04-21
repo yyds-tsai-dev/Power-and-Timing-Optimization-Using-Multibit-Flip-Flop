@@ -23,8 +23,12 @@ void DetailPlacement::run(){
     //   4 = per-iter post (call at end of each iter, after GS+CC)
     //   5 = pre + post pass (call once before loop + once after)
     //   6 = per-iter pre + final post
-    int slotAssignMode = 2;
+    //   -1 = adaptive: mode 2 when beta<=500 (power/area-dominated), else mode 3
+    int slotAssignMode = -1;
     if(const char* e = std::getenv("DP_SLOT_ASSIGN")) slotAssignMode = std::atoi(e);
+    if(slotAssignMode == -1){
+        slotAssignMode = (mgr.beta <= 500.0) ? 2 : 3;
+    }
     bool perIterPre  = (slotAssignMode == 3) || (slotAssignMode == 6);
     bool perIterPost = (slotAssignMode == 4);
     bool prePass     = (slotAssignMode == 5);
@@ -375,7 +379,7 @@ void DetailPlacement::DetailAssignmentMBFF(){
             HungarianAlgorithm HungAlgo;
             std::vector<int> assignment;
             HungAlgo.Solve(cost, assignment);
-            
+
             std::vector<std::pair<size_t, size_t>> newSlotMap(querySize);
             for(size_t i=0;i<FFs.size();i++){ // write back assignment result
                 FF* newFF = MBFFs[slotMap[FFsMap[assignment[i]]].first];
@@ -395,7 +399,7 @@ void DetailPlacement::DetailAssignmentMBFF(){
                 pointwithid = std::make_pair(Point(oldCoor.x, oldCoor.y), FFsMap[i]);
                 rtree.remove(pointwithid);
             }
-            
+
             // update slotMap
             for(size_t slotI=0;slotI<querySize;slotI++)
                 slotMap[FFsMap[slotI]] = newSlotMap[slotI];

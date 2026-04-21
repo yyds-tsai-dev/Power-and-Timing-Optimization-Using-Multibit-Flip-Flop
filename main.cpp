@@ -24,6 +24,14 @@ int main(int argc, char *argv[]){
     // evaluator fork, checker). Use for submission / runtime-factor benchmarking.
     const bool production = std::getenv("PRODUCTION") && std::atoi(std::getenv("PRODUCTION"));
     bool cost_verbose = !production;
+    // STAGE_COST=1: print per-stage cost (non-verbose) even in production mode.
+    // Used to bisect-locate inter-binary score drift.
+    const bool stageCost = std::getenv("STAGE_COST") && std::atoi(std::getenv("STAGE_COST"));
+    auto printStageCost = [&](const char* tag, Manager &m){
+        if(!stageCost) return;
+        double c = m.getOverallCost(false, 0);
+        std::cerr << "[STAGE_COST] " << tag << " cost=" << c << "\n";
+    };
 
     auto _all_s = std::chrono::high_resolution_clock::now();
 
@@ -44,26 +52,34 @@ int main(int argc, char *argv[]){
 
     STAGE("banking",           mgr.banking());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Banking.out"); }
+    printStageCost("banking", mgr);
 
     STAGE("postBankingOpt",    mgr.postBankingOptimize());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("PostCG.out"); }
+    printStageCost("postBankingOpt", mgr);
 
     STAGE("legalize",          mgr.legalize());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Legalize.out"); mgr.checker(); }
+    printStageCost("legalize", mgr);
 
     STAGE("postLGDecluster",   mgr.postLGDecluster());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+    printStageCost("postLGDecluster", mgr);
 
     STAGE("unbankRebank",      mgr.unbankRebank());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+    printStageCost("unbankRebank", mgr);
 
     STAGE("unbankRebankGlobal", mgr.unbankRebankGlobal());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+    printStageCost("unbankRebankGlobal", mgr);
 
     STAGE("postLGResynth",     mgr.postLGResynth());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+    printStageCost("postLGResynth", mgr);
 
     STAGE("detailplacement",   mgr.detailplacement());
+    printStageCost("detailplacement", mgr);
     if(!production){
         mgr.getOverallCost(cost_verbose, 1);
         mgr.dumpVisual("DetailPlacement.out");
