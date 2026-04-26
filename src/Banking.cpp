@@ -965,6 +965,39 @@ void Banking::doMatchingClustering(){
     if(slackSigmoid)
         std::cout << "[MATCHING] slack-budget sigmoid enabled (scale=" << slackSigmoidScale << ")" << std::endl;
 
+    // S_cluster edge reweighting: embed timing criticality into matching edge
+    // weights. Slack-rich pairs get boosted gain (matched first), critical pairs
+    // get damped dist_bonus (penalize distant critical matches).
+    bool sClusterEdge = false;
+    double sClusterBoost = 0.3;
+    double sClusterDampen = 0.5;
+    {
+        const char* envSC = std::getenv("SCLUSTER_EDGE");
+        if(envSC && std::string(envSC) != "0") sClusterEdge = true;
+        const char* envB = std::getenv("SCLUSTER_BOOST");
+        if(envB) sClusterBoost = std::atof(envB);
+        const char* envD = std::getenv("SCLUSTER_DAMPEN");
+        if(envD) sClusterDampen = std::atof(envD);
+    }
+    if(sClusterEdge)
+        std::cout << "[MATCHING] S_cluster edge reweighting enabled (boost="
+                  << sClusterBoost << " dampen=" << sClusterDampen << ")" << std::endl;
+
+    // S_cluster commit priority: add NTU's L_{2k}-L_k spatial density term to
+    // ALG1 S_space commit scoring. FFs in sparse regions (large L_{2k}-L_k) get
+    // higher commit priority because their good neighbors are scarce.
+    bool sClusterCommit = false;
+    double sClusterDensityCoeff = 1.0;
+    {
+        const char* envSCC = std::getenv("SCLUSTER_COMMIT");
+        if(envSCC && std::string(envSCC) != "0") sClusterCommit = true;
+        const char* envDC = std::getenv("SCLUSTER_DENSITY_COEFF");
+        if(envDC) sClusterDensityCoeff = std::atof(envDC);
+    }
+    if(sClusterCommit)
+        std::cout << "[MATCHING] S_cluster commit priority enabled (density_coeff="
+                  << sClusterDensityCoeff << ")" << std::endl;
+
     // Phase 3Z Step 5: inter-batch slack release. After each banked commit,
     // credit upstream/downstream FFs with DisplacementDelay*(oldHPWL-newHPWL)
     // when the MBFF landed closer to them than the original FF was. Credit
@@ -980,6 +1013,23 @@ void Banking::doMatchingClustering(){
     }
     if(slackRelease)
         std::cout << "[MATCHING] slack release enabled (cap=" << slackReleaseCap << ")" << std::endl;
+
+    // COMMIT_ORDER: deferred commit with displacement-aware ordering.
+    //   0 = legacy (graph-traversal order, byte-exact baseline)
+    //   1 = sort by gain descending (commit most profitable first)
+    //   2 = sort by estimated displacement ascending (lowest-displacement first)
+    //   3 = sort by gain/displacement ratio descending
+    int commitOrder = 0;
+    bool commitRetry = false;
+    {
+        const char* envCO = std::getenv("COMMIT_ORDER");
+        if(envCO) commitOrder = std::atoi(envCO);
+        const char* envCR = std::getenv("COMMIT_RETRY");
+        if(envCR && std::string(envCR) != "0") commitRetry = true;
+    }
+    if(commitOrder != 0)
+        std::cout << "[MATCHING] deferred commit order=" << commitOrder
+                  << " retry=" << commitRetry << std::endl;
 
     // Per-FF raw-slack snapshot used as cap reference. Captured lazily on first
     // credit. Local to this invocation of doMatchingClustering.
@@ -1410,6 +1460,73 @@ void Banking::doMatchingClustering(){
             distScale = (avgNN > 1e-9) ? 1.0 / avgNN : 1.0;
         }
 
+        // S_cluster urgency: per-FF normalized criticality [0,1] (for edge reweighting)
+        // and spatial density L_{2k}-L_k (for commit priority ordering).
+        std::vector<double> scUrgency(localFFs.size(), 0.0);
+        std::vector<double> scDensity(localFFs.size(), 0.0);
+        std::unordered_map<FF*, double> ffDensityMap;
+        if(sClusterEdge || sClusterCommit){
+            for(size_t i = 0; i < localFFs.size(); i++){
+                FF* ff = localFFs[i];
+                Coor c = ff->getNewCoor();
+
+                // L_k and L_2k bounding-box HPWL for spatial density
+                if(sClusterCommit){
+                    int qK = std::min((int)localFFs.size(), K_NEIGHBORS);
+                    int q2K = std::min((int)localFFs.size(), K_NEIGHBORS * 2);
+                    std::vector<PointWithID> nn;
+                    nn.reserve(q2K + 1);
+                    rtree.query(bgi::nearest(Point(c.x, c.y), q2K + 1),
+                                std::back_inserter(nn));
+                    double xmin_k = c.x, xmax_k = c.x, ymin_k = c.y, ymax_k = c.y;
+                    double xmin_2k = c.x, xmax_2k = c.x, ymin_2k = c.y, ymax_2k = c.y;
+                    for(int ni = 0; ni < (int)nn.size(); ni++){
+                        if(nn[ni].second == (int)i) continue;
+                        Coor nc = localFFs[nn[ni].second]->getNewCoor();
+                        if(ni < qK){
+                            xmin_k = std::min(xmin_k, nc.x); xmax_k = std::max(xmax_k, nc.x);
+                            ymin_k = std::min(ymin_k, nc.y); ymax_k = std::max(ymax_k, nc.y);
+                        }
+                        xmin_2k = std::min(xmin_2k, nc.x); xmax_2k = std::max(xmax_2k, nc.x);
+                        ymin_2k = std::min(ymin_2k, nc.y); ymax_2k = std::max(ymax_2k, nc.y);
+                    }
+                    double Lk = (xmax_k - xmin_k) + (ymax_k - ymin_k);
+                    double L2k = (xmax_2k - xmin_2k) + (ymax_2k - ymin_2k);
+                    scDensity[i] = L2k - Lk;
+                }
+
+                // Urgency for edge reweighting
+                if(sClusterEdge){
+                    double slD = ff->getTimingSlack("D");
+                    double selfTerm = 1.0 / (1.0 + std::exp(slD / alg1_c4));
+                    double downTerm = 0;
+                    auto& cfs = ff->getClusterFF();
+                    if(!cfs.empty() && cfs[0]){
+                        int dk = 0;
+                        for(auto& ns : cfs[0]->getNextStage()){
+                            if(!ns.ff) continue;
+                            double nsSlack = ns.ff->getTimingSlack("D");
+                            downTerm += 1.0 / (1.0 + std::exp(nsSlack / alg1_c6));
+                            if(++dk >= alg1_lookaheadK) break;
+                        }
+                    }
+                    scUrgency[i] = alg1_c3 * selfTerm + alg1_c5 * downTerm;
+                }
+            }
+            if(sClusterEdge){
+                double maxPri = 0;
+                for(size_t i = 0; i < localFFs.size(); i++)
+                    if(scUrgency[i] > maxPri) maxPri = scUrgency[i];
+                if(maxPri > 1e-12)
+                    for(size_t i = 0; i < localFFs.size(); i++)
+                        scUrgency[i] /= maxPri;
+            }
+            if(sClusterCommit){
+                for(size_t i = 0; i < localFFs.size(); i++)
+                    ffDensityMap[localFFs[i]] = scDensity[i];
+            }
+        }
+
         // Build LEMON graph
         lemon::SmartGraph g;
         std::vector<lemon::SmartGraph::Node> gnodes(localFFs.size());
@@ -1423,6 +1540,7 @@ void Banking::doMatchingClustering(){
         // Store optimal positions per node-pair for v2.1 commit phase
         // Key: min(i,j) * localFFs.size() + max(i,j)
         std::unordered_map<size_t, Coor> optPMap;
+        std::unordered_map<size_t, double> edgeWeightMap;
         auto pairKey = [&](size_t a, size_t b) -> size_t {
             return std::min(a,b) * localFFs.size() + std::max(a,b);
         };
@@ -1489,6 +1607,15 @@ void Banking::doMatchingClustering(){
 
                     if(gain > EDGE_MIN_GAIN){
                         double adjGain = gain;
+
+                        // S_cluster: boost slack-rich pairs, dampen dist_bonus for critical pairs
+                        double pairMaxUrg = 0, pairAvgUrg = 0;
+                        if(sClusterEdge){
+                            pairMaxUrg = std::max(scUrgency[i], scUrgency[j]);
+                            pairAvgUrg = (scUrgency[i] + scUrgency[j]) * 0.5;
+                            adjGain *= (1.0 + sClusterBoost * (1.0 - pairAvgUrg));
+                        }
+
                         if(DIST_BONUS > 0){
                             double edgeBonus = DIST_BONUS;
                             double dist = HPWL(coorA, coorB);
@@ -1508,6 +1635,8 @@ void Banking::doMatchingClustering(){
                                     nEdgesZeroed++;
                                 }
                             }
+                            if(sClusterEdge)
+                                edgeBonus *= (1.0 - sClusterDampen * pairMaxUrg);
                             if(edgeBonus > 0){
                                 adjGain += gain * edgeBonus / (1.0 + dist * distScale);
                             }
@@ -1515,6 +1644,7 @@ void Banking::doMatchingClustering(){
                         adjGain *= slackMul(ffA, ffB);
                         auto e = g.addEdge(gnodes[i], gnodes[j]);
                         weight[e] = (long long)(adjGain * WEIGHT_SCALE);
+                        if(commitOrder != 0) edgeWeightMap[pairKey(i, j)] = adjGain;
                         edgeCount++;
                     }
                 }
@@ -1627,6 +1757,17 @@ void Banking::doMatchingClustering(){
                 }
                 c.laTermVal = laTerm;
                 c.sscore = (c.D2 - c.D1) + selfTerm + laTerm;
+
+                // S_cluster density: FFs in sparse regions commit first
+                if(sClusterCommit){
+                    double maxDen = 0;
+                    for(FF* f : c.ffs){
+                        auto it = ffDensityMap.find(f);
+                        if(it != ffDensityMap.end() && it->second > maxDen)
+                            maxDen = it->second;
+                    }
+                    c.sscore += sClusterDensityCoeff * maxDen;
+                }
                 return true;
             };
 
@@ -1764,6 +1905,12 @@ void Banking::doMatchingClustering(){
             }
         } else {
             // Legacy eager commit (bit-exact to pre-P4 production).
+            // When COMMIT_ORDER!=0 or SCLUSTER_COMMIT=1: collect pairs, sort, then commit.
+            struct LegacyPair { int i, j; double density; double sortKey; };
+            std::vector<LegacyPair> legacyPairs;
+            bool deferCommit = (commitOrder != 0) || sClusterCommit;
+            if(deferCommit) legacyPairs.reserve(localFFs.size() / 2);
+
             for(size_t i = 0; i < localFFs.size(); i++){
                 if(committed[i]) continue;
                 lemon::SmartGraph::Node mate = mwm.mate(gnodes[i]);
@@ -1771,6 +1918,30 @@ void Banking::doMatchingClustering(){
 
                 int j = nodeIdx[mate];
                 if(j < 0 || committed[j]) continue;
+
+                if(deferCommit){
+                    double d = sClusterCommit ? std::max(scDensity[i], scDensity[j]) : 0.0;
+                    double sk = 0.0;
+                    if(commitOrder != 0){
+                        FF* fA = localFFs[i];
+                        FF* fB = localFFs[j];
+                        Coor cA = fA->getNewCoor(), cB = fB->getNewCoor();
+                        double dist = HPWL(cA, cB);
+                        auto wIt = edgeWeightMap.find(pairKey(i, j));
+                        double ew = (wIt != edgeWeightMap.end()) ? wIt->second : 0.0;
+                        if(commitOrder == 1){
+                            sk = ew;
+                        } else if(commitOrder == 2){
+                            sk = -dist;
+                        } else if(commitOrder == 3){
+                            sk = (dist > 1e-9) ? ew / dist : ew * 1e9;
+                        }
+                    }
+                    legacyPairs.push_back({(int)i, j, d, sk});
+                    committed[i] = true;
+                    committed[j] = true;
+                    continue;
+                }
                 total_matched++;
 
                 FF* ffA = localFFs[i];
@@ -1778,7 +1949,6 @@ void Banking::doMatchingClustering(){
 
                 std::vector<FF*> pair_ffs = {ffA, ffB};
 
-                // FindPlace target: use storedOptP (v2.1) or median (legacy)
                 Coor fpTarget;
                 if(useV21){
                     auto it = optPMap.find(pairKey(i, j));
@@ -1812,10 +1982,6 @@ void Banking::doMatchingClustering(){
                     continue;
                 }
 
-                // Step 5: capture logical 1-bit constituents BEFORE bankFF runs;
-                // bankFF calls deleteFF(ffA)/deleteFF(ffB) which clears their
-                // clusterFF. The logical 1-bit children survive (live in newFF's
-                // clusterFF after bankFF) but we need pointers to them now.
                 std::vector<FF*> constituents_2b;
                 if(slackRelease){
                     for(FF* pf : {ffA, ffB}){
@@ -1834,14 +2000,122 @@ void Banking::doMatchingClustering(){
                 ffB->setClusterIdx(clusterTotalNum);
                 ffB->setNewCoor(placeCoor);
 
-                // Step 5: credit upstream FFs whose Q→f-arc got shorter by this
-                // commit (no-op when SLACK_RELEASE=0).
                 releaseSlackAfterCommit(newFF, constituents_2b);
 
                 committed[i] = true;
                 committed[j] = true;
                 clusterTotalNum++;
                 n_committed++;
+            }
+
+            // Deferred commit: sort collected pairs, then commit sequentially.
+            // After the main pass, retry failed-cost pairs (legalizer state changed).
+            if(deferCommit && !legacyPairs.empty()){
+                if(sClusterCommit){
+                    std::sort(legacyPairs.begin(), legacyPairs.end(),
+                        [](const LegacyPair& a, const LegacyPair& b){
+                            return a.density > b.density;
+                        });
+                } else if(commitOrder != 0){
+                    std::sort(legacyPairs.begin(), legacyPairs.end(),
+                        [](const LegacyPair& a, const LegacyPair& b){
+                            return a.sortKey > b.sortKey;
+                        });
+                }
+                std::vector<size_t> failedIdx;
+                for(size_t pi = 0; pi < legacyPairs.size(); pi++){
+                    auto& lp = legacyPairs[pi];
+                    total_matched++;
+                    FF* ffA = localFFs[lp.i];
+                    FF* ffB = localFFs[lp.j];
+                    std::vector<FF*> pair_ffs = {ffA, ffB};
+
+                    Coor fpTarget((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                  (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                    Coor placeCoor = mgr.legalizer->FindPlace(fpTarget, cell2bit);
+                    if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                        n_dropped_place++;
+                        continue;
+                    }
+
+                    double realGain;
+                    {
+                        Banking::CommitBinAware _cba;
+                        realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+                    }
+                    if(realGain < 0){
+                        n_dropped_cost++;
+                        if(commitRetry) failedIdx.push_back(pi);
+                        continue;
+                    }
+                    if(safetyMargin2B > 0.0 && realGain < safetyMargin2B){
+                        n_dropped_by_margin++;
+                        continue;
+                    }
+
+                    std::vector<FF*> constituents_2b;
+                    if(slackRelease){
+                        for(FF* pf : {ffA, ffB}){
+                            auto& cfs = pf->getClusterFF();
+                            if(cfs.empty()) constituents_2b.push_back(pf);
+                            else for(FF* cf : cfs) if(cf) constituents_2b.push_back(cf);
+                        }
+                    }
+
+                    FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
+                    mgr.legalizer->UpdateRows(newFF);
+                    newFF->setIsLegalize(true);
+
+                    ffA->setClusterIdx(clusterTotalNum);
+                    ffA->setNewCoor(placeCoor);
+                    ffB->setClusterIdx(clusterTotalNum);
+                    ffB->setNewCoor(placeCoor);
+
+                    releaseSlackAfterCommit(newFF, constituents_2b);
+
+                    clusterTotalNum++;
+                    n_committed++;
+                }
+                // Retry pass: pairs that failed CostCompare may succeed now
+                // that other commits have changed the legalizer state.
+                if(commitRetry && !failedIdx.empty()){
+                    for(size_t pi : failedIdx){
+                        auto& lp = legacyPairs[pi];
+                        FF* ffA = localFFs[lp.i];
+                        FF* ffB = localFFs[lp.j];
+                        if(ffA->getClusterIdx() >= 0 || ffB->getClusterIdx() >= 0) continue;
+                        std::vector<FF*> pair_ffs = {ffA, ffB};
+                        Coor fpTarget((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                                      (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                        Coor placeCoor = mgr.legalizer->FindPlace(fpTarget, cell2bit);
+                        if(placeCoor.x == DBL_MAX) continue;
+                        double realGain;
+                        {
+                            Banking::CommitBinAware _cba;
+                            realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+                        }
+                        if(realGain < 0) continue;
+                        std::vector<FF*> constituents_2b;
+                        if(slackRelease){
+                            for(FF* pf : {ffA, ffB}){
+                                auto& cfs = pf->getClusterFF();
+                                if(cfs.empty()) constituents_2b.push_back(pf);
+                                else for(FF* cf : cfs) if(cf) constituents_2b.push_back(cf);
+                            }
+                        }
+                        FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
+                        mgr.legalizer->UpdateRows(newFF);
+                        newFF->setIsLegalize(true);
+                        ffA->setClusterIdx(clusterTotalNum);
+                        ffA->setNewCoor(placeCoor);
+                        ffB->setClusterIdx(clusterTotalNum);
+                        ffB->setNewCoor(placeCoor);
+                        releaseSlackAfterCommit(newFF, constituents_2b);
+                        clusterTotalNum++;
+                        n_committed++;
+                        n_dropped_cost--;
+                    }
+                }
             }
         }
         t_commit += ms_fn(tc0, tic());

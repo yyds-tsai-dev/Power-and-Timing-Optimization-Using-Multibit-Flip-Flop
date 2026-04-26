@@ -83,7 +83,7 @@ size_t DetailPlacement::GlobalSwap(){
     DEBUG_DP("Global Swap");
     int GS_K = -1;
     if(const char* e = std::getenv("GS_K")) GS_K = std::atoi(e);
-    if(GS_K == -1) GS_K = (mgr.beta <= 500.0) ? 5 : 8;
+    if(GS_K == -1) GS_K = (mgr.beta <= 500.0) ? 5 : 12;
     // GS_MIN_GAIN: only accept swaps whose improvement exceeds this raw-cost
     // threshold. Default 0.0 = strict improvement (pre-ship behavior).
     double GS_MIN_GAIN = 0.0;

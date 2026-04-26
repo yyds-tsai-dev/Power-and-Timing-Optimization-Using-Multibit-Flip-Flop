@@ -49,6 +49,7 @@ int main(int argc, char *argv[]){
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("PreLegalize.out"); }
 
     STAGE("slackRedist",       mgr.computeSlackRedistribution());
+    STAGE("timingPreReloc",    mgr.timingPreRelocation());
 
     STAGE("banking",           mgr.banking());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Banking.out"); }

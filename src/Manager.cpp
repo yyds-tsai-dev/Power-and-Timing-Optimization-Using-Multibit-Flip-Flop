@@ -556,15 +556,23 @@ void Manager::debankAll(){
 // (preserved by debankFF). If ΔC < -margin (score would improve), decluster.
 // After the decluster batch, the whole design is re-legalized.
 void Manager::postLGDecluster(){
-    // Adaptive gate: per-case DP ripple makes ΔC prediction unreliable; the
-    // only contest case whose prediction survives downstream DP is the D2
-    // design family (153,457 instances). Enable by default only there; other
-    // families stay byte-exact. Override with POST_LG_DECLUSTER={0,1}.
+    // Adaptive gate: per-case DP ripple makes ΔC prediction unreliable.
+    // D2 family (153,457 instances): enable with margin=5000 (original).
+    // Low-β cases (β≤500, e.g. tc2/hc03): enable with margin=50 — the
+    // timing-dominated cost function makes decluster predictions reliable.
+    // Override with POST_LG_DECLUSTER={0,1} and POST_LG_DECLUSTER_MARGIN.
     int mode = -1;
     if(const char* envOn = std::getenv("POST_LG_DECLUSTER")) mode = std::atoi(envOn);
-    if(mode == -1) mode = (NumInstances >= 130000 && NumInstances <= 180000) ? 1 : 0;
+    if(mode == -1){
+        if(NumInstances >= 130000 && NumInstances <= 180000)
+            mode = 1;
+        else if(beta <= 500.0)
+            mode = 1;
+        else
+            mode = 0;
+    }
     if(mode == 0) return;
-    double margin = 5000.0; // Filter weak predictions; keeps only strong decluster wins.
+    double margin = (beta <= 500.0) ? 55.0 : 5000.0;
     if(const char* envM = std::getenv("POST_LG_DECLUSTER_MARGIN")) margin = std::atof(envM);
 
     binTable.invalidate();
@@ -1444,6 +1452,137 @@ void Manager::computeSlackRedistribution(){
               << " red_p90=" << pct(0.90)
               << " red_max=" << maxRed
               << std::endl;
+}
+
+void Manager::timingPreRelocation(){
+    const char* envTP = std::getenv("TIMING_PRELOC");
+    if(!envTP || std::string(envTP) == "0") return;
+
+    double fraction = 0.3;
+    double critMult = 5.0;
+    double maxDispFrac = 0.5;
+    int iters = 3;
+    if(const char* e = std::getenv("PRELOC_FRACTION")) fraction = std::atof(e);
+    if(const char* e = std::getenv("PRELOC_CRIT_MULT")) critMult = std::atof(e);
+    if(const char* e = std::getenv("PRELOC_MAX_DISP")) maxDispFrac = std::atof(e);
+    if(const char* e = std::getenv("PRELOC_ITERS")) iters = std::atoi(e);
+
+    std::cerr << "[TIMING_PRELOC] fraction=" << fraction
+              << " critMult=" << critMult
+              << " maxDispFrac=" << maxDispFrac
+              << " iters=" << iters << std::endl;
+
+    const double dieXlo = die.getDieOrigin().x;
+    const double dieYlo = die.getDieOrigin().y;
+    const double dieXhi = die.getDieBorder().x;
+    const double dieYhi = die.getDieBorder().y;
+
+    int nMoved = 0;
+    double sumDisp = 0;
+
+    for(int iter = 0; iter < iters; iter++){
+        nMoved = 0;
+        sumDisp = 0;
+        for(auto& kv : FF_Map){
+            FF* w = kv.second;
+            if(w->getCell()->getBits() != 1) continue;
+            auto& cfs = w->getClusterFF();
+            if(cfs.empty() || !cfs[0]) continue;
+            FF* logic = cfs[0];
+
+            double fx = 0, fy = 0, totalW = 0;
+            Coor wCoor = w->getNewCoor();
+            double cellW = w->getCell()->getW();
+            double cellH = w->getCell()->getH();
+
+            double slackD = 0;
+            try { slackD = w->getTimingSlack("D"); }
+            catch (...) { continue; }
+
+            // Only move critical FFs (negative slack) — non-critical FFs are better
+            // left at their MeanShift-optimized positions for banking locality.
+            if(slackD >= 0) continue;
+
+            // NTU sign-based force: for each critical timing path, add a unit
+            // force in the sign direction that would reduce HPWL. The magnitude
+            // is uniform (1.0 per path) so no single distant pin dominates.
+            auto signOf = [](double v) -> double {
+                return (v > 0) ? 1.0 : (v < 0) ? -1.0 : 0.0;
+            };
+
+            // D-pin: sign force toward driver
+            PrevInstance prev = logic->getPrevInstance();
+            if(prev.instance){
+                Coor driverCoor;
+                if(prev.cellType == CellType::IO){
+                    driverCoor = prev.instance->getCoor();
+                } else if(prev.cellType == CellType::GATE){
+                    driverCoor = prev.instance->getCoor()
+                               + prev.instance->getPinCoor(prev.pinName);
+                } else {
+                    FF* inFF = dynamic_cast<FF*>(prev.instance);
+                    if(inFF && inFF->getPhysicalFF()){
+                        driverCoor = inFF->getPhysicalFF()->getNewCoor()
+                                   + inFF->getPhysicalFF()->getPinCoor(
+                                       "Q" + inFF->getPhysicalPinName());
+                    }
+                }
+                Coor curDpin = wCoor + w->getCell()->getPinCoor("D");
+                fx += signOf(driverCoor.x - curDpin.x);
+                fy += signOf(driverCoor.y - curDpin.y);
+                totalW += 1.0;
+            }
+
+            // Q-pin: sign force toward each downstream load
+            for(auto& ns : logic->getNextStage()){
+                if(!ns.ff) continue;
+                Coor loadCoor;
+                if(ns.outputGate){
+                    loadCoor = ns.outputGate->getCoor()
+                             + ns.outputGate->getPinCoor(ns.pinName);
+                } else if(ns.ff->getPhysicalFF()){
+                    loadCoor = ns.ff->getPhysicalFF()->getNewCoor()
+                             + ns.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + ns.ff->getPhysicalPinName());
+                } else {
+                    continue;
+                }
+                Coor curQpin = wCoor + w->getCell()->getPinCoor("Q");
+                fx += signOf(loadCoor.x - curQpin.x);
+                fy += signOf(loadCoor.y - curQpin.y);
+                totalW += 1.0;
+            }
+
+            if(totalW < 1e-12) continue;
+
+            // Step size scales with fraction * slack budget
+            double stepSize = (-slackD) / DisplacementDelay * fraction;
+            double dx = stepSize * fx / totalW;
+            double dy = stepSize * fy / totalW;
+
+            // Clamp displacement to maxDispFrac of the slack-implied budget
+            double budget = (-slackD) / DisplacementDelay * maxDispFrac;
+            double dist = std::abs(dx) + std::abs(dy);
+            if(dist > budget && budget > 0){
+                double scale = budget / dist;
+                dx *= scale;
+                dy *= scale;
+            }
+
+            double nx = std::max(dieXlo, std::min(dieXhi - cellW, wCoor.x + dx));
+            double ny = std::max(dieYlo, std::min(dieYhi - cellH, wCoor.y + dy));
+            double moved = std::abs(nx - wCoor.x) + std::abs(ny - wCoor.y);
+            if(moved > 0.01){
+                w->setNewCoor(Coor(nx, ny));
+                nMoved++;
+                sumDisp += moved;
+            }
+        }
+        std::cerr << "[TIMING_PRELOC] iter=" << iter
+                  << " moved=" << nMoved
+                  << " avgDisp=" << (nMoved > 0 ? sumDisp / nMoved : 0)
+                  << std::endl;
+    }
 }
 
 /**
