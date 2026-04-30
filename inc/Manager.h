@@ -177,6 +177,8 @@ public:
     double getCostDiff(Coor newbankCoor, Cell* bankCellType, std::vector<FF*>& FFToBank); // > 0 -> after bank cost will be larger
     double getEvaluatorCost();
     double calculateBinDensityCost();
+    double computeAccurateTNS();
+    void   refreshArrivalCorrections();
     double getOverallCost(bool verbose, bool runEvaluator);
     friend class Parser;
     friend class Dumper;

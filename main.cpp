@@ -27,6 +27,8 @@ int main(int argc, char *argv[]){
     // STAGE_COST=1: print per-stage cost (non-verbose) even in production mode.
     // Used to bisect-locate inter-binary score drift.
     const bool stageCost = std::getenv("STAGE_COST") && std::atoi(std::getenv("STAGE_COST"));
+    // ACCURATE_TNS=1: use BFS-based accurate TNS in getOverallCost() for reporting.
+    // Does NOT affect optimization stages (getSlack() is unchanged). Read in Manager::getOverallCost().
     auto printStageCost = [&](const char* tag, Manager &m){
         if(!stageCost) return;
         double c = m.getOverallCost(false, 0);
@@ -51,6 +53,8 @@ int main(int argc, char *argv[]){
     STAGE("slackRedist",       mgr.computeSlackRedistribution());
     STAGE("timingPreReloc",    mgr.timingPreRelocation());
 
+    if(std::getenv("ACCURATE_BANKING") && std::atoi(std::getenv("ACCURATE_BANKING")))
+        STAGE("refreshArr(pre-bank)", mgr.refreshArrivalCorrections());
     STAGE("banking",           mgr.banking());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Banking.out"); }
     printStageCost("banking", mgr);
@@ -79,7 +83,8 @@ int main(int argc, char *argv[]){
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
     printStageCost("postLGResynth", mgr);
 
-    STAGE("detailplacement",   mgr.detailplacement());
+    if(!std::getenv("SKIP_DP") || std::string(std::getenv("SKIP_DP")) == "0")
+        STAGE("detailplacement",   mgr.detailplacement());
     printStageCost("detailplacement", mgr);
     if(!production){
         mgr.getOverallCost(cost_verbose, 1);

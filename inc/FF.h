@@ -76,6 +76,13 @@ private:
     // via getEffectiveSlack() and consumed only by matching edge-weight logic
     // under SLACK_RELEASE=1. Not part of getSlack() itself.
     double bankingReleasedSlackD;
+
+    // BFS-based arrival correction. Captures the difference between accurate
+    // gate-arrival (max over ALL inputs at current positions) and the stale
+    // single-path model (prevStage). Position-independent: D-pin terms cancel.
+    // Set by Manager::refreshArrivalCorrections(), consumed by getSlack().
+    double arrCorrection_;
+
 public:
     FF();
     explicit FF(int size);
@@ -103,6 +110,8 @@ public:
     void setRedistributedSlackD(double s);
     void addBankingReleasedSlackD(double delta);
     void clearBankingReleasedSlackD();
+    void setArrCorrection(double c);
+    double getArrCorrection()const;
     // Getter
     double getTimingSlack(const std::string &pinName)const;
     std::vector<FF*>& getClusterFF();

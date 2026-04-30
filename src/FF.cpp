@@ -21,7 +21,8 @@ FF::FF() :
     slot(0),
     fixed(true),
     redistributedSlackD(0),
-    bankingReleasedSlackD(0){
+    bankingReleasedSlackD(0),
+    arrCorrection_(0){
 }
 
 FF::FF(int size) : Instance(), clusterFF(size, nullptr){
@@ -164,6 +165,9 @@ void FF::clearBankingReleasedSlackD(){
 double FF::getBankingReleasedSlackD()const{
     return bankingReleasedSlackD;
 }
+
+void FF::setArrCorrection(double c){ arrCorrection_ = c; }
+double FF::getArrCorrection()const{ return arrCorrection_; }
 
 double FF::getEffectiveSlack(){
     return getSlack() + bankingReleasedSlackD;
@@ -346,6 +350,7 @@ void FF::clear(){
     prevInstance = {nullptr, CellType::IO, ""};
     nextStage.clear();
     physicalFF = nullptr;
+    arrCorrection_ = 0;
 }
 
 std::ostream &operator<<(std::ostream &os, const FF &ff){

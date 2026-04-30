@@ -1710,9 +1710,338 @@ double Manager::calculateBinDensityCost(){
     return lambda * numViolationBins;
 }
 
+double Manager::computeAccurateTNS(){
+    // Dual-BFS mini-STA: computes arrival at every gate and FF using BOTH
+    //   (a) original positions (post-CG, pre-banking) — the baseline for origSlack
+    //   (b) current positions (post-banking)
+    // Then: newSlack = origSlack - (curArrival - origArrival).
+    //
+    // Key fix vs getSlack(): takes max over ALL gate inputs at current positions,
+    // not just the single critical path recorded during preprocessing.
+
+    // Step 0: Build inner-FF map (logical 1-bit FFs from clusterFF).
+    std::unordered_map<std::string, FF*> innerFF;
+    innerFF.reserve(FF_Map.size() * 2);
+    for(auto& ff_pair : FF_Map){
+        for(FF* cf : ff_pair.second->getClusterFF()){
+            innerFF[cf->getInstanceName()] = cf;
+        }
+    }
+
+    // Per-gate: running max arrival (orig & cur), and shared input-counter.
+    struct ArrPair { double orig = 0, cur = 0; };
+    std::unordered_map<Gate*, ArrPair> gateArr;
+    std::unordered_map<Gate*, int>     gateCnt;
+    gateArr.reserve(Gate_Map.size());
+    gateCnt.reserve(Gate_Map.size());
+    std::queue<Gate*> q;
+
+    // Step 1: IO → Gate arrivals (IOs don't move; same for orig and cur).
+    for(auto& io_m : Input_Map){
+        Instance& ioInst = IO_Map[io_m.first];
+        auto& outs = ioInst.getOutputInstances();
+        for(auto& outPair : outs){
+            for(auto& tgt : outPair.second){
+                const std::string& instName = tgt.first;
+                const std::string& pinName  = tgt.second;
+                auto it = Gate_Map.find(instName);
+                if(it != Gate_Map.end()){
+                    Gate* gate = it->second;
+                    Coor gatePin = gate->getCoor() + gate->getPinCoor(pinName);
+                    double arr = DisplacementDelay * HPWL(ioInst.getCoor(), gatePin);
+                    ArrPair& ap = gateArr[gate];
+                    if(arr > ap.orig) ap.orig = arr;
+                    if(arr > ap.cur)  ap.cur  = arr;
+                    int& cnt = gateCnt[gate];
+                    cnt++;
+                    if(cnt == gate->getCell()->getInputCount())
+                        q.push(gate);
+                }
+            }
+        }
+    }
+
+    // Step 2: FF → Gate arrivals (orig uses originalQ/originalQpd; cur uses current).
+    for(auto& inner_pair : innerFF){
+        FF* cf   = inner_pair.second;
+        FF* phys = cf->getPhysicalFF();
+        Coor origQ  = cf->getOriginalQ();
+        double origQpd = cf->getOriginalQpinDelay();
+        Coor curQ    = phys->getNewCoor() + phys->getPinCoor("Q" + cf->getPhysicalPinName());
+        double curQpd  = phys->getCell()->getQpinDelay();
+
+        auto& outs = cf->getOutputInstances();
+        for(auto& outPair : outs){
+            for(auto& tgt : outPair.second){
+                const std::string& instName = tgt.first;
+                const std::string& pinName  = tgt.second;
+                auto it = Gate_Map.find(instName);
+                if(it != Gate_Map.end()){
+                    Gate* gate = it->second;
+                    Coor gatePin = gate->getCoor() + gate->getPinCoor(pinName);
+                    double oArr = origQpd + DisplacementDelay * HPWL(origQ, gatePin);
+                    double cArr = curQpd  + DisplacementDelay * HPWL(curQ,  gatePin);
+                    ArrPair& ap = gateArr[gate];
+                    if(oArr > ap.orig) ap.orig = oArr;
+                    if(cArr > ap.cur)  ap.cur  = cArr;
+                    int& cnt = gateCnt[gate];
+                    cnt++;
+                    if(cnt == gate->getCell()->getInputCount())
+                        q.push(gate);
+                }
+            }
+        }
+    }
+
+    // Step 3: BFS (topological order) through gate graph.
+    // Gate-to-gate HPWL is identical for orig and cur (gates don't move).
+    // When a gate outputs to an inner FF, record both arrivals.
+    struct FFArrPair { double orig = 0, cur = 0; };
+    std::unordered_map<std::string, FFArrPair> ffArr;
+    ffArr.reserve(innerFF.size());
+
+    while(!q.empty()){
+        Gate* gate = q.front(); q.pop();
+        const ArrPair& myArr = gateArr[gate];
+
+        auto& outs = gate->getOutputInstances();
+        for(auto& outPair : outs){
+            const std::string& outPin = outPair.first;
+            Coor gateOut = gate->getCoor() + gate->getPinCoor(outPin);
+            for(auto& tgt : outPair.second){
+                const std::string& instName = tgt.first;
+                const std::string& pinName  = tgt.second;
+
+                auto git = Gate_Map.find(instName);
+                if(git != Gate_Map.end()){
+                    Gate* next = git->second;
+                    Coor nextPin = next->getCoor() + next->getPinCoor(pinName);
+                    double hop = DisplacementDelay * HPWL(gateOut, nextPin);
+                    ArrPair& nap = gateArr[next];
+                    double oArr = myArr.orig + hop;
+                    double cArr = myArr.cur  + hop;
+                    if(oArr > nap.orig) nap.orig = oArr;
+                    if(cArr > nap.cur)  nap.cur  = cArr;
+                    int& cnt = gateCnt[next];
+                    cnt++;
+                    if(cnt == next->getCell()->getInputCount())
+                        q.push(next);
+                }
+                else{
+                    auto fit = innerFF.find(instName);
+                    if(fit != innerFF.end()){
+                        FF* cf   = fit->second;
+                        FF* phys = cf->getPhysicalFF();
+                        Coor origD = cf->getOriginalD();
+                        Coor curD  = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
+                        double oArr = myArr.orig + DisplacementDelay * HPWL(gateOut, origD);
+                        double cArr = myArr.cur  + DisplacementDelay * HPWL(gateOut, curD);
+                        FFArrPair& fap = ffArr[instName];
+                        if(oArr > fap.orig) fap.orig = oArr;
+                        if(cArr > fap.cur)  fap.cur  = cArr;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: Compute per-FF slack using accurate arrival deltas.
+    double totalTNS = 0;
+    for(auto& inner_pair : innerFF){
+        const std::string& name = inner_pair.first;
+        FF* cf = inner_pair.second;
+        double origSlack = cf->getTimingSlack("D");
+        PrevInstance prev = cf->getPrevInstance();
+        FF* phys = cf->getPhysicalFF();
+        Coor curD = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
+
+        if(!prev.instance){
+            if(origSlack < 0) totalTNS += -origSlack;
+            continue;
+        }
+
+        double arrChange = 0;
+
+        if(prev.cellType == CellType::GATE){
+            auto fit = ffArr.find(name);
+            if(fit != ffArr.end()){
+                arrChange = fit->second.cur - fit->second.orig;
+            }
+            else{
+                // Gate unreached by BFS — fall back to old delta model.
+                Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
+                arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, cf->getOriginalD()));
+                const PrevStage& ps = cf->getPrevStage();
+                if(ps.ff){
+                    FF* srcPhys = ps.ff->getPhysicalFF();
+                    Coor origQ = ps.ff->getOriginalQ();
+                    Coor newQ  = srcPhys->getNewCoor() + srcPhys->getPinCoor("Q" + ps.ff->getPhysicalPinName());
+                    double dqpd = srcPhys->getCell()->getQpinDelay() - ps.ff->getOriginalQpinDelay();
+                    Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
+                    arrChange += dqpd + DisplacementDelay * (HPWL(firstGatePin, newQ) - HPWL(firstGatePin, origQ));
+                }
+            }
+        }
+        else if(prev.cellType == CellType::IO){
+            Coor ioCoor = prev.instance->getCoor();
+            arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, cf->getOriginalD()));
+        }
+        else{
+            FF* prevFF   = static_cast<FF*>(prev.instance);
+            FF* prevPhys = prevFF->getPhysicalFF();
+            Coor origQ = prevFF->getOriginalQ();
+            Coor newQ  = prevPhys->getNewCoor() + prevPhys->getPinCoor("Q" + prevFF->getPhysicalPinName());
+            double origQpd = prevFF->getOriginalQpinDelay();
+            double newQpd  = prevPhys->getCell()->getQpinDelay();
+            double origArr = origQpd + DisplacementDelay * HPWL(origQ, cf->getOriginalD());
+            double newArr  = newQpd  + DisplacementDelay * HPWL(newQ,  curD);
+            arrChange = newArr - origArr;
+        }
+
+        double newSlack = origSlack - arrChange;
+        if(newSlack < 0) totalTNS += -newSlack;
+    }
+
+    return totalTNS;
+}
+
+void Manager::refreshArrivalCorrections(){
+    // Dual-BFS: compute per-inner-FF arrival correction.
+    // correction = accurate_slack - old_getSlack().
+    // getSlack() adds arrCorrection_, so all callers automatically get accurate results.
+    // The correction is D-pin-position-independent: when DP moves an FF,
+    // getSlack() recomputes the D-pin delta, and the correction handles
+    // the upstream gate-arrival delta. Together they give exact accurate slack.
+
+    // Step 0: Collect inner FFs, temporarily zero their corrections.
+    std::unordered_map<std::string, FF*> innerFF;
+    innerFF.reserve(FF_Map.size() * 2);
+    for(auto& ff_pair : FF_Map){
+        for(FF* cf : ff_pair.second->getClusterFF()){
+            cf->setArrCorrection(0);
+            innerFF[cf->getInstanceName()] = cf;
+        }
+    }
+
+    // Per-gate dual arrival.
+    struct ArrPair { double orig = 0, cur = 0; };
+    std::unordered_map<Gate*, ArrPair> gateArr;
+    std::unordered_map<Gate*, int>     gateCnt;
+    gateArr.reserve(Gate_Map.size());
+    gateCnt.reserve(Gate_Map.size());
+    std::queue<Gate*> q;
+
+    // Step 1: IO → Gate (same for orig and cur).
+    for(auto& io_m : Input_Map){
+        Instance& ioInst = IO_Map[io_m.first];
+        auto& outs = ioInst.getOutputInstances();
+        for(auto& outPair : outs){
+            for(auto& tgt : outPair.second){
+                auto it = Gate_Map.find(tgt.first);
+                if(it != Gate_Map.end()){
+                    Gate* gate = it->second;
+                    Coor gp = gate->getCoor() + gate->getPinCoor(tgt.second);
+                    double arr = DisplacementDelay * HPWL(ioInst.getCoor(), gp);
+                    ArrPair& ap = gateArr[gate];
+                    if(arr > ap.orig) ap.orig = arr;
+                    if(arr > ap.cur)  ap.cur  = arr;
+                    if(++gateCnt[gate] == gate->getCell()->getInputCount())
+                        q.push(gate);
+                }
+            }
+        }
+    }
+
+    // Step 2: FF → Gate (orig uses originalQ/Qpd, cur uses current).
+    for(auto& ip : innerFF){
+        FF* cf   = ip.second;
+        FF* phys = cf->getPhysicalFF();
+        Coor  origQ  = cf->getOriginalQ();
+        double origQpd = cf->getOriginalQpinDelay();
+        Coor  curQ   = phys->getNewCoor() + phys->getPinCoor("Q" + cf->getPhysicalPinName());
+        double curQpd  = phys->getCell()->getQpinDelay();
+
+        auto& outs = cf->getOutputInstances();
+        for(auto& outPair : outs){
+            for(auto& tgt : outPair.second){
+                auto it = Gate_Map.find(tgt.first);
+                if(it != Gate_Map.end()){
+                    Gate* gate = it->second;
+                    Coor gp = gate->getCoor() + gate->getPinCoor(tgt.second);
+                    double oA = origQpd + DisplacementDelay * HPWL(origQ, gp);
+                    double cA = curQpd  + DisplacementDelay * HPWL(curQ,  gp);
+                    ArrPair& ap = gateArr[gate];
+                    if(oA > ap.orig) ap.orig = oA;
+                    if(cA > ap.cur)  ap.cur  = cA;
+                    if(++gateCnt[gate] == gate->getCell()->getInputCount())
+                        q.push(gate);
+                }
+            }
+        }
+    }
+
+    // Step 3: BFS through gates. Record per-FF arrivals.
+    struct FFArrPair { double orig = 0, cur = 0; };
+    std::unordered_map<std::string, FFArrPair> ffArr;
+    ffArr.reserve(innerFF.size());
+
+    while(!q.empty()){
+        Gate* gate = q.front(); q.pop();
+        const ArrPair& my = gateArr[gate];
+        auto& outs = gate->getOutputInstances();
+        for(auto& outPair : outs){
+            Coor go = gate->getCoor() + gate->getPinCoor(outPair.first);
+            for(auto& tgt : outPair.second){
+                auto git = Gate_Map.find(tgt.first);
+                if(git != Gate_Map.end()){
+                    Gate* nxt = git->second;
+                    Coor np = nxt->getCoor() + nxt->getPinCoor(tgt.second);
+                    double hop = DisplacementDelay * HPWL(go, np);
+                    ArrPair& nap = gateArr[nxt];
+                    double oA = my.orig + hop, cA = my.cur + hop;
+                    if(oA > nap.orig) nap.orig = oA;
+                    if(cA > nap.cur)  nap.cur  = cA;
+                    if(++gateCnt[nxt] == nxt->getCell()->getInputCount())
+                        q.push(nxt);
+                }
+                else{
+                    auto fit = innerFF.find(tgt.first);
+                    if(fit != innerFF.end()){
+                        FF* cf   = fit->second;
+                        FF* phys = cf->getPhysicalFF();
+                        Coor origD = cf->getOriginalD();
+                        Coor curD  = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
+                        double oA = my.orig + DisplacementDelay * HPWL(go, origD);
+                        double cA = my.cur  + DisplacementDelay * HPWL(go, curD);
+                        FFArrPair& fap = ffArr[tgt.first];
+                        if(oA > fap.orig) fap.orig = oA;
+                        if(cA > fap.cur)  fap.cur  = cA;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: Compute per-FF correction = accurate_slack - old_getSlack().
+    // arrCorrection_ is already 0 (cleared in Step 0), so getSlack() returns old model.
+    for(auto& ip : innerFF){
+        FF* cf = ip.second;
+        auto fit = ffArr.find(ip.first);
+        if(fit == ffArr.end()) continue; // IO-direct or unreached: correction stays 0
+
+        PrevInstance prev = cf->getPrevInstance();
+        if(prev.cellType != CellType::GATE) continue;
+
+        double origSlack = cf->getTimingSlack("D");
+        double accurateSlack = origSlack - (fit->second.cur - fit->second.orig);
+        double oldSlack = cf->getSlack(); // uses old model (arrCorrection_ == 0)
+        cf->setArrCorrection(accurateSlack - oldSlack);
+    }
+}
+
 /**
  * @brief The cost function of the problem
- * 
+ *
  * @param verbose whether to print the pretty table
  * @param runEvaluator whether to run evaluator to get the real cost
  * @return double the weighted overall cost
@@ -1722,9 +2051,17 @@ double Manager::getOverallCost(bool verbose, bool runEvaluator){
     double Power_cost = 0;
     double Area_cost = 0;
     double Bin_cost = 0;
+
+    static const bool useAccurate = std::getenv("ACCURATE_TNS") && std::atoi(std::getenv("ACCURATE_TNS"));
+    if(useAccurate){
+        TNS_cost = alpha * computeAccurateTNS();
+    }
+
     for(const auto & ff_pair : FF_Map){
-        double curTNS = ff_pair.second->getTNS();
-        TNS_cost += alpha * (curTNS);
+        if(!useAccurate){
+            double curTNS = ff_pair.second->getTNS();
+            TNS_cost += alpha * (curTNS);
+        }
         Power_cost += beta * ff_pair.second->getCell()->getGatePower();
         Area_cost += gamma * (ff_pair.second->getCell()->getArea());
     }

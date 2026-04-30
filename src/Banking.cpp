@@ -352,6 +352,7 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
     // If downstreamMargin != nullptr, also accumulate positive-slack margin
     // erosion on 1-hop downstream FFs (the piece the TNS filter misses when
     // slack stays >= 0 but shrinks). This is option (ii) in the HB diagnosis.
+    static const bool useArrCorr = std::getenv("ACCURATE_BANKING") && std::atoi(std::getenv("ACCURATE_BANKING"));
     oldTNS = 0;
     newTNS = 0;
     if(downstreamMargin) *downstreamMargin = 0;
@@ -368,7 +369,8 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
                 ? "" : std::to_string(flatIdx);
 
             // ---- D-pin slack of this constituent FF ----
-            double curSlackD = cf->getSlack();
+            double curSlackD = cf->getSlack()
+                + (useArrCorr ? cf->getArrCorrection() : 0.0);
 
             // Predict D-pin slack at new position using actual driver position
             Coor curDpin = ff->getNewCoor() + ff->getPinCoor(
@@ -401,7 +403,8 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
 
             // ---- Q-pin: downstream FFs' D-pin slack ----
             for(auto& next : cf->getNextStage()){
-                double nextCurSlack = next.ff->getSlack();
+                double nextCurSlack = next.ff->getSlack()
+                    + (useArrCorr ? next.ff->getArrCorrection() : 0.0);
 
                 // Q-pin delay change: positive if new cell is faster
                 double qDelayBenefit = oldCellQDelay - newCellQDelay;
@@ -837,6 +840,186 @@ void Banking::doClustering(){
               << std::endl;
 }
 
+int Banking::doTopDown4Bit(Cell* cell4bit, Cell* cell2bit){
+    const double SAFETY_MARGIN = std::getenv("TD4_MARGIN")
+        ? std::atof(std::getenv("TD4_MARGIN")) : 50.0;
+    const int TD4_K = std::getenv("TD4_K")
+        ? std::atoi(std::getenv("TD4_K")) : 12;
+    // Max displacement from median to legal position (die-fraction)
+    const double DISP_FRAC = std::getenv("TD4_DISP_FRAC")
+        ? std::atof(std::getenv("TD4_DISP_FRAC")) : 0.01;
+    const Coor& dieO = mgr.die.getDieOrigin();
+    const Coor& dieB = mgr.die.getDieBorder();
+    const double dieSpan = std::max(1.0, (dieB.x - dieO.x) + (dieB.y - dieO.y));
+    const double DISP_CAP = dieSpan * DISP_FRAC;
+    // Fraction of 1-bit FFs allowed to merge (cap total commits)
+    const double FRAC_CAP = std::getenv("TD4_FRAC")
+        ? std::atof(std::getenv("TD4_FRAC")) : 0.30;
+
+    size_t max_clk_idx = 0;
+    for(const auto& p : mgr.FF_Map)
+        max_clk_idx = std::max((int)max_clk_idx, p.second->getClkIdx());
+
+    int totalCommitted = 0;
+    DEBUG_BAN("TD4 margin=" << SAFETY_MARGIN << " disp=" << DISP_CAP << " frac=" << FRAC_CAP);
+
+    for(size_t clkIDX = 0; clkIDX <= max_clk_idx; clkIDX++){
+        std::vector<FF*> sbffs;
+        for(const auto& p : mgr.FF_Map){
+            if((size_t)p.second->getClkIdx() == clkIDX
+               && p.second->getCell()->getBits() == 1)
+                sbffs.push_back(p.second);
+        }
+        if(sbffs.size() < 4) continue;
+
+        const int maxCommitThisClock = (int)(sbffs.size() * FRAC_CAP / 4.0);
+
+        typedef bg::model::point<double, 2, bg::cs::cartesian> Pt;
+        typedef std::pair<Pt, int> PtID;
+        bg::index::rtree<PtID, bg::index::quadratic<16>> rtree;
+        for(int i = 0; i < (int)sbffs.size(); i++){
+            Coor c = sbffs[i]->getNewCoor();
+            rtree.insert({Pt(c.x, c.y), i});
+        }
+
+        // S_cluster priority: density + slack resilience
+        struct Candidate { int idx; double priority; };
+        std::vector<Candidate> candidates;
+        candidates.reserve(sbffs.size());
+        for(int i = 0; i < (int)sbffs.size(); i++){
+            Coor ci = sbffs[i]->getNewCoor();
+            std::vector<PtID> near;
+            rtree.query(bg::index::nearest(Pt(ci.x, ci.y), 9), std::back_inserter(near));
+            double dist8 = 0;
+            if(near.size() >= 9){
+                Coor cn = {bg::get<0>(near[8].first), bg::get<1>(near[8].first)};
+                dist8 = HPWL(ci, cn);
+            }
+            double density = 1.0 / (dist8 + 1.0);
+            double slack = sbffs[i]->getPhysicalFF()
+                ? sbffs[i]->getSlack()
+                : sbffs[i]->getTimingSlack("D");
+            double sigmoidSlack = 1.0 / (1.0 + std::exp(-slack / 5.0));
+            candidates.push_back({i, density + 0.5 * sigmoidSlack});
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b){
+                      return a.priority > b.priority;
+                  });
+
+        // Two-phase: collect scored candidates, then commit top-K by gain
+        struct ScoredGroup {
+            std::vector<int> idxs;
+            Coor legalPos;
+            double gain;
+        };
+        std::vector<ScoredGroup> scoredGroups;
+        std::vector<bool> used(sbffs.size(), false);
+
+        for(const auto& cand : candidates){
+            if(used[cand.idx]) continue;
+            FF* ff0 = sbffs[cand.idx];
+            Coor c0 = ff0->getNewCoor();
+
+            std::vector<PtID> near;
+            rtree.query(bg::index::nearest(Pt(c0.x, c0.y), TD4_K + 4),
+                        std::back_inserter(near));
+
+            std::vector<std::pair<double, int>> neighbors;
+            for(auto& np : near){
+                int ni = np.second;
+                if(ni == cand.idx || used[ni]) continue;
+                Coor cn = {bg::get<0>(np.first), bg::get<1>(np.first)};
+                neighbors.push_back({HPWL(c0, cn), ni});
+            }
+            std::sort(neighbors.begin(), neighbors.end());
+            if((int)neighbors.size() < 3) continue;
+
+            std::vector<FF*> group = {ff0};
+            std::vector<int> groupIdx = {cand.idx};
+            for(int j = 0; j < 3; j++){
+                group.push_back(sbffs[neighbors[j].second]);
+                groupIdx.push_back(neighbors[j].second);
+            }
+
+            // Median position
+            std::vector<double> xs, ys;
+            for(auto* f : group){ xs.push_back(f->getNewCoor().x); ys.push_back(f->getNewCoor().y); }
+            std::sort(xs.begin(), xs.end());
+            std::sort(ys.begin(), ys.end());
+            Coor median((xs[1]+xs[2])*0.5, (ys[1]+ys[2])*0.5);
+
+            // Compare 4-bit gain vs best 2×2-bit split.
+            // Try all 3 pairings of 4 FFs: (01|23), (02|13), (03|12)
+            double gain4 = CostCompare(median, cell4bit, group);
+            double best2x2 = 0;
+            if(cell2bit){
+                int pairings[3][2][2] = {{{0,1},{2,3}}, {{0,2},{1,3}}, {{0,3},{1,2}}};
+                for(auto& p : pairings){
+                    std::vector<FF*> pA = {group[p[0][0]], group[p[0][1]]};
+                    std::vector<FF*> pB = {group[p[1][0]], group[p[1][1]]};
+                    Coor mA((pA[0]->getNewCoor().x + pA[1]->getNewCoor().x)*0.5,
+                            (pA[0]->getNewCoor().y + pA[1]->getNewCoor().y)*0.5);
+                    Coor mB((pB[0]->getNewCoor().x + pB[1]->getNewCoor().x)*0.5,
+                            (pB[0]->getNewCoor().y + pB[1]->getNewCoor().y)*0.5);
+                    double g2 = CostCompare(mA, cell2bit, pA)
+                              + CostCompare(mB, cell2bit, pB);
+                    best2x2 = std::max(best2x2, g2);
+                }
+            }
+            double netGain = gain4 - best2x2;
+            if(netGain <= SAFETY_MARGIN) continue;
+
+            Coor legalPos = mgr.legalizer->FindPlace(median, cell4bit);
+            if(legalPos.x >= 1e18 || legalPos.y >= 1e18) continue;
+            if(HPWL(median, legalPos) > DISP_CAP) continue;
+
+            double legalGain4 = CostCompare(legalPos, cell4bit, group);
+            double legalNetGain = legalGain4 - best2x2;
+            if(legalNetGain <= SAFETY_MARGIN) continue;
+
+            // Tentatively reserve these FFs (greedy, no backtrack)
+            for(int gi : groupIdx) used[gi] = true;
+            for(int gi : groupIdx){
+                Coor cr = sbffs[gi]->getNewCoor();
+                rtree.remove({Pt(cr.x, cr.y), gi});
+            }
+            scoredGroups.push_back({groupIdx, legalPos, legalNetGain});
+        }
+        // Sort by gain descending, commit top maxCommitThisClock
+        std::sort(scoredGroups.begin(), scoredGroups.end(),
+                  [](const ScoredGroup& a, const ScoredGroup& b){
+                      return a.gain > b.gain;
+                  });
+
+        int committed = 0;
+        for(auto& sg : scoredGroups){
+            if(committed >= maxCommitThisClock) break;
+
+            bool allExist = true;
+            std::vector<FF*> group;
+            for(int gi : sg.idxs){
+                FF* f = sbffs[gi];
+                if(mgr.FF_Map.find(f->getInstanceName()) == mgr.FF_Map.end()){
+                    allExist = false; break;
+                }
+                group.push_back(f);
+            }
+            if(!allExist) continue;
+
+            FF* newFF = mgr.bankFF(sg.legalPos, cell4bit, group);
+            mgr.legalizer->UpdateRows(newFF);
+            newFF->setIsLegalize(true);
+            committed++;
+        }
+        totalCommitted += committed;
+    }
+
+    DEBUG_BAN("TopDown4Bit: committed " << totalCommitted
+              << " 4-bit MBFFs (" << totalCommitted * 4 << " FFs merged)");
+    return totalCommitted;
+}
+
 void Banking::doMatchingClustering(){
     // Stage B v1: Max-weight matching for 2-bit banking, then greedy for
     // higher-bit targets (4-bit, 8-bit, ...) on remaining FFs.
@@ -866,6 +1049,27 @@ void Banking::doMatchingClustering(){
         std::cout << "[MATCHING] No 2-bit cell in library, falling back to greedy" << std::endl;
         doClustering();
         return;
+    }
+
+    // Top-down 4-bit clustering: group 4 SBFFs into 4-bit MBFFs BEFORE 2-bit
+    // matching. NTU's key technique for area+power-dominated cases.
+    {
+        const char* envTD4 = std::getenv("TOP_DOWN_4BIT");
+        if(envTD4 && std::string(envTD4) != "0"){
+            Cell* cell4bit = nullptr;
+            for(const auto& bitLib : mgr.Bit_FF_Map){
+                if(bitLib.first == 4){
+                    cell4bit = bitLib.second[0];
+                    break;
+                }
+            }
+            if(cell4bit){
+                delete mgr.legalizer;
+                mgr.legalizer = new Legalizer(mgr);
+                mgr.legalizer->initial();
+                doTopDown4Bit(cell4bit, cell2bit);
+            }
+        }
     }
 
     // [RA/2] Route A prototype dump: enumerate 1-bit + pruned 2-bit candidates
@@ -919,16 +1123,17 @@ void Banking::doMatchingClustering(){
     if(useV21) std::cout << "[MATCHING] v2.1 window-optimal edge weight enabled" << std::endl;
 
     // Per-edge adaptive DIST_BONUS: zero DIST_BONUS for timing-critical pairs.
-    // Default mode (RISK_ADAPTIVE=0): slack < 0 = critical. Simple, robust.
-    // Risk mode  (RISK_ADAPTIVE=1): slack < D_delay*dist/scale = critical.
-    //   Physically motivated but non-monotonic across cases; t2_0812 regresses.
+    // Risk-adaptive mode: zero DIST_BONUS when slack < D_delay*dist/scale.
+    // Physically motivated: distant pairs need more slack to absorb displacement.
+    // RISK_SCALE=10 gives -0.87% tc2, -1.34% hc02, -0.08% tc1 vs slack<0 mode.
     bool adaptiveDistPerEdge = true;
-    bool riskAdaptive = false;
-    double riskScale = 4.0;
+    bool riskAdaptive = true;
+    double riskScale = 10.0;
     {
         const char* envAdapt = std::getenv("ADAPTIVE_DIST");
         if(envAdapt && std::string(envAdapt) == "0") adaptiveDistPerEdge = false;
         const char* envRisk = std::getenv("RISK_ADAPTIVE");
+        if(envRisk && std::string(envRisk) == "0") riskAdaptive = false;
         if(envRisk && std::string(envRisk) == "1") riskAdaptive = true;
         const char* envRS = std::getenv("RISK_SCALE");
         if(envRS) riskScale = std::atof(envRS);
@@ -937,6 +1142,7 @@ void Banking::doMatchingClustering(){
         std::cout << "[MATCHING] per-edge adaptive DIST_BONUS enabled"
                   << (riskAdaptive ? " (risk mode, scale=" + std::to_string(riskScale) + ")" : " (slack<0 mode)")
                   << std::endl;
+
 
     // Phase 4: Space-aware matching for higher-bit. Only affects 4-bit+ graph build.
     bool spaceAware = false;
@@ -998,6 +1204,7 @@ void Banking::doMatchingClustering(){
         std::cout << "[MATCHING] S_cluster commit priority enabled (density_coeff="
                   << sClusterDensityCoeff << ")" << std::endl;
 
+
     // Phase 3Z Step 5: inter-batch slack release. After each banked commit,
     // credit upstream/downstream FFs with DisplacementDelay*(oldHPWL-newHPWL)
     // when the MBFF landed closer to them than the original FF was. Credit
@@ -1030,6 +1237,17 @@ void Banking::doMatchingClustering(){
     if(commitOrder != 0)
         std::cout << "[MATCHING] deferred commit order=" << commitOrder
                   << " retry=" << commitRetry << std::endl;
+
+    bool retryAltTarget = false;
+    {
+        const char* envRAT = std::getenv("RETRY_ALT_TARGET");
+        if(envRAT && std::string(envRAT) != "0") retryAltTarget = true;
+    }
+    double forceCommitThreshold = -DBL_MAX;
+    {
+        const char* envFC = std::getenv("FORCE_COMMIT_THRESH");
+        if(envFC) forceCommitThreshold = std::atof(envFC);
+    }
 
     // Per-FF raw-slack snapshot used as cap reference. Captured lazily on first
     // credit. Local to this invocation of doMatchingClustering.
@@ -1396,8 +1614,23 @@ void Banking::doMatchingClustering(){
     // ================================================================
     // Phase 1: Max-weight matching for 2-bit on all 1-bit FFs
     // ================================================================
+    int maxMatchRounds = 1;
+    {
+        const char* envIR = std::getenv("ITER_ROUNDS");
+        if(envIR) maxMatchRounds = std::max(1, std::atoi(envIR));
+    }
+    if(maxMatchRounds > 1)
+        std::cout << "[ITER_MATCH] enabled: maxRounds=" << maxMatchRounds << std::endl;
+
     mgr.legalizer = new Legalizer(mgr);
     mgr.legalizer->initial();
+    for(const auto& ff_pair : mgr.FF_Map){
+        if(ff_pair.second->getCell()->getBits() > 1 && ff_pair.second->getIsLegalize())
+            mgr.legalizer->UpdateRows(ff_pair.second);
+    }
+
+    for(int matchRound = 0; matchRound < maxMatchRounds; matchRound++){
+    int round_committed_start = n_committed;
 
     for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
         std::vector<FF*> allLocalFFs;
@@ -1854,7 +2087,20 @@ void Banking::doMatchingClustering(){
                     Banking::CommitBinAware _cba;
                     realGain = CostCompare(placeCoor, c.cell, c.ffs);
                 }
-                if(realGain < 0){
+                if(realGain < 0 && retryAltTarget){
+                    for(FF* af : c.ffs){
+                        Coor altTarget = af->getNewCoor();
+                        Coor altPlace = mgr.legalizer->FindPlace(altTarget, c.cell);
+                        if(altPlace.x == DBL_MAX) continue;
+                        double altGain;
+                        { Banking::CommitBinAware _cba2; altGain = CostCompare(altPlace, c.cell, c.ffs); }
+                        if(altGain > realGain){
+                            realGain = altGain;
+                            placeCoor = altPlace;
+                        }
+                    }
+                }
+                if(realGain < forceCommitThreshold){
                     local_dropped_cost++;
                     n_dropped_cost++;
                     continue;
@@ -2155,6 +2401,227 @@ void Banking::doMatchingClustering(){
                   << " pass2_ms=" << alg1_pass2_ms
                   << " pass3_ms=" << alg1_pass3_ms
                   << "\n";
+    }
+
+    // End of iterative matching round
+    int round_committed = n_committed - round_committed_start;
+    if(matchRound > 0 || maxMatchRounds > 1){
+        std::cout << "[ITER_MATCH] round=" << matchRound
+                  << " committed=" << round_committed << std::endl;
+    }
+    if(round_committed == 0 && matchRound > 0) break;
+    } // end for(matchRound)
+
+    // ================================================================
+    // REMATCH_DROPS: Re-match un-merged 1-bit FFs across all clusters.
+    // After the per-cluster matching, some FFs were dropped because
+    // their matched partner led to negative gain at the legal position.
+    // These dropped FFs from different clusters might pair well with
+    // each other (cross-cluster re-matching).
+    // ================================================================
+    bool rematchDrops = (FF::beta <= 500.0);
+    int rematchK = K_NEIGHBORS;
+    double rematchMargin = mgr.DisplacementDelay * cell2bit->getW() * 2.0;
+    {
+        const char* envRM = std::getenv("REMATCH_DROPS");
+        if(envRM){
+            rematchDrops = (std::string(envRM) != "0");
+        }
+        const char* envRK = std::getenv("REMATCH_K");
+        if(envRK) rematchK = std::atoi(envRK);
+        const char* envRMM = std::getenv("REMATCH_MARGIN");
+        if(envRMM) rematchMargin = std::atof(envRMM);
+    }
+    if(rematchDrops && (n_dropped_cost + n_dropped_place) > 0){
+        auto t_rm0 = tic();
+        int rm_committed = 0, rm_dropped_place = 0, rm_dropped_cost = 0;
+        int rm_nodes = 0, rm_edges = 0, rm_matched = 0;
+
+        for(size_t clkIDX = 0; clkIDX < clkCount; clkIDX++){
+            std::vector<FF*> unmerged;
+            for(const auto& pair : mgr.FF_Map){
+                FF* ff = pair.second;
+                if((size_t)ff->getClkIdx() == clkIDX
+                   && ff->getCell()->getBits() == 1
+                   && ff->getClusterIdx() == UNSET_IDX){
+                    unmerged.push_back(ff);
+                }
+            }
+            if(unmerged.size() < 2) continue;
+            rm_nodes += (int)unmerged.size();
+
+            // Build R-tree
+            bgi::rtree<PointWithID, bgi::quadratic<P_PER_NODE>> rtree_rm;
+            for(size_t i = 0; i < unmerged.size(); i++){
+                Coor c = unmerged[i]->getNewCoor();
+                rtree_rm.insert(PointWithID(Point(c.x, c.y), (int)i));
+            }
+
+            // Compute distScale for this pool
+            double distScale_rm = 1.0;
+            {
+                double sumNN = 0; int cntNN = 0;
+                int sampleStep = std::max(1, (int)unmerged.size() / 200);
+                for(size_t i = 0; i < unmerged.size(); i += sampleStep){
+                    Coor ci = unmerged[i]->getNewCoor();
+                    std::vector<PointWithID> nn2;
+                    nn2.reserve(2);
+                    rtree_rm.query(bgi::nearest(Point(ci.x, ci.y), 2),
+                                   std::back_inserter(nn2));
+                    for(auto& nb : nn2){
+                        if(nb.second == (int)i) continue;
+                        double d = std::abs(ci.x - nb.first.get<0>())
+                                 + std::abs(ci.y - nb.first.get<1>());
+                        sumNN += d; cntNN++;
+                        break;
+                    }
+                }
+                double avgNN = (cntNN > 0) ? sumNN / cntNN : 1.0;
+                distScale_rm = (avgNN > 1e-9) ? 1.0 / avgNN : 1.0;
+            }
+
+            // Build LEMON graph
+            lemon::SmartGraph g_rm;
+            std::vector<lemon::SmartGraph::Node> gnodes_rm(unmerged.size());
+            for(size_t i = 0; i < unmerged.size(); i++)
+                gnodes_rm[i] = g_rm.addNode();
+            lemon::SmartGraph::EdgeMap<long long> weight_rm(g_rm);
+            int edgeCount_rm = 0;
+
+            int K_RM = std::min((int)unmerged.size() - 1, rematchK);
+            for(size_t i = 0; i < unmerged.size(); i++){
+                FF* ffA = unmerged[i];
+                Coor coorA = ffA->getNewCoor();
+
+                std::vector<PointWithID> neighbors;
+                neighbors.reserve(K_RM + 1);
+                rtree_rm.query(bgi::nearest(Point(coorA.x, coorA.y), K_RM + 1),
+                               std::back_inserter(neighbors));
+
+                for(auto& nb : neighbors){
+                    size_t j = nb.second;
+                    if(j <= i) continue;
+                    FF* ffB = unmerged[j];
+                    Coor coorB = ffB->getNewCoor();
+
+                    std::vector<FF*> pair_ffs = {ffA, ffB};
+                    Coor median((coorA.x + coorB.x) / 2.0,
+                                (coorA.y + coorB.y) / 2.0);
+                    double gain = CostCompare(median, cell2bit, pair_ffs);
+                    if(gain > EDGE_MIN_GAIN){
+                        double adjGain = gain;
+                        if(DIST_BONUS > 0){
+                            double edgeBonus = DIST_BONUS;
+                            double dist = HPWL(coorA, coorB);
+                            if(adaptiveDistPerEdge){
+                                double slA = ffA->getTimingSlack("D");
+                                double slB = ffB->getTimingSlack("D");
+                                if(riskAdaptive){
+                                    double risk = mgr.DisplacementDelay * dist / riskScale;
+                                    if(slA < risk || slB < risk) edgeBonus = 0;
+                                } else {
+                                    if(slA < 0 || slB < 0) edgeBonus = 0;
+                                }
+                            }
+                            if(edgeBonus > 0)
+                                adjGain += gain * edgeBonus / (1.0 + dist * distScale_rm);
+                        }
+                        adjGain *= slackMul(ffA, ffB);
+                        auto e = g_rm.addEdge(gnodes_rm[i], gnodes_rm[j]);
+                        weight_rm[e] = (long long)(adjGain * WEIGHT_SCALE);
+                        edgeCount_rm++;
+                    }
+                }
+            }
+            rm_edges += edgeCount_rm;
+            if(edgeCount_rm == 0) continue;
+
+            // Run max-weight matching
+            lemon::MaxWeightedMatching<lemon::SmartGraph,
+                lemon::SmartGraph::EdgeMap<long long>> mwm_rm(g_rm, weight_rm);
+            mwm_rm.run();
+
+            // Commit matched pairs (eager, sorted by gain descending)
+            lemon::SmartGraph::NodeMap<int> nodeIdx_rm(g_rm, -1);
+            for(size_t i = 0; i < unmerged.size(); i++)
+                nodeIdx_rm[gnodes_rm[i]] = (int)i;
+
+            struct RMPair { int i, j; double gain; };
+            std::vector<RMPair> rmPairs;
+            std::vector<bool> committed_rm(unmerged.size(), false);
+            for(size_t i = 0; i < unmerged.size(); i++){
+                if(committed_rm[i]) continue;
+                lemon::SmartGraph::Node mate = mwm_rm.mate(gnodes_rm[i]);
+                if(mate == lemon::INVALID) continue;
+                int j = nodeIdx_rm[mate];
+                if(j < 0 || committed_rm[j]) continue;
+                committed_rm[i] = true;
+                committed_rm[j] = true;
+                rm_matched++;
+
+                FF* ffA = unmerged[i];
+                FF* ffB = unmerged[j];
+                Coor cA = ffA->getNewCoor(), cB = ffB->getNewCoor();
+                std::vector<FF*> pf = {ffA, ffB};
+                double g = CostCompare(Coor((cA.x+cB.x)/2,(cA.y+cB.y)/2), cell2bit, pf);
+                rmPairs.push_back({(int)i, j, g});
+            }
+
+            // Sort by gain descending for priority commit
+            std::sort(rmPairs.begin(), rmPairs.end(),
+                      [](const RMPair& a, const RMPair& b){ return a.gain > b.gain; });
+
+            for(auto& rp : rmPairs){
+                FF* ffA = unmerged[rp.i];
+                FF* ffB = unmerged[rp.j];
+                if(ffA->getClusterIdx() != UNSET_IDX || ffB->getClusterIdx() != UNSET_IDX)
+                    continue;
+                std::vector<FF*> pair_ffs = {ffA, ffB};
+                Coor fpTarget((ffA->getNewCoor().x + ffB->getNewCoor().x) / 2.0,
+                              (ffA->getNewCoor().y + ffB->getNewCoor().y) / 2.0);
+                Coor placeCoor = mgr.legalizer->FindPlace(fpTarget, cell2bit);
+                if(placeCoor.x == DBL_MAX && placeCoor.y == DBL_MAX){
+                    rm_dropped_place++;
+                    continue;
+                }
+                double realGain;
+                {
+                    Banking::CommitBinAware _cba;
+                    realGain = CostCompare(placeCoor, cell2bit, pair_ffs);
+                }
+                if(realGain < rematchMargin){
+                    rm_dropped_cost++;
+                    continue;
+                }
+
+                std::vector<FF*> constituents_rm;
+                if(slackRelease){
+                    for(FF* pf : pair_ffs){
+                        auto& cfs = pf->getClusterFF();
+                        if(cfs.empty()) constituents_rm.push_back(pf);
+                        else for(FF* cf : cfs) if(cf) constituents_rm.push_back(cf);
+                    }
+                }
+                FF* newFF = mgr.bankFF(placeCoor, cell2bit, pair_ffs);
+                mgr.legalizer->UpdateRows(newFF);
+                newFF->setIsLegalize(true);
+                ffA->setClusterIdx(clusterTotalNum);
+                ffA->setNewCoor(placeCoor);
+                ffB->setClusterIdx(clusterTotalNum);
+                ffB->setNewCoor(placeCoor);
+                releaseSlackAfterCommit(newFF, constituents_rm);
+                clusterTotalNum++;
+                rm_committed++;
+            }
+        }
+        double t_rm = ms_fn(t_rm0, tic());
+        std::cout << "[REMATCH] nodes=" << rm_nodes << " edges=" << rm_edges
+                  << " matched=" << rm_matched << " committed=" << rm_committed
+                  << " dropped_place=" << rm_dropped_place
+                  << " dropped_cost=" << rm_dropped_cost
+                  << " margin=" << rematchMargin
+                  << " time=" << t_rm << "ms" << std::endl;
+        n_committed += rm_committed;
     }
 
     // ================================================================

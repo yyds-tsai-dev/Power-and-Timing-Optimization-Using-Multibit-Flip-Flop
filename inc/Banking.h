@@ -47,6 +47,7 @@ public:
     static void sortFFs(std::vector<std::pair<int, double>> &nearFFs);
     void doClustering();
     void doMatchingClustering();
+    int  doTopDown4Bit(Cell* cell4bit, Cell* cell2bit);
     void restoreUnclusterFFCoor();
     void ClusterResult();
     void computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
