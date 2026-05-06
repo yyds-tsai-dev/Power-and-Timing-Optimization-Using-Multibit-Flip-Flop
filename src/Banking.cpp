@@ -352,7 +352,6 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
     // If downstreamMargin != nullptr, also accumulate positive-slack margin
     // erosion on 1-hop downstream FFs (the piece the TNS filter misses when
     // slack stays >= 0 but shrinks). This is option (ii) in the HB diagnosis.
-    static const bool useArrCorr = std::getenv("ACCURATE_BANKING") && std::atoi(std::getenv("ACCURATE_BANKING"));
     oldTNS = 0;
     newTNS = 0;
     if(downstreamMargin) *downstreamMargin = 0;
@@ -369,8 +368,7 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
                 ? "" : std::to_string(flatIdx);
 
             // ---- D-pin slack of this constituent FF ----
-            double curSlackD = cf->getSlack()
-                + (useArrCorr ? cf->getArrCorrection() : 0.0);
+            double curSlackD = cf->getSlack();
 
             // Predict D-pin slack at new position using actual driver position
             Coor curDpin = ff->getNewCoor() + ff->getPinCoor(
@@ -403,8 +401,7 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
 
             // ---- Q-pin: downstream FFs' D-pin slack ----
             for(auto& next : cf->getNextStage()){
-                double nextCurSlack = next.ff->getSlack()
-                    + (useArrCorr ? next.ff->getArrCorrection() : 0.0);
+                double nextCurSlack = next.ff->getSlack();
 
                 // Q-pin delay change: positive if new cell is faster
                 double qDelayBenefit = oldCellQDelay - newCellQDelay;
@@ -1051,8 +1048,9 @@ void Banking::doMatchingClustering(){
         return;
     }
 
-    // Top-down 4-bit clustering: group 4 SBFFs into 4-bit MBFFs BEFORE 2-bit
-    // matching. NTU's key technique for area+power-dominated cases.
+    // Top-down 4-bit clustering (legacy path, NOT used by NTU_FLOW).
+    // NTU_FLOW uses doNTUFlowMatching() which has its own 4→2 loop with
+    // CostCompare-based matching + per-level decluster.
     {
         const char* envTD4 = std::getenv("TOP_DOWN_4BIT");
         if(envTD4 && std::string(envTD4) != "0"){
@@ -1524,7 +1522,7 @@ void Banking::doMatchingClustering(){
         const char* envS = std::getenv("ALG1_SA");
         if(envS && std::string(envS) != "0") alg1_sa = true;
     }
-    if(alg1_2b || alg1_hb){
+    if(alg1_2b || alg1_hb || sClusterEdge || sClusterCommit){
         // Adaptive coefficients derived from 1-bit FF slack distribution across
         // the full design. Computed once per banking entry (cheap: ~20K sort).
         std::vector<double> slacksAll;
@@ -1639,6 +1637,24 @@ void Banking::doMatchingClustering(){
                && pair.second->getCell()->getBits() == 1){
                 allLocalFFs.push_back(pair.second);
             }
+        }
+        // DONT_BANK_SLACK: exclude FFs with slack below threshold from matching
+        static const double dontBankSlack = [](){
+            const char* e = std::getenv("DONT_BANK_SLACK");
+            return e ? std::atof(e) : -1e30;
+        }();
+        if(dontBankSlack > -1e29){
+            size_t before = allLocalFFs.size();
+            allLocalFFs.erase(
+                std::remove_if(allLocalFFs.begin(), allLocalFFs.end(),
+                    [](FF* ff){
+                        double sl = ff->getTimingSlack("D");
+                        return sl < dontBankSlack;
+                    }),
+                allLocalFFs.end());
+            if(allLocalFFs.size() < before)
+                std::cerr << "[DONT_BANK] excluded=" << (before - allLocalFFs.size())
+                          << " remaining=" << allLocalFFs.size() << "\n";
         }
         if(allLocalFFs.size() < 2) continue;
 
@@ -2630,11 +2646,13 @@ void Banking::doMatchingClustering(){
     //   (b) Greedy fallback for remaining FFs
     // Both share the same legalizer so placements are consistent.
     // ================================================================
+    const bool skipGreedyHB = std::getenv("SKIP_GREEDY_HB") && std::atoi(std::getenv("SKIP_GREEDY_HB"));
     std::map<int, std::vector<Cell *>> orderBitMap(mgr.Bit_FF_Map.begin(), mgr.Bit_FF_Map.end());
     for(const auto &bitLib : orderBitMap){
         Cell* chooseCell = bitLib.second[0];
         int targetBit = chooseCell->getBits();
         if(targetBit <= 2) continue;
+        if(skipGreedyHB) continue;
         int sourceBit = targetBit / 2;
         bool canMatch = (mgr.Bit_FF_Map.find(sourceBit) != mgr.Bit_FF_Map.end());
 
@@ -3289,7 +3307,12 @@ void Banking::doMatchingClustering(){
                     Coor clusterCoor = mgr.legalizer->FindPlace(medianCoor, chooseCell);
                     if(clusterCoor.x == DBL_MAX && clusterCoor.y == DBL_MAX)
                         continue;
-                    if(CostCompare(clusterCoor, chooseCell, FFToBank) < 0)
+                    double greedyHBMargin = (mgr.beta > 500.0) ? 1000.0 : 0.0;
+                    {
+                        const char* e = std::getenv("GREEDY_HB_MARGIN");
+                        if(e) greedyHBMargin = std::atof(e);
+                    }
+                    if(CostCompare(clusterCoor, chooseCell, FFToBank) < greedyHBMargin)
                         continue;
 
                     FF* newFF = mgr.bankFF(clusterCoor, chooseCell, FFToBank);
