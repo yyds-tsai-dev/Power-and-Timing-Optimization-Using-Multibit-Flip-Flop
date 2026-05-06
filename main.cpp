@@ -27,6 +27,11 @@ int main(int argc, char *argv[]){
     // STAGE_COST=1: print per-stage cost (non-verbose) even in production mode.
     // Used to bisect-locate inter-binary score drift.
     const bool stageCost = std::getenv("STAGE_COST") && std::atoi(std::getenv("STAGE_COST"));
+    const bool ntuFlow = std::getenv("NTU_FLOW") && std::atoi(std::getenv("NTU_FLOW"));
+    if(ntuFlow){
+        // NTU_FLOW auto-enables TIMING_PRELOC unless explicitly set to 0
+        if(!std::getenv("TIMING_PRELOC")) setenv("TIMING_PRELOC", "1", 0);
+    }
     // ACCURATE_TNS=1: use BFS-based accurate TNS in getOverallCost() for reporting.
     // Does NOT affect optimization stages (getSlack() is unchanged). Read in Manager::getOverallCost().
     auto printStageCost = [&](const char* tag, Manager &m){
@@ -83,9 +88,27 @@ int main(int argc, char *argv[]){
     if(!production){ mgr.getOverallCost(cost_verbose, 0); }
     printStageCost("postLGResynth", mgr);
 
+    if(std::getenv("IB_BFS") && std::atoi(std::getenv("IB_BFS")))
+        STAGE("refreshArr(pre-IB)", mgr.refreshArrivalCorrections());
+    STAGE("iterBanking",       mgr.iterativeBankingLoop());
+    if(!production){ mgr.getOverallCost(cost_verbose, 0); }
+    printStageCost("iterBanking", mgr);
+
+    if(std::getenv("BFS_PRE_DP") && std::atoi(std::getenv("BFS_PRE_DP")))
+        STAGE("refreshArr(pre-DP)", mgr.refreshArrivalCorrections());
     if(!std::getenv("SKIP_DP") || std::string(std::getenv("SKIP_DP")) == "0")
         STAGE("detailplacement",   mgr.detailplacement());
     printStageCost("detailplacement", mgr);
+
+    // DP_ROUNDS: run additional DP passes with BFS-refreshed timing between each.
+    {
+        int dpRounds = 0;
+        if(const char* e = std::getenv("DP_ROUNDS")) dpRounds = std::atoi(e);
+        for(int r = 0; r < dpRounds; r++){
+            STAGE("refreshArr(dp-round)", mgr.refreshArrivalCorrections());
+            STAGE("dp-round",             mgr.detailplacement());
+        }
+    }
     if(!production){
         mgr.getOverallCost(cost_verbose, 1);
         mgr.dumpVisual("DetailPlacement.out");
