@@ -1,4 +1,5 @@
 #include "Manager.h"
+#include <unordered_set>
 #include <boost/geometry/index/rtree.hpp>
 #include <lemon/smart_graph.h>
 #include <lemon/matching.h>
@@ -85,6 +86,7 @@ void Manager::banking(){
 }
 
 void Manager::postBankingOptimize(){
+    if(std::getenv("SKIP_POST_CG") && std::atoi(std::getenv("SKIP_POST_CG"))) return;
     binTable.invalidate();
     postBankingOptimizer postOptimize(*this);
     postOptimize.run();
@@ -709,6 +711,106 @@ void Manager::postLGDecluster(){
     }
     std::cout << "[PostLGDecluster] placed_ok=" << okCnt
               << " placed_fallback=" << failCnt << std::endl;
+}
+
+// NTU Eq.5 per-level declustering.
+// After banking creates MBFFs of `targetBit` width, evaluate each under the
+// multi-objective cost ΔC = α·(s(i) - sBar) + β·ΔPower + γ·ΔArea.
+// sBar = median negative-slack sum among (targetBit/2)-width FFs (reference).
+// If ΔC < threshold, the MBFF is harmful — decluster it to (targetBit/2)-bit FFs.
+int Manager::perLevelDecluster(int targetBit, double threshold){
+    Cell* halfCell = nullptr;
+    int halfBit = targetBit / 2;
+    if(halfBit < 1) halfBit = 1;
+    auto it = Bit_FF_Map.find(halfBit);
+    if(it == Bit_FF_Map.end() || it->second.empty()) return 0;
+    halfCell = it->second[0];
+
+    std::vector<FF*> candidates;
+    for(auto& kv : FF_Map){
+        if(kv.second->getCell()->getBits() == targetBit)
+            candidates.push_back(kv.second);
+    }
+    if(candidates.empty()) return 0;
+
+    // Compute reference slack: median of negative slacks among halfBit FFs
+    std::vector<double> refSlacks;
+    for(auto& kv : FF_Map){
+        if(kv.second->getCell()->getBits() == halfBit){
+            double s = 0;
+            for(auto* cf : kv.second->getClusterFF()){
+                try { s += std::min(0.0, cf->getSlack()); }
+                catch(...) {}
+            }
+            refSlacks.push_back(s);
+        }
+    }
+    double sBar = 0;
+    if(!refSlacks.empty()){
+        std::sort(refSlacks.begin(), refSlacks.end());
+        sBar = refSlacks[refSlacks.size() / 2];
+    }
+
+    int nDeclustered = 0;
+    std::vector<FF*> toDecluster;
+
+    for(auto* mbff : candidates){
+        Cell* mCell = mbff->getCell();
+        int N = mCell->getBits();
+
+        // s(i) = sum of negative slack on all pins
+        double si = 0;
+        for(auto* cf : mbff->getClusterFF()){
+            try { si += std::min(0.0, cf->getSlack()); }
+            catch(...) {}
+        }
+
+        // Power/Area deltas (after - before): N half-cells vs 1 MBFF
+        double dPower = N * halfCell->getGatePower() - mCell->getGatePower();
+        double dArea  = N * halfCell->getArea()      - mCell->getArea();
+
+        // NTU Eq.5: ΔC = α·(s(i) - sBar) + β·ΔPower + γ·ΔArea
+        double deltaC = alpha * (si - sBar) + beta * dPower + gamma * dArea;
+
+        if(deltaC < threshold){
+            toDecluster.push_back(mbff);
+        }
+    }
+
+    for(auto* mbff : toDecluster){
+        Coor mbffCoor = mbff->getNewCoor();
+        Cell* mCell = mbff->getCell();
+        int N = mCell->getBits();
+
+        // Free legalizer state for the MBFF
+        legalizer->FreeRect(mbffCoor, mCell->getW(), mCell->getH());
+        legalizer->RemoveNodeByFFPtr(mbff);
+
+        // Compute intended positions from D-pin offsets
+        std::vector<Coor> intendedPos(N);
+        for(int i = 0; i < N; i++){
+            intendedPos[i] = mbffCoor + mCell->getPinCoor("D" + std::to_string(i))
+                           - halfCell->getPinCoor("D");
+        }
+
+        std::vector<FF*> newFFs = debankFF(mbff, halfCell);
+        for(size_t i = 0; i < newFFs.size() && i < intendedPos.size(); i++){
+            Coor placed = legalizer->FindPlace(intendedPos[i], halfCell);
+            if(placed.x >= 1e18) placed = intendedPos[i];
+            newFFs[i]->setCoor(placed);
+            newFFs[i]->setNewCoor(placed);
+            newFFs[i]->setIsLegalize(true);
+            legalizer->UpdateRows(newFFs[i]);
+        }
+        nDeclustered++;
+    }
+
+    std::cout << "[PerLevelDecluster] bit=" << targetBit
+              << " candidates=" << candidates.size()
+              << " declustered=" << nDeclustered
+              << " sBar=" << sBar
+              << " threshold=" << threshold << std::endl;
+    return nDeclustered;
 }
 
 // Placement-informed re-banking (v1).
@@ -1336,6 +1438,292 @@ void Manager::postLGResynth(){
               << " totalGain=" << totalGain << std::endl;
 }
 
+void Manager::iterativeBankingLoop(){
+    const char* envOn = std::getenv("ITER_BANKING");
+    if(!envOn || std::atoi(envOn) == 0) return;
+
+    binTable.invalidate();
+
+    int maxIters = 3;
+    double debankMargin = 0.0;
+    double radiusMul = 5.0;
+    int kmax = 15;
+    double commitMargin = 0.0;
+    bool crossPollinate = true;
+    if(const char* e = std::getenv("IB_ITERS"))      maxIters = std::atoi(e);
+    if(const char* e = std::getenv("IB_MARGIN"))      debankMargin = std::atof(e);
+    if(const char* e = std::getenv("IB_RADIUS_MUL"))  radiusMul = std::atof(e);
+    if(const char* e = std::getenv("IB_KMAX"))        kmax = std::atoi(e);
+    if(const char* e = std::getenv("IB_COMMIT_MARGIN")) commitMargin = std::atof(e);
+    if(const char* e = std::getenv("IB_CROSS"))       crossPollinate = (std::string(e) != "0");
+
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+    auto it2 = Bit_FF_Map.find(2);
+    if(it2 == Bit_FF_Map.end() || it2->second.empty()){
+        std::cout << "[ITER_BANK] no 2-bit cell, skip" << std::endl;
+        return;
+    }
+    Cell* twoBitCell = it2->second[0];
+    double radius = std::max(twoBitCell->getW(), twoBitCell->getH()) * radiusMul;
+
+    Banking banker(*this);
+
+    // scoreDelta: net cost of keeping the MBFF banked vs N×1-bit at same position.
+    // Negative => MBFF is net-harmful, debanking is always an improvement.
+    // Mirrors postLGDecluster logic.
+    auto scoreDelta = [&](FF* mbff) -> double {
+        Cell* mCell = mbff->getCell();
+        int N = mCell->getBits();
+        double pwrDelta  = beta  * (N * oneBitCell->getGatePower() - mCell->getGatePower());
+        double areaDelta = gamma * (N * oneBitCell->getArea()      - mCell->getArea());
+        double oldTNS = 0, newTNS = 0;
+        double qDelayBenefit = mCell->getQpinDelay() - oneBitCell->getQpinDelay();
+        std::vector<FF*>& clusterFF = mbff->getClusterFF();
+        int slot = 0;
+        for(auto* cf : clusterFF){
+            std::string slotStr = (N == 1) ? "" : std::to_string(slot);
+            Coor curQpin = mbff->getNewCoor() + mbff->getPinCoor("Q" + slotStr);
+            Coor debankedCoor = mbff->getNewCoor() + mbff->getPinCoor("D" + slotStr)
+                              - oneBitCell->getPinCoor("D");
+            Coor newQpin = debankedCoor + oneBitCell->getPinCoor("Q");
+            for(auto& next : cf->getNextStage()){
+                double nextCurSlack = next.ff->getSlack();
+                Coor loadCoor;
+                if(next.outputGate){
+                    loadCoor = next.outputGate->getCoor()
+                             + next.outputGate->getPinCoor(next.pinName);
+                } else {
+                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                             + next.ff->getPhysicalFF()->getPinCoor(
+                                 "D" + next.ff->getPhysicalPinName());
+                }
+                double deltaHpwlQ = HPWL(loadCoor, curQpin) - HPWL(loadCoor, newQpin);
+                double predNextSlack = nextCurSlack + qDelayBenefit
+                                     + DisplacementDelay * deltaHpwlQ;
+                oldTNS += std::max(0.0, -nextCurSlack);
+                newTNS += std::max(0.0, -predNextSlack);
+            }
+            slot++;
+        }
+        double tnsDelta = alpha * (newTNS - oldTNS);
+        return tnsDelta + pwrDelta + areaDelta;
+    };
+
+    std::cout << "[ITER_BANK] maxIters=" << maxIters
+              << " debankMargin=" << debankMargin
+              << " radius=" << radius << " kmax=" << kmax
+              << " commitMargin=" << commitMargin << std::endl;
+
+    for(int iter = 0; iter < maxIters; iter++){
+        // Step 1: Find MBFFs that are net-harmful at current position.
+        // scoreDelta < -debankMargin => debanking is provably beneficial.
+        struct ScoredMBFF { double delta; FF* mbff; };
+        std::vector<ScoredMBFF> harmful;
+        harmful.reserve(FF_Map.size());
+        for(auto& kv : FF_Map){
+            FF* m = kv.second;
+            if(m->getCell()->getBits() < 2) continue;
+            double d = scoreDelta(m);
+            if(d < -debankMargin)
+                harmful.push_back({d, m});
+        }
+        std::sort(harmful.begin(), harmful.end(),
+                  [](const ScoredMBFF& a, const ScoredMBFF& b){
+                      return a.delta < b.delta;
+                  });
+        if(harmful.empty()){
+            std::cout << "[ITER_BANK] iter=" << iter << " no harmful MBFFs" << std::endl;
+            break;
+        }
+
+        double predictedSaving = 0;
+        for(auto& h : harmful) predictedSaving += -h.delta;
+
+        // Step 2: Free legalizer state for harmful MBFFs.
+        for(auto& h : harmful){
+            FF* m = h.mbff;
+            legalizer->FreeRect(m->getNewCoor(), m->getCell()->getW(),
+                                m->getCell()->getH());
+            legalizer->RemoveNodeByFFPtr(m);
+        }
+
+        // Step 3: Debank harmful MBFFs into 1-bit wrappers.
+        std::vector<FF*> pool;
+        pool.reserve(harmful.size() * 2);
+        for(auto& h : harmful){
+            auto ones = debankFF(h.mbff, oneBitCell);
+            for(FF* w : ones) pool.push_back(w);
+        }
+
+        // Step 4: Collect nearby unbanked 1-bit FFs for cross-pollination.
+        namespace bgi = boost::geometry::index;
+        typedef std::pair<Point, int> PtID;
+        std::vector<PtID> pts;
+        pts.reserve(pool.size());
+        for(size_t i = 0; i < pool.size(); ++i){
+            Coor c = pool[i]->getNewCoor();
+            pts.emplace_back(Point(c.x, c.y), (int)i);
+        }
+        bgi::rtree<PtID, bgi::quadratic<16>> poolTree(pts.begin(), pts.end());
+
+        std::vector<FF*> nearby;
+        if(crossPollinate){
+            std::unordered_set<FF*> poolSet(pool.begin(), pool.end());
+            for(auto& kv : FF_Map){
+                FF* m = kv.second;
+                if(m->getCell()->getBits() != 1) continue;
+                if(poolSet.count(m)) continue;
+                Coor c = m->getNewCoor();
+                std::vector<PtID> nn;
+                poolTree.query(bgi::nearest(Point(c.x, c.y), 1), std::back_inserter(nn));
+                if(!nn.empty()){
+                    Coor nc = pool[nn[0].second]->getNewCoor();
+                    if(HPWL(c, nc) <= radius)
+                        nearby.push_back(m);
+                }
+            }
+            for(FF* nf : nearby){
+                legalizer->FreeRect(nf->getNewCoor(), nf->getCell()->getW(),
+                                    nf->getCell()->getH());
+                legalizer->RemoveNodeByFFPtr(nf);
+                pool.push_back(nf);
+            }
+        }
+
+        // Step 5: Build LEMON matching graph using CostCompare edge weights.
+        pts.clear();
+        pts.reserve(pool.size());
+        for(size_t i = 0; i < pool.size(); ++i){
+            Coor c = pool[i]->getNewCoor();
+            pts.emplace_back(Point(c.x, c.y), (int)i);
+        }
+        bgi::rtree<PtID, bgi::quadratic<16>> fullTree(pts.begin(), pts.end());
+
+        lemon::SmartGraph g;
+        std::vector<lemon::SmartGraph::Node> gnodes(pool.size());
+        for(size_t i = 0; i < pool.size(); ++i) gnodes[i] = g.addNode();
+        lemon::SmartGraph::EdgeMap<long long> wt(g);
+
+        struct PairInfo { size_t i, j; Coor tgt; double gain; };
+        std::vector<PairInfo> pairs;
+        pairs.reserve(pool.size() * kmax / 2);
+        const long long wscale = 1000;
+
+        for(size_t i = 0; i < pool.size(); ++i){
+            FF* wi = pool[i];
+            Coor ci = wi->getNewCoor();
+            int clki = wi->getClkIdx();
+            std::vector<PtID> knn;
+            fullTree.query(bgi::nearest(Point(ci.x, ci.y), kmax + 1),
+                           std::back_inserter(knn));
+            for(auto& q : knn){
+                size_t j = (size_t)q.second;
+                if(j <= i) continue;
+                FF* wj = pool[j];
+                if(wj->getClkIdx() != clki) continue;
+                Coor cj = wj->getNewCoor();
+                if(HPWL(ci, cj) > radius) continue;
+
+                Coor tgt((ci.x + cj.x) / 2.0, (ci.y + cj.y) / 2.0);
+                std::vector<FF*> pair = {wi, wj};
+                double gain = banker.CostCompare(tgt, twoBitCell, pair);
+                if(gain <= commitMargin) continue;
+
+                auto e = g.addEdge(gnodes[i], gnodes[j]);
+                wt[e] = (long long)(gain * wscale);
+                pairs.push_back({i, j, tgt, gain});
+            }
+        }
+
+        // Step 6: Max-weight matching.
+        lemon::MaxWeightedMatching<lemon::SmartGraph,
+            lemon::SmartGraph::EdgeMap<long long>> mwm(g, wt);
+        mwm.run();
+
+        // Step 7: Collect and sort matched pairs by gain descending.
+        std::vector<bool> claimed(pool.size(), false);
+        std::vector<PairInfo> matched;
+        matched.reserve(pairs.size() / 2);
+        for(auto& p : pairs){
+            auto mate = mwm.mate(gnodes[p.i]);
+            if(mate != lemon::INVALID && mate == gnodes[p.j]
+               && !claimed[p.i] && !claimed[p.j]){
+                claimed[p.i] = claimed[p.j] = true;
+                matched.push_back(p);
+            }
+        }
+        std::sort(matched.begin(), matched.end(),
+                  [](const PairInfo& a, const PairInfo& b){
+                      return a.gain > b.gain;
+                  });
+
+        // Step 8: Commit matches at legal positions (re-verify CostCompare).
+        int committed = 0, fpFail = 0, costFail = 0;
+        double totalGain = 0;
+        for(auto& p : matched){
+            FF* wi = pool[p.i];
+            FF* wj = pool[p.j];
+            Coor placed = legalizer->FindPlace(p.tgt, twoBitCell);
+            if(placed.x == DBL_MAX)
+                placed = legalizer->FindNearestLegalSpace(
+                    p.tgt, twoBitCell, 4 * twoBitCell->getW());
+            if(placed.x == DBL_MAX){
+                fpFail++;
+                claimed[p.i] = claimed[p.j] = false;
+                continue;
+            }
+            std::vector<FF*> pair = {wi, wj};
+            double realGain = banker.CostCompare(placed, twoBitCell, pair);
+            if(realGain <= commitMargin){
+                costFail++;
+                claimed[p.i] = claimed[p.j] = false;
+                continue;
+            }
+            FF* newMBFF = bankFF(placed, twoBitCell, pair);
+            newMBFF->setIsLegalize(true);
+            legalizer->UpdateRows(newMBFF);
+            committed++;
+            totalGain += realGain;
+        }
+
+        // Step 9: Place unmatched 1-bits back.
+        int place1ok = 0, place1fb = 0;
+        for(size_t i = 0; i < pool.size(); ++i){
+            if(claimed[i]) continue;
+            FF* w = pool[i];
+            if(FF_Map.count(w->getInstanceName()) == 0) continue;
+            Coor placed = legalizer->FindPlace(w->getNewCoor(), oneBitCell);
+            if(placed.x == DBL_MAX)
+                placed = legalizer->FindNearestLegalSpace(
+                    w->getNewCoor(), oneBitCell, 4 * oneBitCell->getW());
+            if(placed.x == DBL_MAX){
+                placed = w->getNewCoor();
+                place1fb++;
+            } else {
+                place1ok++;
+            }
+            w->setCoor(placed);
+            w->setNewCoor(placed);
+            w->setIsLegalize(true);
+            legalizer->UpdateRows(w);
+        }
+
+        std::cout << "[ITER_BANK] iter=" << iter
+                  << " harmful=" << harmful.size()
+                  << " pool=" << pool.size()
+                  << " nearby=" << nearby.size()
+                  << " predictedSaving=" << predictedSaving
+                  << " edges=" << pairs.size()
+                  << " matched=" << matched.size()
+                  << " committed=" << committed
+                  << " fpFail=" << fpFail
+                  << " costFail=" << costFail
+                  << " place1=" << place1ok << "+" << place1fb
+                  << " gain=" << totalGain << std::endl;
+
+        if(harmful.size() <= 1 && committed == 0) break;
+    }
+}
 
 void Manager::getNS(double& TNS, double& WNS, bool show){
     TNS = 0;

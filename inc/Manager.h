@@ -158,9 +158,11 @@ public:
     std::vector<FF*> debankFF(FF* MBFF, Cell* debankCellType);
     void debankAll();
     void postLGDecluster(); // Phase 5: undo bad banking decisions using LG-accurate positions
+    int perLevelDecluster(int targetBit, double threshold = 0.0);
     void unbankRebank();    // v1: debank 4-bit MBFFs and re-bank constituents as 2x 2-bit if \u0394C < 0
     void unbankRebankGlobal(); // v2: debank ALL MBFFs and run LEMON max-weight matching on constituents at post-LG coords
     void postLGResynth(); // P7: pick top-K worst MBFFs by neg-slack concentration, debank + LEMON rematch with real Banking::CostCompare weights
+    void iterativeBankingLoop(); // Iterative post-LG: debank worst MBFFs + nearby 1-bits, re-match at actual positions, repeat
     // the FF after debank will be assign to debankCellType (maybe this can be a vector)
     void getNS(double& TNS, double& WNS, bool show); // this retunr TNS and WNS of whole design (all FF in FF_Map)
     double getTNS();
