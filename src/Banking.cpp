@@ -1048,12 +1048,15 @@ void Banking::doMatchingClustering(){
         return;
     }
 
-    // Top-down 4-bit clustering (legacy path, NOT used by NTU_FLOW).
-    // NTU_FLOW uses doNTUFlowMatching() which has its own 4→2 loop with
-    // CostCompare-based matching + per-level decluster.
+    // Top-down 4-bit clustering + per-level decluster
     {
         const char* envTD4 = std::getenv("TOP_DOWN_4BIT");
-        if(envTD4 && std::string(envTD4) != "0"){
+        bool doTD4 = (envTD4 && std::string(envTD4) != "0");
+        // NTU_FLOW implies TOP_DOWN_4BIT
+        const char* envNTU = std::getenv("NTU_FLOW");
+        if(envNTU && std::string(envNTU) != "0") doTD4 = true;
+
+        if(doTD4){
             Cell* cell4bit = nullptr;
             for(const auto& bitLib : mgr.Bit_FF_Map){
                 if(bitLib.first == 4){
@@ -1065,7 +1068,16 @@ void Banking::doMatchingClustering(){
                 delete mgr.legalizer;
                 mgr.legalizer = new Legalizer(mgr);
                 mgr.legalizer->initial();
-                doTopDown4Bit(cell4bit, cell2bit);
+                int committed = doTopDown4Bit(cell4bit, cell2bit);
+
+                // NTU Eq.5: decluster harmful 4-bit merges
+                const char* envNF = std::getenv("NTU_FLOW");
+                if(envNF && std::string(envNF) != "0" && committed > 0){
+                    double dclThresh = 0.0;
+                    if(const char* e = std::getenv("DECLUSTER_THRESH"))
+                        dclThresh = std::atof(e);
+                    mgr.perLevelDecluster(4, dclThresh);
+                }
             }
         }
     }
