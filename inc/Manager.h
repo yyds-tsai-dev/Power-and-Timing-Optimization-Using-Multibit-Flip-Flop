@@ -163,6 +163,22 @@ public:
     void unbankRebankGlobal(); // v2: debank ALL MBFFs and run LEMON max-weight matching on constituents at post-LG coords
     void postLGResynth(); // P7: pick top-K worst MBFFs by neg-slack concentration, debank + LEMON rematch with real Banking::CostCompare weights
     void iterativeBankingLoop(); // Iterative post-LG: debank worst MBFFs + nearby 1-bits, re-match at actual positions, repeat
+
+    // --- Evaluator-Guided Refinement (EGR) ---
+    struct EGRUndoEntry {
+        std::string originalName;
+        Cell* originalCell;
+        Coor originalPos;
+        int clkIdx;
+        std::vector<FF*> freedFFs;
+    };
+    void evaluatorRefinement(const std::string& testcasePath);
+    double runEvaluator(const std::string& testcasePath, const std::string& outputPath);
+    std::vector<FF*> rankMBFFByDisplacement();
+    EGRUndoEntry debankWithUndo(FF* mbff);
+    void reLegalizeFreedFFs(EGRUndoEntry& entry);
+    void revertDebank(EGRUndoEntry& entry);
+
     // the FF after debank will be assign to debankCellType (maybe this can be a vector)
     void getNS(double& TNS, double& WNS, bool show); // this retunr TNS and WNS of whole design (all FF in FF_Map)
     double getTNS();

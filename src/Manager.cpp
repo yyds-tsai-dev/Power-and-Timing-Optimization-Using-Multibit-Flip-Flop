@@ -2591,3 +2591,185 @@ double Manager::getCostDiff(Coor newbankCoor, Cell* bankCellType, std::vector<FF
     }
     return cost - oldCost;
 }
+
+// ==================== Evaluator-Guided Refinement (EGR) ====================
+
+double Manager::runEvaluator(const std::string& testcasePath, const std::string& outputPath){
+    std::string cmd = "./evaluator/preliminary-evaluator "
+                    + testcasePath + " " + outputPath + " 2>&1";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if(!pipe){
+        std::cerr << "[EGR] popen failed\n";
+        return -1.0;
+    }
+    char buf[512];
+    double score = -1.0;
+    bool checkPass = false;
+    while(fgets(buf, sizeof(buf), pipe)){
+        std::string line(buf);
+        if(line.find("Check pass") != std::string::npos) checkPass = true;
+        auto pos = line.find("Final score:");
+        if(pos != std::string::npos){
+            score = std::stod(line.substr(pos + 12));
+        }
+    }
+    int status = pclose(pipe);
+    if(status != 0 || !checkPass){
+        std::cerr << "[EGR] evaluator failed (status=" << status
+                  << " checkPass=" << checkPass << ")\n";
+        return -1.0;
+    }
+    return score;
+}
+
+std::vector<FF*> Manager::rankMBFFByDisplacement(){
+    std::vector<std::pair<double, FF*>> scored;
+    scored.reserve(FF_Map.size());
+    for(auto& pair : FF_Map){
+        FF* mbff = pair.second;
+        if(mbff->getCell()->getBits() <= 1) continue;
+        double totalDisp = 0;
+        int slot = 0;
+        for(auto* cf : mbff->getClusterFF()){
+            std::string slotStr = std::to_string(slot);
+            Coor curD = mbff->getNewCoor() + mbff->getPinCoor("D" + slotStr);
+            Coor origD = cf->getOriginalD();
+            totalDisp += DisplacementDelay * (std::abs(curD.x - origD.x)
+                                            + std::abs(curD.y - origD.y));
+            slot++;
+        }
+        scored.push_back({totalDisp, mbff});
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const auto& a, const auto& b){ return a.first > b.first; });
+    std::vector<FF*> result;
+    result.reserve(scored.size());
+    for(auto& p : scored) result.push_back(p.second);
+    return result;
+}
+
+Manager::EGRUndoEntry Manager::debankWithUndo(FF* mbff){
+    EGRUndoEntry entry;
+    entry.originalName = mbff->getInstanceName();
+    entry.originalCell = mbff->getCell();
+    entry.originalPos = mbff->getNewCoor();
+    entry.clkIdx = mbff->getClkIdx();
+
+    legalizer->FreeRect(entry.originalPos, entry.originalCell->getW(),
+                        entry.originalCell->getH());
+    legalizer->RemoveNodeByFFPtr(mbff);
+
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+    entry.freedFFs = debankFF(mbff, oneBitCell);
+    return entry;
+}
+
+void Manager::reLegalizeFreedFFs(EGRUndoEntry& entry){
+    Cell* oneBitCell = Bit_FF_Map[1][0];
+    for(auto* ff : entry.freedFFs){
+        Coor target = ff->getNewCoor();
+        Coor placed = legalizer->FindPlace(target, oneBitCell);
+        if(placed.x == DBL_MAX){
+            placed = target;
+        }
+        ff->setCoor(placed);
+        ff->setNewCoor(placed);
+        ff->setIsLegalize(true);
+        legalizer->UpdateRows(ff);
+    }
+}
+
+void Manager::revertDebank(EGRUndoEntry& entry){
+    for(auto* ff : entry.freedFFs){
+        legalizer->FreeRect(ff->getNewCoor(), ff->getCell()->getW(),
+                            ff->getCell()->getH());
+        legalizer->RemoveNodeByFFPtr(ff);
+    }
+    FF* restored = bankFF(entry.originalPos, entry.originalCell, entry.freedFFs);
+    restored->setNewCoor(entry.originalPos);
+    restored->setIsLegalize(true);
+    legalizer->UpdateRows(restored);
+}
+
+void Manager::evaluatorRefinement(const std::string& testcasePath){
+    int maxIters = 5;
+    if(const char* e = std::getenv("EGR_ITERS")) maxIters = std::atoi(e);
+    int K = 5;
+    if(const char* e = std::getenv("EGR_K")) K = std::atoi(e);
+    double timeBudget = 180.0;
+    if(const char* e = std::getenv("EGR_TIME_BUDGET")) timeBudget = std::atof(e);
+
+    const std::string tmpOut = "/tmp/egr_" + std::to_string(getpid()) + ".out";
+
+    dump(tmpOut);
+    double bestScore = runEvaluator(testcasePath, tmpOut);
+    if(bestScore < 0){
+        std::cerr << "[EGR] baseline evaluator failed, aborting\n";
+        return;
+    }
+    std::cerr << "[EGR] baseline score=" << std::fixed << bestScore << "\n";
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]() -> double {
+        auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double>(now - startTime).count();
+    };
+
+    if(!legalizer){
+        legalizer = new Legalizer(*this);
+        legalizer->initial();
+    }
+
+    auto candidates = rankMBFFByDisplacement();
+    std::cerr << "[EGR] candidates=" << candidates.size() << "\n";
+
+    int cursor = 0;
+    int totalImproved = 0;
+
+    for(int iter = 0; iter < maxIters && cursor < (int)candidates.size(); iter++){
+        if(elapsed() > timeBudget){
+            std::cerr << "[EGR] time budget exceeded (" << elapsed() << "s)\n";
+            break;
+        }
+
+        int batchEnd = std::min(cursor + K, (int)candidates.size());
+        std::vector<EGRUndoEntry> undos;
+        undos.reserve(batchEnd - cursor);
+        int batchCount = 0;
+        for(int j = cursor; j < batchEnd; j++){
+            if(FF_Map.find(candidates[j]->getInstanceName()) == FF_Map.end()) continue;
+            undos.push_back(debankWithUndo(candidates[j]));
+            reLegalizeFreedFFs(undos.back());
+            batchCount++;
+        }
+
+        if(batchCount == 0){
+            cursor = batchEnd;
+            continue;
+        }
+
+        dump(tmpOut);
+        double newScore = runEvaluator(testcasePath, tmpOut);
+
+        if(newScore > 0 && newScore < bestScore){
+            std::cerr << "[EGR] iter=" << iter << " IMPROVED "
+                      << bestScore << " -> " << newScore
+                      << " (debanked " << batchCount << ")\n";
+            bestScore = newScore;
+            totalImproved += batchCount;
+            cursor = batchEnd;
+        } else {
+            std::cerr << "[EGR] iter=" << iter << " reverted ("
+                      << newScore << " >= " << bestScore
+                      << ", debanked " << batchCount << ")\n";
+            for(int j = (int)undos.size() - 1; j >= 0; j--)
+                revertDebank(undos[j]);
+            cursor = batchEnd;
+        }
+    }
+
+    std::remove(tmpOut.c_str());
+    std::cerr << "[EGR] done. improved=" << totalImproved
+              << " finalScore=" << std::fixed << bestScore
+              << " elapsed=" << elapsed() << "s\n";
+}

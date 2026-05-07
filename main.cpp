@@ -109,6 +109,8 @@ int main(int argc, char *argv[]){
             STAGE("dp-round",             mgr.detailplacement());
         }
     }
+    if(std::getenv("EGR") && std::atoi(std::getenv("EGR")))
+        STAGE("evalRefinement", mgr.evaluatorRefinement(argv[1]));
     if(!production){
         mgr.getOverallCost(cost_verbose, 1);
         mgr.dumpVisual("DetailPlacement.out");
