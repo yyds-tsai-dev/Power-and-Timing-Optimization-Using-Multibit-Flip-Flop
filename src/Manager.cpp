@@ -2622,6 +2622,17 @@ double Manager::runEvaluator(const std::string& testcasePath, const std::string&
     return score;
 }
 
+double Manager::computeInlineCost(){
+    double tns = computeAccurateTNS();
+    double power = 0, area = 0;
+    for(const auto& ff_pair : FF_Map){
+        power += ff_pair.second->getCell()->getGatePower();
+        area  += ff_pair.second->getCell()->getArea();
+    }
+    double bin = calculateBinDensityCost();
+    return alpha * tns + beta * power + gamma * area + bin;
+}
+
 std::vector<FF*> Manager::rankMBFFByDisplacement(){
     std::vector<std::pair<double, FF*>> scored;
     scored.reserve(FF_Map.size());
@@ -2679,7 +2690,7 @@ void Manager::reLegalizeFreedFFs(EGRUndoEntry& entry){
     }
 }
 
-void Manager::revertDebank(EGRUndoEntry& entry){
+FF* Manager::revertDebank(EGRUndoEntry& entry){
     for(auto* ff : entry.freedFFs){
         legalizer->FreeRect(ff->getNewCoor(), ff->getCell()->getW(),
                             ff->getCell()->getH());
@@ -2689,6 +2700,7 @@ void Manager::revertDebank(EGRUndoEntry& entry){
     restored->setNewCoor(entry.originalPos);
     restored->setIsLegalize(true);
     legalizer->UpdateRows(restored);
+    return restored;
 }
 
 void Manager::evaluatorRefinement(const std::string& testcasePath){
@@ -2699,15 +2711,16 @@ void Manager::evaluatorRefinement(const std::string& testcasePath){
     double timeBudget = 180.0;
     if(const char* e = std::getenv("EGR_TIME_BUDGET")) timeBudget = std::atof(e);
 
-    const std::string tmpOut = "/tmp/egr_" + std::to_string(getpid()) + ".out";
+    const int egrMode = std::getenv("EGR_INLINE") ? std::atoi(std::getenv("EGR_INLINE")) : 0;
+    // Mode 0: binary evaluator only (original)
+    // Mode 1: inline evaluator with margin
+    // Mode 2: hybrid — inline screen all candidates, verify top-N with binary
+    double acceptMargin = 0.0;
+    if(const char* e = std::getenv("EGR_MARGIN")) acceptMargin = std::atof(e);
+    int screenTop = 10;
+    if(const char* e = std::getenv("EGR_SCREEN_TOP")) screenTop = std::atoi(e);
 
-    dump(tmpOut);
-    double bestScore = runEvaluator(testcasePath, tmpOut);
-    if(bestScore < 0){
-        std::cerr << "[EGR] baseline evaluator failed, aborting\n";
-        return;
-    }
-    std::cerr << "[EGR] baseline score=" << std::fixed << bestScore << "\n";
+    const std::string tmpOut = "/tmp/egr_" + std::to_string(getpid()) + ".out";
 
     auto startTime = std::chrono::high_resolution_clock::now();
     auto elapsed = [&]() -> double {
@@ -2721,7 +2734,114 @@ void Manager::evaluatorRefinement(const std::string& testcasePath){
     }
 
     auto candidates = rankMBFFByDisplacement();
-    std::cerr << "[EGR] candidates=" << candidates.size() << "\n";
+    std::cerr << "[EGR] candidates=" << candidates.size() << " mode=" << egrMode << "\n";
+
+    if(egrMode == 2){
+        // Hybrid mode: screen with inline, verify with binary evaluator
+        double inlineBase = computeInlineCost();
+        std::cerr << "[EGR] inline baseline=" << std::fixed << inlineBase << "\n";
+
+        // Phase 1: Screen all candidates with inline model
+        struct ScreenResult { int idx; double inlineDelta; FF* ff; };
+        std::vector<ScreenResult> screenResults;
+        int scanLimit = std::min(maxIters, (int)candidates.size());
+        for(int i = 0; i < scanLimit; i++){
+            FF* ff = candidates[i];
+            if(FF_Map.find(ff->getInstanceName()) == FF_Map.end()) continue;
+
+            EGRUndoEntry undo = debankWithUndo(ff);
+            reLegalizeFreedFFs(undo);
+            double newInline = computeInlineCost();
+            double delta = newInline - inlineBase;
+
+            // Revert and track the restored FF pointer
+            FF* restored = revertDebank(undo);
+
+            screenResults.push_back({i, delta, restored});
+            if(elapsed() > timeBudget * 0.5){
+                std::cerr << "[EGR] screen phase time limit (" << elapsed() << "s), screened " << i+1 << "\n";
+                break;
+            }
+        }
+
+        // Sort by inline delta ascending (most promising first)
+        std::sort(screenResults.begin(), screenResults.end(),
+                  [](const ScreenResult& a, const ScreenResult& b){ return a.inlineDelta < b.inlineDelta; });
+
+        std::cerr << "[EGR] screened=" << screenResults.size();
+        if(!screenResults.empty()){
+            std::cerr << " best_delta=" << screenResults.front().inlineDelta
+                      << " worst_delta=" << screenResults.back().inlineDelta;
+        }
+        std::cerr << "\n";
+
+        // Phase 2: Try bulk debank of all inline-negative candidates, verify with single evaluator call
+        dump(tmpOut);
+        double bestScore = runEvaluator(testcasePath, tmpOut);
+        if(bestScore < 0){
+            std::cerr << "[EGR] baseline evaluator failed\n";
+            return;
+        }
+        std::cerr << "[EGR] evaluator baseline=" << std::fixed << bestScore << "\n";
+
+        double threshold = acceptMargin;  // EGR_MARGIN as inline delta threshold
+
+        // Collect candidates below threshold
+        std::vector<ScreenResult> toTry;
+        for(auto& sr : screenResults)
+            if(sr.inlineDelta < threshold) toTry.push_back(sr);
+        std::cerr << "[EGR] candidates below threshold(" << threshold << ")=" << toTry.size() << "\n";
+
+        // Try one-by-one with binary evaluator (greedy: keep each improvement)
+        int verified = 0, improved = 0;
+        int topN = std::min(screenTop, (int)toTry.size());
+        for(int i = 0; i < topN && elapsed() < timeBudget; i++){
+            FF* ff = toTry[i].ff;
+            if(FF_Map.find(ff->getInstanceName()) == FF_Map.end()) continue;
+
+            EGRUndoEntry undo = debankWithUndo(ff);
+            reLegalizeFreedFFs(undo);
+            dump(tmpOut);
+            double newScore = runEvaluator(testcasePath, tmpOut);
+            verified++;
+
+            if(newScore > 0 && newScore < bestScore){
+                std::cerr << "[EGR] VERIFY #" << i << " idx=" << toTry[i].idx
+                          << " inlineDelta=" << toTry[i].inlineDelta
+                          << " evalDelta=" << (newScore - bestScore)
+                          << " KEPT\n";
+                bestScore = newScore;
+                improved++;
+            } else {
+                std::cerr << "[EGR] VERIFY #" << i << " idx=" << toTry[i].idx
+                          << " inlineDelta=" << toTry[i].inlineDelta
+                          << " evalDelta=" << (newScore - bestScore)
+                          << " reverted\n";
+                revertDebank(undo);
+            }
+        }
+
+        std::remove(tmpOut.c_str());
+        std::cerr << "[EGR] hybrid done. verified=" << verified << " improved=" << improved
+                  << " finalScore=" << std::fixed << bestScore << " elapsed=" << elapsed() << "s\n";
+        return;
+    }
+
+    // Mode 0 or 1: original loop
+    const bool useInline = (egrMode == 1);
+    double bestScore;
+    if(useInline){
+        bestScore = computeInlineCost();
+    } else {
+        dump(tmpOut);
+        bestScore = runEvaluator(testcasePath, tmpOut);
+    }
+    if(bestScore < 0){
+        std::cerr << "[EGR] baseline evaluator failed, aborting\n";
+        return;
+    }
+    std::cerr << "[EGR] baseline score=" << std::fixed << bestScore
+              << (useInline ? " (inline)" : " (evaluator)") << "\n";
 
     int cursor = 0;
     int totalImproved = 0;
@@ -2748,27 +2868,33 @@ void Manager::evaluatorRefinement(const std::string& testcasePath){
             continue;
         }
 
-        dump(tmpOut);
-        double newScore = runEvaluator(testcasePath, tmpOut);
+        double newScore;
+        if(useInline){
+            newScore = computeInlineCost();
+        } else {
+            dump(tmpOut);
+            newScore = runEvaluator(testcasePath, tmpOut);
+        }
 
-        if(newScore > 0 && newScore < bestScore){
+        if(newScore > 0 && newScore < bestScore + acceptMargin){
             std::cerr << "[EGR] iter=" << iter << " IMPROVED "
                       << bestScore << " -> " << newScore
-                      << " (debanked " << batchCount << ")\n";
+                      << " delta=" << (newScore - bestScore)
+                      << " (debanked " << batchCount << ", " << elapsed() << "s)\n";
             bestScore = newScore;
             totalImproved += batchCount;
             cursor = batchEnd;
         } else {
             std::cerr << "[EGR] iter=" << iter << " reverted ("
                       << newScore << " >= " << bestScore
-                      << ", debanked " << batchCount << ")\n";
+                      << ", debanked " << batchCount << ", " << elapsed() << "s)\n";
             for(int j = (int)undos.size() - 1; j >= 0; j--)
                 revertDebank(undos[j]);
             cursor = batchEnd;
         }
     }
 
-    std::remove(tmpOut.c_str());
+    if(!useInline) std::remove(tmpOut.c_str());
     std::cerr << "[EGR] done. improved=" << totalImproved
               << " finalScore=" << std::fixed << bestScore
               << " elapsed=" << elapsed() << "s\n";

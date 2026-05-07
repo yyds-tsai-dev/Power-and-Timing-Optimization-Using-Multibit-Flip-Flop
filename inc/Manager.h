@@ -174,10 +174,11 @@ public:
     };
     void evaluatorRefinement(const std::string& testcasePath);
     double runEvaluator(const std::string& testcasePath, const std::string& outputPath);
+    double computeInlineCost();
     std::vector<FF*> rankMBFFByDisplacement();
     EGRUndoEntry debankWithUndo(FF* mbff);
     void reLegalizeFreedFFs(EGRUndoEntry& entry);
-    void revertDebank(EGRUndoEntry& entry);
+    FF* revertDebank(EGRUndoEntry& entry);
 
     // the FF after debank will be assign to debankCellType (maybe this can be a vector)
     void getNS(double& TNS, double& WNS, bool show); // this retunr TNS and WNS of whole design (all FF in FF_Map)
