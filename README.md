@@ -14,29 +14,30 @@
 > NTU reference scores from the ICCAD 2024 winner's LBR paper (Cheng-Yen Li, NTU).
 > **Lower = better. Bold = beats NTU.**
 
-| Testcase | NTU (winner) | **Ours (2026-04-20)** | Δ vs NTU | β | Notes |
+| Testcase | NTU (winner) | **Ours (2026-06-15, best)** | Δ vs NTU | β | Notes |
 |---|---:|---:|---:|---:|---|
-| testcase1_0812 | 738,800,000 | 739,828,213 | +0.14% | 2000 | slightly behind NTU |
-| testcase2_0812 | 738,400 | 765,703.64 | +3.70% | 400 | gap narrowed −1.00% this sprint |
-| testcase3 | 728,800,000 | **728,088,695** | **−0.10%** | 10000 | beats NTU |
-| hiddencase01 | 31,270,000 | **30,663,894** | **−1.94%** | 200000 | beats NTU |
-| hiddencase02 | 12,760,000 | **11,744,484** | **−7.96%** | 40000 | largest lead |
-| hiddencase03 | 55,920,000 | **55,871,388** | **−0.09%** | 400 | beats NTU |
-| hiddencase04 | 726,900,000 | 728,050,329 | +0.16% | 10000 | slightly behind NTU |
+| testcase1_0812 | 738,800,000 | **735,461,390** | **−0.45%** | 2000 | beats NTU |
+| testcase2_0812 | 738,400 | 743,940 | +0.75% | 400 | below 748,000 post-contest NTU floor; still above 738,400 LBR figure |
+| testcase3 | 728,800,000 | **727,140,578** | **−0.23%** | 10000 | beats NTU |
+| hiddencase01 | 31,270,000 | **30,281,151** | **−3.16%** | 200000 | beats NTU |
+| hiddencase02 | 12,760,000 | **11,099,145** | **−13.02%** | 40000 | largest lead |
+| hiddencase03 | 55,920,000 | **55,846,482** | **−0.13%** | 400 | beats NTU |
+| hiddencase04 | 726,900,000 | 727,191,554 | +0.04% | 10000 | slightly behind NTU |
 
-> **Wins NTU on 4/7 contest cases**, behind within 0.2% on tc1/hc04, narrowing gap on tc2. Largest lead: hc02 −7.96%.
+> **Best** = baseline V3 production + env-gated post-LG refinement (RELOC + CRIT_SWAP + BIT_REPAIR, faithful incremental-STA engine); all numbers from the real `preliminary-evaluator`, all legal.
+> **Wins NTU (LBR figures) on 5/7 contest cases**, slightly behind on hc04 (+0.04%). tc2 743,940 now sits below the 748,000 post-contest NTU floor (its sole previously-failing case), though still above the 738,400 LBR figure. Largest lead: hc02 −13.02%.
 
 ### Historical Per-Phase Scores (lower = better)
 
-| Testcase | Baseline | Stage B v2 | DP-v2 | Pin-offset | Adaptive DIST_BONUS | **Current (2026-04-20)** |
+| Testcase | Baseline | Stage B v2 | DP-v2 | Pin-offset | Adaptive DIST_BONUS | **Current (2026-06-15, best)** |
 |---|---:|---:|---:|---:|---:|---:|
-| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | 740,426,488 | 740,715,329 | **739,828,213** |
-| testcase2_0812 | 830,273 | 815,494 | 799,642 | 772,711 | 771,385 | **765,704** |
-| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | 728,677,742 | 728,292,737 | **728,088,695** |
-| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | 31,070,005 | 31,108,205 | **30,663,894** |
-| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | 12,325,446 | 12,056,721 | **11,744,484** |
-| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | 55,860,767 | 55,866,361 | **55,871,388** |
-| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | 728,289,561 | 728,299,384 | **728,050,329** |
+| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | 740,426,488 | 740,715,329 | **735,461,390** |
+| testcase2_0812 | 830,273 | 815,494 | 799,642 | 772,711 | 771,385 | **743,940** |
+| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | 728,677,742 | 728,292,737 | **727,140,578** |
+| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | 31,070,005 | 31,108,205 | **30,281,151** |
+| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | 12,325,446 | 12,056,721 | **11,099,145** |
+| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | 55,860,767 | 55,866,361 | **55,846,482** |
+| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | 728,289,561 | 728,299,384 | **727,191,554** |
 
 ### Banking Wall Time
 
