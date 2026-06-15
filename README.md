@@ -15,13 +15,13 @@
 
 | Testcase | Contest top-3 best | **Ours** | Δ | β |
 |---|---:|---:|---:|---:|
-| testcase1_0812 | 739,200,000 | **735,461,390** | **−0.51%** | 2000 |
+| testcase1_0812 | 739,200,000 | **735,326,724** | **−0.52%** | 2000 |
 | testcase2_0812 | 748,000 | **743,940** | **−0.54%** | 400 |
 | testcase3 | 729,300,000 | **727,140,578** | **−0.30%** | 10000 |
-| hiddencase01 | 31,510,000 | **30,281,151** | **−3.90%** | 200000 |
+| hiddencase01 | 31,510,000 | **30,277,542** | **−3.91%** | 200000 |
 | hiddencase02 | 13,280,000 | **11,099,145** | **−16.42%** | 40000 |
 | hiddencase03 | 55,940,000 | **55,846,482** | **−0.17%** | 400 |
-| hiddencase04 | 728,700,000 | **727,191,554** | **−0.21%** | 10000 |
+| hiddencase04 | 728,700,000 | **727,171,564** | **−0.21%** | 10000 |
 
 > **Beats the ICCAD 2024 contest top-3 (best entry per case) on all 7 cases.** tc2 (β=400, the hardest) is still being optimized — 743,940 here (extended budget); 747,324 at the standard 600 s budget, both below the 748,000 contest best. Largest lead: hc02 −16.42%.
 
