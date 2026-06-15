@@ -110,14 +110,24 @@ int main(int argc, char *argv[]){
             STAGE("dp-round",             mgr.detailplacement());
         }
     }
-    if(std::getenv("RELOC") && std::atoi(std::getenv("RELOC"))){
-        STAGE("refreshArr(pre-reloc)", mgr.refreshArrivalCorrections());
-        STAGE("timingReloc",           mgr.timingDrivenRelocation());
+    // Alternate {RELOC; CRIT_SWAP; BIT_REPAIR} to a joint fixpoint. ALT_ROUNDS=1 (default)
+    // reproduces the single-pass behavior byte-exactly. With the build-once incremental
+    // engine, the running incrTNS_ is shared across passes (each operator's moves enable
+    // the others'); all accepts are faithful-TNS-monotone at fixed power/area => no regress.
+    {
+        int altRounds = 1;
+        if(const char* e = std::getenv("ALT_ROUNDS")) altRounds = std::atoi(e);
+        for(int alt = 0; alt < altRounds; alt++){
+            if(std::getenv("RELOC") && std::atoi(std::getenv("RELOC"))){
+                STAGE("refreshArr(pre-reloc)", mgr.refreshArrivalCorrections());
+                STAGE("timingReloc",           mgr.timingDrivenRelocation());
+            }
+            if(std::getenv("CRIT_SWAP") && std::atoi(std::getenv("CRIT_SWAP")))
+                STAGE("critSwapRefine", mgr.criticalPathSwapRefine());
+            if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR")))
+                STAGE("bitRepair", mgr.bitRepairRefine());
+        }
     }
-    if(std::getenv("CRIT_SWAP") && std::atoi(std::getenv("CRIT_SWAP")))
-        STAGE("critSwapRefine", mgr.criticalPathSwapRefine());
-    if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR")))
-        STAGE("bitRepair", mgr.bitRepairRefine());
     if(std::getenv("EGR") && std::atoi(std::getenv("EGR")))
         STAGE("evalRefinement", mgr.evaluatorRefinement(argv[1]));
     if(!production){

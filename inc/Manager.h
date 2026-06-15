@@ -212,6 +212,13 @@ public:
     void incrAccurateBuild();                       // build caches + full initial compute
     double incrFFSlack(FF* cf);                     // current slack of logical FF using caches
     double incrAccurateRecomputeFF(FF* movedPhys);  // after a move, cone-recompute; returns total TNS
+    // Side-effect-free ΔTNS of swapping bit (A,sa)<->(B,sb): reads global caches read-only,
+    // recomputes only the cfa/cfb forward cone into local scratch => thread-safe (parallel
+    // best-swap search) and 1 cone-walk instead of apply/revert's 4. A,B must be same cell.
+    // Optionally returns the cone gates + affected FFs (for cone-disjoint dynasearch batching).
+    double evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
+                            std::vector<Gate*>* coneOut = nullptr,
+                            std::vector<FF*>*  affOut  = nullptr);
     double runEvaluator(const std::string& testcasePath, const std::string& outputPath);
     double computeInlineCost();
     std::vector<FF*> rankMBFFByDisplacement();
