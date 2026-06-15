@@ -346,16 +346,12 @@ void Banking::sortFFs(std::vector<std::pair<int, double>> &nearFFs){
 
 void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
                             const Coor& placeCoor, double& oldTNS, double& newTNS,
-                            double* downstreamMargin){
-    // Per-pin TNS calculation: compute actual per-constituent-FF slack change
-    // using driver/load positions and the max(0, -slack) TNS filter.
-    // If downstreamMargin != nullptr, also accumulate positive-slack margin
-    // erosion on 1-hop downstream FFs (the piece the TNS filter misses when
-    // slack stays >= 0 but shrinks). This is option (ii) in the HB diagnosis.
+                            double* downstreamMargin, bool forceNetHPWL){
     oldTNS = 0;
     newTNS = 0;
     if(downstreamMargin) *downstreamMargin = 0;
-    size_t flatIdx = 0; // slot index into target cell's pin layout
+    size_t flatIdx = 0;
+    const bool useNetHPWL = forceNetHPWL || mgr.netHPWLEnabled_;
 
     for(size_t i = 0; i < FFToBank.size(); i++){
         FF* ff = FFToBank[i];
@@ -368,31 +364,54 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
                 ? "" : std::to_string(flatIdx);
 
             // ---- D-pin slack of this constituent FF ----
-            double curSlackD = cf->getSlack();
-
-            // Predict D-pin slack at new position using actual driver position
             Coor curDpin = ff->getNewCoor() + ff->getPinCoor(
                 "D" + cf->getPhysicalPinName());
             Coor newDpin = placeCoor + targetCell->getPinCoor("D" + slotStr);
 
+            double curSlackD;
             double deltaHpwlD = 0;
-            PrevInstance prev = cf->getPrevInstance();
-            if(prev.instance){
-                Coor driverCoor;
-                if(prev.cellType == CellType::IO){
-                    driverCoor = prev.instance->getCoor();
-                } else if(prev.cellType == CellType::GATE){
-                    driverCoor = prev.instance->getCoor()
-                               + prev.instance->getPinCoor(prev.pinName);
-                } else {
-                    FF* inputFF = dynamic_cast<FF*>(prev.instance);
-                    driverCoor = inputFF->getPhysicalFF()->getNewCoor()
-                               + inputFF->getPhysicalFF()->getPinCoor(
-                                   "Q" + inputFF->getPhysicalPinName());
+            if(useNetHPWL && cf->getDNet()){
+                // Compute curSlackD consistently using net HPWL model
+                double origSlack = cf->getTimingSlack("D");
+                double delta_q_cf = 0;
+                PrevStage ps = cf->getPrevStage();
+                if(ps.ff){
+                    delta_q_cf = ps.ff->getOriginalQpinDelay()
+                               - ps.ff->getPhysicalFF()->getCell()->getQpinDelay();
                 }
-                // positive = new position is closer to driver (timing improves)
-                deltaHpwlD = HPWL(driverCoor, curDpin)
-                           - HPWL(driverCoor, newDpin);
+                double dNetOrig = mgr.origNetHPWL_[cf->getDNet()];
+                double dNetCur  = mgr.computeNetHPWL(cf->getDNet());
+                double srcQDelta = 0;
+                if(ps.ff && ps.ff->getQNet()){
+                    srcQDelta = mgr.origNetHPWL_[ps.ff->getQNet()]
+                              - mgr.computeNetHPWL(ps.ff->getQNet());
+                }
+                curSlackD = origSlack + delta_q_cf
+                          + mgr.DisplacementDelay * ((dNetOrig - dNetCur) + srcQDelta)
+                          + cf->getArrCorrection();
+
+                // Delta: how much does moving D-pin change the D-net HPWL
+                double dNetProposed = mgr.computeNetHPWL(cf->getDNet(), cf, false, newDpin);
+                deltaHpwlD = dNetCur - dNetProposed;
+            } else {
+                curSlackD = cf->getSlack();
+                PrevInstance prev = cf->getPrevInstance();
+                if(prev.instance){
+                    Coor driverCoor;
+                    if(prev.cellType == CellType::IO){
+                        driverCoor = prev.instance->getCoor();
+                    } else if(prev.cellType == CellType::GATE){
+                        driverCoor = prev.instance->getCoor()
+                                   + prev.instance->getPinCoor(prev.pinName);
+                    } else {
+                        FF* inputFF = dynamic_cast<FF*>(prev.instance);
+                        driverCoor = inputFF->getPhysicalFF()->getNewCoor()
+                                   + inputFF->getPhysicalFF()->getPinCoor(
+                                       "Q" + inputFF->getPhysicalPinName());
+                    }
+                    deltaHpwlD = HPWL(driverCoor, curDpin)
+                               - HPWL(driverCoor, newDpin);
+                }
             }
 
             double predSlackD = curSlackD + mgr.DisplacementDelay * deltaHpwlD;
@@ -400,41 +419,58 @@ void Banking::computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
             newTNS += std::max(0.0, -predSlackD);
 
             // ---- Q-pin: downstream FFs' D-pin slack ----
-            for(auto& next : cf->getNextStage()){
-                double nextCurSlack = next.ff->getSlack();
+            Coor curQpin = ff->getNewCoor() + ff->getPinCoor(
+                "Q" + cf->getPhysicalPinName());
+            Coor newQpin = placeCoor + targetCell->getPinCoor("Q" + slotStr);
 
-                // Q-pin delay change: positive if new cell is faster
+            double qNetCur = 0;
+            if(useNetHPWL && cf->getQNet())
+                qNetCur = mgr.computeNetHPWL(cf->getQNet());
+
+            for(auto& next : cf->getNextStage()){
+                double nextCurSlack;
                 double qDelayBenefit = oldCellQDelay - newCellQDelay;
 
-                // Q-pin displacement: compute using actual load position
-                Coor curQpin = ff->getNewCoor() + ff->getPinCoor(
-                    "Q" + cf->getPhysicalPinName());
-                Coor newQpin = placeCoor + targetCell->getPinCoor("Q" + slotStr);
+                double deltaHpwlQ = 0;
+                if(useNetHPWL && cf->getQNet()){
+                    // Compute nextCurSlack using net HPWL model
+                    double nextOrigSlack = next.ff->getTimingSlack("D");
+                    double delta_q_next = cf->getOriginalQpinDelay()
+                                        - oldCellQDelay;
+                    double qNetOrig = mgr.origNetHPWL_[cf->getQNet()];
+                    double nextDNetDelta = 0;
+                    if(next.ff->getDNet()){
+                        nextDNetDelta = mgr.origNetHPWL_[next.ff->getDNet()]
+                                      - mgr.computeNetHPWL(next.ff->getDNet());
+                    }
+                    nextCurSlack = nextOrigSlack + delta_q_next
+                                 + mgr.DisplacementDelay
+                                   * ((qNetOrig - qNetCur) + nextDNetDelta)
+                                 + next.ff->getArrCorrection();
 
-                Coor loadCoor;
-                if(next.outputGate){
-                    loadCoor = next.outputGate->getCoor()
-                             + next.outputGate->getPinCoor(next.pinName);
+                    // Delta from moving cf's Q pin
+                    double qNetProposed = mgr.computeNetHPWL(cf->getQNet(), cf, true, newQpin);
+                    deltaHpwlQ = qNetCur - qNetProposed;
                 } else {
-                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
-                             + next.ff->getPhysicalFF()->getPinCoor(
-                                 "D" + next.ff->getPhysicalPinName());
+                    nextCurSlack = next.ff->getSlack();
+                    Coor loadCoor;
+                    if(next.outputGate){
+                        loadCoor = next.outputGate->getCoor()
+                                 + next.outputGate->getPinCoor(next.pinName);
+                    } else {
+                        loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                                 + next.ff->getPhysicalFF()->getPinCoor(
+                                     "D" + next.ff->getPhysicalPinName());
+                    }
+                    deltaHpwlQ = HPWL(loadCoor, curQpin)
+                               - HPWL(loadCoor, newQpin);
                 }
-                // positive = Q-pin moved closer to load (timing improves)
-                double deltaHpwlQ = HPWL(loadCoor, curQpin)
-                                  - HPWL(loadCoor, newQpin);
 
                 double predNextSlack = nextCurSlack + qDelayBenefit
                                      + mgr.DisplacementDelay * deltaHpwlQ;
                 oldTNS += std::max(0.0, -nextCurSlack);
                 newTNS += std::max(0.0, -predNextSlack);
 
-                // Option (ii): downstream margin erosion (positive slack shrinking).
-                // TNS-delta above captures cross-zero and further-negative cases but
-                // is blind when both old and pred are positive (slack=1.0 -> 0.3 is
-                // invisible). This term fills that gap: min(oldSlack, oldSlack-pred)
-                // counts positive margin lost, capped at oldSlack (the reserve we
-                // actually had). Skipped when oldSlack<=0 (already in TNS regime).
                 if(downstreamMargin && nextCurSlack > 0.0){
                     double loss = std::min(nextCurSlack,
                                            nextCurSlack - predNextSlack);
@@ -499,6 +535,21 @@ double Banking::CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vecto
 }
 
 thread_local int Banking::commitBinAwareDepth = 0;
+
+double Banking::CostCompareNetHPWL(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank){
+    double costOptimize = 0;
+    for(size_t i = 0; i < FFToBank.size(); i++){
+        FF* ff = FFToBank[i];
+        costOptimize += mgr.beta * (ff->getCell()->getGatePower());
+        costOptimize += mgr.gamma * (ff->getCell()->getArea());
+    }
+    costOptimize -= mgr.beta * (chooseCell->getGatePower()) + mgr.gamma * (chooseCell->getArea());
+    double oldTNS = 0, newTNS = 0;
+    computePinTNS(FFToBank, chooseCell, clusterCoor, oldTNS, newTNS, nullptr, true);
+    double deltaTNS = newTNS - oldTNS;
+    costOptimize -= mgr.alpha * deltaTNS;
+    return costOptimize;
+}
 
 double Banking::weightedMedian(std::vector<std::pair<double,double>>& cw){
     // cw = {(coordinate, weight)}. Returns weighted median.
@@ -1605,8 +1656,13 @@ void Banking::doMatchingClustering(){
     int alg1_hb_lookahead_dominant_total = 0;
     double alg1_hb_pass2_ms = 0, alg1_hb_pass3_ms = 0;
 
-    // Normalization: distScale = 1 / avg_nn_dist (computed per clk domain below)
-    // so dist * distScale ≈ 1.0 for a typical neighbor distance
+    static const bool gainDiag = [](){
+        const char* e = std::getenv("GAIN_DIAG");
+        return e && std::string(e) != "0";
+    }();
+    double gd_min = DBL_MAX, gd_max = -DBL_MAX, gd_sum = 0;
+    int gd_n = 0;
+    int gd_hist[10] = {}; // buckets: [0,50), [50,100), ..., [400,450), [450+)
 
     auto t_total = tic();
     double t_graph = 0, t_match = 0, t_commit = 0;
@@ -1925,6 +1981,14 @@ void Banking::doMatchingClustering(){
         mwm.run();
         t_match += ms_fn(tm0, tic());
 
+        // BFS_COMMIT: refresh timing via full BFS between matching and commit.
+        // Matching uses 2-hop timing (preserves combinatorial stability);
+        // commit loop sees BFS-accurate slack to reject harmful merges.
+        static const bool bfsCommit = std::getenv("BFS_COMMIT") && std::atoi(std::getenv("BFS_COMMIT"));
+        if(bfsCommit){
+            mgr.refreshArrivalCorrections();
+        }
+
         // Commit matched pairs
         auto tc0 = tic();
         lemon::SmartGraph::NodeMap<int> nodeIdx(g, -1);
@@ -2139,6 +2203,38 @@ void Banking::doMatchingClustering(){
                     continue;
                 }
 
+                // NET_HPWL_VETO: secondary check using net bounding-box HPWL.
+                // Catches merges where two-point CostCompare overestimates the
+                // D-pin HPWL improvement (other pins on the net define a larger
+                // bounding box, so moving the D-pin doesn't actually help).
+                static const bool netHPWLVeto = [](){
+                    const char* e = std::getenv("NET_HPWL_VETO");
+                    return e && std::string(e) != "0";
+                }();
+                static const double vetoThreshold = [](){
+                    const char* e = std::getenv("NET_HPWL_VETO_THRESH");
+                    return e ? std::atof(e) : 0.0;
+                }();
+                if(netHPWLVeto){
+                    double netGain = CostCompareNetHPWL(placeCoor, c.cell, c.ffs);
+                    if(netGain < vetoThreshold){
+                        local_dropped_cost++;
+                        n_dropped_cost++;
+                        continue;
+                    }
+                }
+
+                if(gainDiag){
+                    if(realGain < gd_min) gd_min = realGain;
+                    if(realGain > gd_max) gd_max = realGain;
+                    gd_sum += realGain;
+                    gd_n++;
+                    int bucket = (int)(realGain / 50.0);
+                    if(bucket < 0) bucket = 0;
+                    if(bucket >= 10) bucket = 9;
+                    gd_hist[bucket]++;
+                }
+
                 std::vector<FF*> constituents_2b;
                 if(slackRelease){
                     for(FF* pf : c.ffs){
@@ -2254,6 +2350,34 @@ void Banking::doMatchingClustering(){
                 if(safetyMargin2B > 0.0 && realGain < safetyMargin2B){
                     n_dropped_by_margin++;
                     continue;
+                }
+
+                if(gainDiag){
+                    if(realGain < gd_min) gd_min = realGain;
+                    if(realGain > gd_max) gd_max = realGain;
+                    gd_sum += realGain;
+                    gd_n++;
+                    int bucket = (int)(realGain / 50.0);
+                    if(bucket < 0) bucket = 0;
+                    if(bucket >= 10) bucket = 9;
+                    gd_hist[bucket]++;
+                }
+
+                // NET_HPWL_VETO: secondary check using net bounding-box HPWL
+                static const bool netHPWLVetoLeg = [](){
+                    const char* e = std::getenv("NET_HPWL_VETO");
+                    return e && std::string(e) != "0";
+                }();
+                static const double vetoThreshLeg = [](){
+                    const char* e = std::getenv("NET_HPWL_VETO_THRESH");
+                    return e ? std::atof(e) : 0.0;
+                }();
+                if(netHPWLVetoLeg){
+                    double netGain = CostCompareNetHPWL(placeCoor, cell2bit, pair_ffs);
+                    if(netGain < vetoThreshLeg){
+                        n_dropped_cost++;
+                        continue;
+                    }
                 }
 
                 std::vector<FF*> constituents_2b;
@@ -2429,6 +2553,16 @@ void Banking::doMatchingClustering(){
                   << " pass2_ms=" << alg1_pass2_ms
                   << " pass3_ms=" << alg1_pass3_ms
                   << "\n";
+    }
+
+    if(gainDiag && gd_n > 0){
+        std::cout << "[GAIN_DIAG] 2bit committed=" << gd_n
+                  << " min=" << gd_min << " max=" << gd_max
+                  << " avg=" << (gd_sum/gd_n) << " sum=" << gd_sum << "\n";
+        std::cout << "[GAIN_DIAG] histogram (bucket_start count):";
+        for(int b = 0; b < 10; b++)
+            if(gd_hist[b]) std::cout << " [" << (b*50) << "," << ((b+1)*50) << ")=" << gd_hist[b];
+        std::cout << std::endl;
     }
 
     // End of iterative matching round

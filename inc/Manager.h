@@ -68,6 +68,7 @@ public:
     int NumInstances;
     std::unordered_map<std::string, FF *> FF_Map;
     std::unordered_map<std::string, FF *> originalFF_Map;
+    std::unordered_map<FF *, double> origDSlack_; // clean input-file D-slack per logical FF (TNS oracle)
     std::unordered_map<std::string, Gate *> Gate_Map;
     
 
@@ -96,6 +97,20 @@ public:
     // Bin-density table for incremental Δλ in CostCompare. Lazily built on
     // first query when BIN_DENSITY_AWARE=1; maintained by bankFF / debankFF.
     BinDensityTable binTable;
+
+    // --- Net HPWL infrastructure (NET_HPWL=1) ---
+    // Replaces per-sink two-point HPWL with per-net bounding-box HPWL to match
+    // the evaluator's actual timing formula from the contest specification.
+    struct NetPinEntry {
+        enum Kind : uint8_t { FIXED, FF_PIN };
+        Kind kind;
+        bool isQpin;       // only meaningful when kind == FF_PIN
+        Coor fixedCoor;    // precomputed position for FIXED pins (IO/Gate)
+        FF* innerFF;       // inner FF pointer for FF_PIN
+    };
+    std::unordered_map<Net*, std::vector<NetPinEntry>> netPinCache_;
+    std::unordered_map<Net*, double> origNetHPWL_;
+    bool netHPWLEnabled_ = false;
 
 public:
     Manager();
@@ -173,6 +188,30 @@ public:
         std::vector<FF*> freedFFs;
     };
     void evaluatorRefinement(const std::string& testcasePath);
+    void timingDrivenRelocation();
+    void criticalPathSwapRefine(); // NTU-style post-LG critical-path FF swap (TNS-only, same-cell)
+    void bitRepairRefine();        // re-pair individual bits between nearby same-cell/same-clk MBFFs (power/area-fixed)
+    void captureOrigSlack();  // record clean input-file D-slack per logical FF (call once post-preprocess)
+    double validateTNSOracle(bool restore); // recompute TNS from clean base; returns oracle TNS
+
+    // ---- Incremental accurate-TNS engine (cone-recompute; matches computeAccurateTNS) ----
+    struct IncrFanin { int kind; Gate* g; FF* cf; double cnst; Coor pin; }; // kind 0=IO/const,1=FF.Q,2=gate
+    std::vector<Gate*> incrTopo_;                                   // gates in topological order
+    std::unordered_map<Gate*, int> incrTopoIdx_;                    // gate -> topo index
+    std::unordered_map<Gate*, std::vector<IncrFanin>> incrFanin_;   // gate -> its fanin contributions
+    std::unordered_map<Gate*, std::vector<Gate*>> incrFanoutG_;     // gate -> downstream gates
+    std::unordered_map<Gate*, std::vector<FF*>> incrSinkFF_;        // gate -> sink (gate-driven) FFs
+    std::unordered_map<FF*, std::vector<Gate*>> incrFFQGates_;      // logical FF -> gates its Q drives
+    std::unordered_map<FF*, std::vector<FF*>> incrFFDirectSinks_;   // logical FF -> FFs its Q drives directly (no gate)
+    std::unordered_map<FF*, std::vector<std::pair<Gate*,Coor>>> incrFFDrivers_; // gate-driven FF -> (driver gate, gate-out coor)
+    std::unordered_map<Gate*, double> incrGateCur_;                 // current gate arrival (cached)
+    std::unordered_map<FF*, double> incrFFArrOrig_;                 // orig arrival at D for gate-driven FFs
+    std::unordered_map<FF*, double> incrFFNeg_;                     // cached max(0,-slack) per logical FF
+    double incrTNS_ = 0;
+    bool incrBuilt_ = false;
+    void incrAccurateBuild();                       // build caches + full initial compute
+    double incrFFSlack(FF* cf);                     // current slack of logical FF using caches
+    double incrAccurateRecomputeFF(FF* movedPhys);  // after a move, cone-recompute; returns total TNS
     double runEvaluator(const std::string& testcasePath, const std::string& outputPath);
     double computeInlineCost();
     std::vector<FF*> rankMBFFByDisplacement();
@@ -198,6 +237,10 @@ public:
     double calculateBinDensityCost();
     double computeAccurateTNS();
     void   refreshArrivalCorrections();
+    void   buildNetHPWLInfra();
+    double computeNetHPWL(Net* net, FF* overrideFF = nullptr,
+                          bool overrideIsQ = false,
+                          const Coor& overridePos = {0,0}) const;
     double getOverallCost(bool verbose, bool runEvaluator);
     friend class Parser;
     friend class Dumper;

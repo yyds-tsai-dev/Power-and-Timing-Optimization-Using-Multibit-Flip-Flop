@@ -88,19 +88,45 @@ size_t DetailPlacement::GlobalSwap(){
     // threshold. Default 0.0 = strict improvement (pre-ship behavior).
     double GS_MIN_GAIN = 0.0;
     if(const char* e = std::getenv("GS_MIN_GAIN")) GS_MIN_GAIN = std::atof(e);
-    size_t swapCount = 0;
+
+    bool crossVariant = true;
+    if(const char* e = std::getenv("GS_CROSS_VARIANT")) crossVariant = std::atoi(e) != 0;
+
+    // Build same-dimension cell groups for cross-variant search
+    std::unordered_map<Cell*, std::vector<Cell*>> sameDimGroup;
+    if(crossVariant){
+        for(Cell* c1 : cellSet){
+            for(Cell* c2 : cellSet){
+                if(c1->getW() == c2->getW() && c1->getH() == c2->getH())
+                    sameDimGroup[c1].push_back(c2);
+            }
+        }
+    }
+
+    size_t swapCount = 0, crossCount = 0;
     for(size_t id = 0; id < legalizer->ffs.size(); id++){
         Node *ff = legalizer->ffs[id];
         Node *ff_current = ff;
         Coor origCoorA = ff_current->getLGCoor();
         double costA = ff_current->getFFPtr()->getCost();
 
-        // Query K nearest same-cell-type FFs near GP coordinate
         Point queryPoint(ff->getGPCoor().x, ff->getGPCoor().y);
         std::vector<PointWithID> nearestResults;
-        RtreeMaps[ff->getCell()].query(bgi::nearest(queryPoint, GS_K), std::back_inserter(nearestResults));
 
-        // Find best swap partner among K candidates
+        if(crossVariant && sameDimGroup.count(ff->getCell()) &&
+           sameDimGroup[ff->getCell()].size() > 1){
+            for(Cell* cell : sameDimGroup[ff->getCell()]){
+                auto it = RtreeMaps.find(cell);
+                if(it != RtreeMaps.end())
+                    it->second.query(bgi::nearest(queryPoint, GS_K),
+                                     std::back_inserter(nearestResults));
+            }
+        } else {
+            RtreeMaps[ff->getCell()].query(bgi::nearest(queryPoint, GS_K),
+                                           std::back_inserter(nearestResults));
+        }
+
+        // Find best swap partner among candidates
         double bestImprovement = GS_MIN_GAIN;
         int bestIdx = -1;
         PointWithID bestPoint;
@@ -131,7 +157,7 @@ size_t DetailPlacement::GlobalSwap(){
             }
         }
 
-        if(bestIdx < 0) continue; // no improving swap found
+        if(bestIdx < 0) continue;
         swapCount++;
 
         // Commit the best swap
@@ -148,16 +174,22 @@ size_t DetailPlacement::GlobalSwap(){
         ff->setPlaceRowIdx(ff_choose_to_swap_placeIdx);
         ff_choose_to_swap->setPlaceRowIdx(ff_current_placeIdx);
 
-        // Maintain rtree: remove old, insert new for both FFs
-        RtreeMaps[ff->getCell()].remove(bestPoint);
+        // R-tree maintenance: update each FF's own cell R-tree
+        Cell* cellA = ff->getCell();
+        Cell* cellB = ff_choose_to_swap->getCell();
+        if(cellA != cellB) crossCount++;
+
+        RtreeMaps[cellB].remove(bestPoint);
         PointWithID oldEntry = std::make_pair(Point(origCoorA.x, origCoorA.y), id);
-        RtreeMaps[ff->getCell()].remove(oldEntry);
+        RtreeMaps[cellA].remove(oldEntry);
 
         PointWithID newEntryA = std::make_pair(Point(origCoorB.x, origCoorB.y), id);
         PointWithID newEntryB = std::make_pair(Point(origCoorA.x, origCoorA.y), bestIdx);
-        RtreeMaps[ff->getCell()].insert(newEntryA);
-        RtreeMaps[ff->getCell()].insert(newEntryB);
+        RtreeMaps[cellA].insert(newEntryA);
+        RtreeMaps[cellB].insert(newEntryB);
     }
+    if(crossVariant)
+        std::cerr << "[GS_CROSS] swaps=" << swapCount << " cross=" << crossCount << "\n";
     CheckSwapSanity();
     return swapCount;
 }

@@ -1,5 +1,7 @@
 #include "Manager.h"
 #include <unordered_set>
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/index/rtree.hpp>
 #include <lemon/smart_graph.h>
 #include <lemon/matching.h>
@@ -65,6 +67,51 @@ void Manager::preprocess(){
 
         FF_Map[instanceName] = newFF;
     }
+    if(std::getenv("TNS_ORACLE_VALIDATE")) captureOrigSlack();
+    buildNetHPWLInfra();
+}
+
+// Record the clean input-file D-slack of every logical (single-bit) FF, BEFORE any
+// banking/relocation mutates TimingSlack. Keys are the logical FF objects that later
+// become clusterFF elements of MBFFs. Used by validateTNSOracle to recompute TNS from
+// the true anchor (the evaluator's behavior) instead of the drifted internal base.
+void Manager::captureOrigSlack(){
+    origDSlack_.clear();
+    for(auto& kv : FF_Map){
+        FF* phys = kv.second;
+        for(FF* cf : phys->getClusterFF())
+            origDSlack_[cf] = cf->getTimingSlack("D");
+    }
+    std::cerr << "[ORACLE] captured orig D-slack for " << origDSlack_.size() << " logical FFs\n";
+}
+
+// Recompute total negative slack from the CLEAN original base + one-shot displacement
+// delta (orig->current), per the contest evaluator's model: slack(cf) = origDSlack(cf)
+// + delta_q + DispDelay*delta_HPWL, evaluated by getSlack() after restoring cf's base.
+// This is the go/no-go: if it reads ~7,850 on tc2 while getTNS reads 5,864, the gap is
+// base-drift and this is the faithful metric to drive refinement.
+double Manager::validateTNSOracle(bool restore){
+    double oracleTNS = 0.0, internalTNS = 0.0;
+    int missing = 0;
+    for(auto& kv : FF_Map){
+        FF* phys = kv.second;
+        for(FF* cf : phys->getClusterFF()){
+            auto it = origDSlack_.find(cf);
+            if(it == origDSlack_.end()){ missing++; continue; }
+            double saved = cf->getTimingSlack("D");
+            cf->setTimingSlack("D", it->second);   // restore clean anchor
+            double s = cf->getSlack();              // origBase + delta(orig->cur)
+            if(s < 0) oracleTNS += -s;
+            if(restore) cf->setTimingSlack("D", saved);
+        }
+    }
+    for(auto& kv : FF_Map) internalTNS += kv.second->getTNS();
+    double accTNS = computeAccurateTNS();  // multi-hop forward-BFS metric
+    std::cerr << "[ORACLE] oracleTNS(clean-base-1hop)=" << std::fixed << oracleTNS
+              << "  internalTNS(getTNS)=" << internalTNS
+              << "  accurateTNS(multihop)=" << accTNS
+              << "  [eval-true=7850.5]  missing=" << missing << "\n";
+    return oracleTNS;
 }
 
 void Manager::meanshift(){
@@ -582,46 +629,66 @@ void Manager::postLGDecluster(){
 
     // Lambda: ΔC of declustering one MBFF into N copies of oneBitCell.
     // Returns score change under MINIMIZE convention: negative => decluster wins.
+    static const bool useNetHPWLDecluster = []{
+        const char* e = std::getenv("NET_HPWL_DECLUSTER");
+        return e && std::string(e) != "0";
+    }();
+
     auto scoreDelta = [&](FF* mbff) -> double {
         Cell* mCell = mbff->getCell();
         int N = mCell->getBits();
-        // Power/Area delta: after decluster, we use N × oneBit instead of 1 × MBFF.
         double pwrDelta  = beta  * (N * oneBitCell->getGatePower() - mCell->getGatePower());
         double areaDelta = gamma * (N * oneBitCell->getArea()      - mCell->getArea());
 
-        // TNS delta: D-pin absolute coord preserved by debankFF, so D-side
-        // contribution unchanged. Q-side shifts because of QpinDelay + Q-pin
-        // offset differences. Iterate each constituent cf in the MBFF.
         double oldTNS = 0, newTNS = 0;
         double qDelayBenefit = mCell->getQpinDelay() - oneBitCell->getQpinDelay();
         std::vector<FF*>& clusterFF = mbff->getClusterFF();
         int slot = 0;
         for(auto* cf : clusterFF){
             std::string slotStr = (mCell->getBits() == 1) ? "" : std::to_string(slot);
-            // D-side: unchanged absolute position, same contribution both sides -> cancels.
-            // Q-side: downstream FFs' D-pin slack affected.
-            // Use LG-snapped coord for both sides: predicts the position debankFF
-            // will use after we update the debanked 1-bits' newCoor below.
-            Coor curQpin = mbff->getNewCoor() + mbff->getPinCoor("Q" + slotStr);
-            Coor debankedCoor = mbff->getNewCoor() + mbff->getPinCoor("D" + slotStr)
-                              - oneBitCell->getPinCoor("D");
-            Coor newQpin = debankedCoor + oneBitCell->getPinCoor("Q");
-            for(auto& next : cf->getNextStage()){
-                double nextCurSlack = next.ff->getSlack();
-                Coor loadCoor;
-                if(next.outputGate){
-                    loadCoor = next.outputGate->getCoor()
-                             + next.outputGate->getPinCoor(next.pinName);
-                } else {
-                    loadCoor = next.ff->getPhysicalFF()->getNewCoor()
-                             + next.ff->getPhysicalFF()->getPinCoor(
-                                 "D" + next.ff->getPhysicalPinName());
+
+            if(useNetHPWLDecluster && cf->getQNet()){
+                // Hybrid: two-point for current slack, net HPWL for delta.
+                Coor curQpin = mbff->getNewCoor() + mbff->getPinCoor("Q" + slotStr);
+                Coor debankedCoor = mbff->getNewCoor() + mbff->getPinCoor("D" + slotStr)
+                                  - oneBitCell->getPinCoor("D");
+                Coor newQpin = debankedCoor + oneBitCell->getPinCoor("Q");
+
+                Net* qNet = cf->getQNet();
+                double qNetCur = computeNetHPWL(qNet);
+                double qNetProposed = computeNetHPWL(qNet, cf, true, newQpin);
+                double deltaHpwlQ = qNetCur - qNetProposed;
+
+                for(auto& next : cf->getNextStage()){
+                    double nextCurSlack = next.ff->getSlack();
+                    double predNextSlack = nextCurSlack + qDelayBenefit
+                                         + DisplacementDelay * deltaHpwlQ;
+                    oldTNS += std::max(0.0, -nextCurSlack);
+                    newTNS += std::max(0.0, -predNextSlack);
                 }
-                double deltaHpwlQ = HPWL(loadCoor, curQpin) - HPWL(loadCoor, newQpin);
-                double predNextSlack = nextCurSlack + qDelayBenefit
-                                     + DisplacementDelay * deltaHpwlQ;
-                oldTNS += std::max(0.0, -nextCurSlack);
-                newTNS += std::max(0.0, -predNextSlack);
+            } else {
+                // Original two-point model
+                Coor curQpin = mbff->getNewCoor() + mbff->getPinCoor("Q" + slotStr);
+                Coor debankedCoor = mbff->getNewCoor() + mbff->getPinCoor("D" + slotStr)
+                                  - oneBitCell->getPinCoor("D");
+                Coor newQpin = debankedCoor + oneBitCell->getPinCoor("Q");
+                for(auto& next : cf->getNextStage()){
+                    double nextCurSlack = next.ff->getSlack();
+                    Coor loadCoor;
+                    if(next.outputGate){
+                        loadCoor = next.outputGate->getCoor()
+                                 + next.outputGate->getPinCoor(next.pinName);
+                    } else {
+                        loadCoor = next.ff->getPhysicalFF()->getNewCoor()
+                                 + next.ff->getPhysicalFF()->getPinCoor(
+                                     "D" + next.ff->getPhysicalPinName());
+                    }
+                    double deltaHpwlQ = HPWL(loadCoor, curQpin) - HPWL(loadCoor, newQpin);
+                    double predNextSlack = nextCurSlack + qDelayBenefit
+                                         + DisplacementDelay * deltaHpwlQ;
+                    oldTNS += std::max(0.0, -nextCurSlack);
+                    newTNS += std::max(0.0, -predNextSlack);
+                }
             }
             slot++;
         }
@@ -2098,6 +2165,363 @@ double Manager::calculateBinDensityCost(){
     return lambda * numViolationBins;
 }
 
+// ---------- Net HPWL infrastructure (NET_HPWL=1) ----------
+
+void Manager::buildNetHPWLInfra(){
+    const char* env = std::getenv("NET_HPWL");
+    const char* envVeto = std::getenv("NET_HPWL_VETO");
+    const char* envDecl = std::getenv("NET_HPWL_DECLUSTER");
+    bool wantFull = (env && std::string(env) != "0");
+    bool wantVeto = (envVeto && std::string(envVeto) != "0");
+    bool wantDecl = (envDecl && std::string(envDecl) != "0");
+    if(!wantFull && !wantVeto && !wantDecl) return;
+    if(wantFull) netHPWLEnabled_ = true;
+
+    auto& ffListMap = preprocessor->getFFListMap();
+    auto& ffList    = preprocessor->getFFList();
+
+    // 1. Build reverse map: inner FF instanceName → original "inst/Dpin" key
+    std::unordered_map<std::string, std::string> innerToOrigD;
+    for(auto& kv : ffListMap){
+        // kv.first = "originalFF/D0", kv.second = inner FF name in ffList
+        if(ffList.count(kv.second))
+            innerToOrigD[ffList[kv.second]->getInstanceName()] = kv.first;
+    }
+
+    // 2. Build pinToNet: "instanceName/pinName" → Net*
+    std::unordered_map<std::string, Net*> pinToNet;
+    for(auto& nm : Net_Map){
+        Net& net = nm.second;
+        for(int i = 0; i < net.getNumPins(); i++){
+            const Pin& p = net.getPin(i);
+            std::string key = p.getInstanceName() + "/" + p.getPinName();
+            pinToNet[key] = &net;
+        }
+    }
+
+    // 3. For each inner FF, look up its D-net and Q-net
+    int setD = 0, setQ = 0;
+    for(auto& fm : ffList){
+        FF* innerFF = fm.second;
+        auto it = innerToOrigD.find(innerFF->getInstanceName());
+        if(it == innerToOrigD.end()) continue;
+        const std::string& origDKey = it->second; // "ff1/D0"
+
+        // D-net: net containing this FF's D pin
+        auto dn = pinToNet.find(origDKey);
+        if(dn != pinToNet.end()){
+            innerFF->setDNet(dn->second);
+            setD++;
+        }
+
+        // Q-net: replace D→Q in pin name. "ff1/D0" → "ff1/Q0", "ff1/D" → "ff1/Q"
+        std::string origQKey = origDKey;
+        size_t slashPos = origQKey.find('/');
+        if(slashPos != std::string::npos && slashPos + 1 < origQKey.size()
+           && origQKey[slashPos + 1] == 'D'){
+            origQKey[slashPos + 1] = 'Q';
+        }
+        auto qn = pinToNet.find(origQKey);
+        if(qn != pinToNet.end()){
+            innerFF->setQNet(qn->second);
+            setQ++;
+        }
+    }
+
+    // 4. Collect all nets referenced by any inner FF's dNet_ or qNet_
+    std::unordered_set<Net*> relevantNets;
+    for(auto& fm : ffList){
+        FF* f = fm.second;
+        if(f->getDNet()) relevantNets.insert(f->getDNet());
+        if(f->getQNet()) relevantNets.insert(f->getQNet());
+    }
+
+    // 5. Build netPinCache_ for each relevant net
+    for(Net* net : relevantNets){
+        std::vector<NetPinEntry> entries;
+        entries.reserve(net->getNumPins());
+        for(int i = 0; i < net->getNumPins(); i++){
+            const Pin& p = net->getPin(i);
+            const std::string& inst = p.getInstanceName();
+            const std::string& pin  = p.getPinName();
+
+            if(p.getIsIOPin()){
+                Coor pos = {0, 0};
+                if(IO_Map.count(inst))     pos = IO_Map[inst].getCoor();
+                else if(Input_Map.count(inst))  pos = Input_Map[inst];
+                else if(Output_Map.count(inst)) pos = Output_Map[inst];
+                entries.push_back({NetPinEntry::FIXED, false, pos, nullptr});
+            }
+            else if(originalFF_Map.count(inst)){
+                // FF pin — find the inner FF
+                std::string ffKey = inst + "/" + pin;
+                bool isQ = (pin.size() > 0 && pin[0] == 'Q');
+                auto flit = ffListMap.find(ffKey);
+                if(flit != ffListMap.end() && ffList.count(flit->second)){
+                    FF* inner = ffList[flit->second];
+                    entries.push_back({NetPinEntry::FF_PIN, isQ, {0,0}, inner});
+                } else {
+                    // Fallback: use original position as fixed
+                    FF* origFF = originalFF_Map[inst];
+                    Coor pos = origFF->getCoor() + origFF->getPinCoor(pin);
+                    entries.push_back({NetPinEntry::FIXED, false, pos, nullptr});
+                }
+            }
+            else if(Gate_Map.count(inst)){
+                Gate* g = Gate_Map[inst];
+                Coor pos = g->getCoor() + g->getPinCoor(pin);
+                entries.push_back({NetPinEntry::FIXED, false, pos, nullptr});
+            }
+            else {
+                // Unknown — try IO_Map
+                if(IO_Map.count(inst)){
+                    entries.push_back({NetPinEntry::FIXED, false, IO_Map[inst].getCoor(), nullptr});
+                }
+            }
+        }
+        netPinCache_[net] = std::move(entries);
+    }
+
+    // 6. Cache original net HPWL for each relevant net
+    for(Net* net : relevantNets){
+        auto it = netPinCache_.find(net);
+        if(it == netPinCache_.end()) continue;
+        double minX = 1e18, maxX = -1e18, minY = 1e18, maxY = -1e18;
+        for(const auto& e : it->second){
+            Coor pos;
+            if(e.kind == NetPinEntry::FIXED){
+                pos = e.fixedCoor;
+            } else {
+                pos = e.isQpin ? e.innerFF->getOriginalQ() : e.innerFF->getOriginalD();
+            }
+            minX = std::min(minX, pos.x); maxX = std::max(maxX, pos.x);
+            minY = std::min(minY, pos.y); maxY = std::max(maxY, pos.y);
+        }
+        origNetHPWL_[net] = (maxX > minX) ? (maxX - minX) + (maxY - minY) : 0.0;
+    }
+
+    std::cout << "[NET_HPWL] Built infrastructure: " << relevantNets.size()
+              << " nets, " << setD << " D-nets, " << setQ << " Q-nets" << std::endl;
+}
+
+double Manager::computeNetHPWL(Net* net, FF* overrideFF, bool overrideIsQ,
+                                const Coor& overridePos) const {
+    auto it = netPinCache_.find(net);
+    if(it == netPinCache_.end()) return 0.0;
+
+    double minX = 1e18, maxX = -1e18, minY = 1e18, maxY = -1e18;
+    for(const auto& e : it->second){
+        Coor pos;
+        if(e.kind == NetPinEntry::FIXED){
+            pos = e.fixedCoor;
+        } else {
+            if(overrideFF && e.innerFF == overrideFF && e.isQpin == overrideIsQ){
+                pos = overridePos;
+            } else {
+                FF* phys = e.innerFF->getPhysicalFF();
+                if(e.isQpin){
+                    pos = phys->getNewCoor() + phys->getPinCoor(
+                        "Q" + e.innerFF->getPhysicalPinName());
+                } else {
+                    pos = phys->getNewCoor() + phys->getPinCoor(
+                        "D" + e.innerFF->getPhysicalPinName());
+                }
+            }
+        }
+        minX = std::min(minX, pos.x); maxX = std::max(maxX, pos.x);
+        minY = std::min(minY, pos.y); maxY = std::max(maxY, pos.y);
+    }
+    return (maxX > minX) ? (maxX - minX) + (maxY - minY) : 0.0;
+}
+
+// ==================== Incremental Accurate-TNS Engine ====================
+// Cone-recompute incremental version of computeAccurateTNS: build caches once,
+// then a single FF move recomputes only that FF's forward gate-cone + the affected
+// sink slacks, maintaining a running incrTNS_. Correctness-gated (INCR_VALIDATE)
+// against computeAccurateTNS. Topology is move-invariant; only positions change.
+
+double Manager::incrFFSlack(FF* cf){
+    double origSlack = cf->getTimingSlack("D");
+    PrevInstance prev = cf->getPrevInstance();
+    // C2: match getSlack()/evaluator model (arrCorrection_ is 0 unless an arrival-refresh
+    // gate ran; included here so the incr metric never diverges from getSlack).
+    if(!prev.instance) return origSlack + cf->getArrCorrection();
+    FF* phys = cf->getPhysicalFF();
+    Coor curD = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
+    double arrChange = 0;
+    if(prev.cellType == CellType::GATE){
+        auto it = incrFFDrivers_.find(cf);
+        if(it != incrFFDrivers_.end() && !it->second.empty()){
+            double cur = -1e300;
+            for(auto& gp : it->second){
+                double v = incrGateCur_[gp.first] + DisplacementDelay * HPWL(gp.second, curD);
+                if(v > cur) cur = v;
+            }
+            arrChange = cur - incrFFArrOrig_[cf];
+        } else {
+            Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
+            arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, cf->getOriginalD()));
+            const PrevStage& ps = cf->getPrevStage();
+            if(ps.ff){
+                FF* srcPhys = ps.ff->getPhysicalFF();
+                Coor origQ = ps.ff->getOriginalQ();
+                Coor newQ  = srcPhys->getNewCoor() + srcPhys->getPinCoor("Q" + ps.ff->getPhysicalPinName());
+                double dqpd = srcPhys->getCell()->getQpinDelay() - ps.ff->getOriginalQpinDelay();
+                Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
+                arrChange += dqpd + DisplacementDelay * (HPWL(firstGatePin, newQ) - HPWL(firstGatePin, origQ));
+            }
+        }
+    } else if(prev.cellType == CellType::IO){
+        Coor ioCoor = prev.instance->getCoor();
+        arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, cf->getOriginalD()));
+    } else {
+        FF* prevFF   = static_cast<FF*>(prev.instance);
+        FF* prevPhys = prevFF->getPhysicalFF();
+        Coor origQ = prevFF->getOriginalQ();
+        Coor newQ  = prevPhys->getNewCoor() + prevPhys->getPinCoor("Q" + prevFF->getPhysicalPinName());
+        double origArr = prevFF->getOriginalQpinDelay() + DisplacementDelay * HPWL(origQ, cf->getOriginalD());
+        double newArr  = prevPhys->getCell()->getQpinDelay() + DisplacementDelay * HPWL(newQ, curD);
+        arrChange = newArr - origArr;
+    }
+    return origSlack - arrChange + cf->getArrCorrection();
+}
+
+void Manager::incrAccurateBuild(){
+    incrTopo_.clear(); incrTopoIdx_.clear(); incrFanin_.clear(); incrFanoutG_.clear();
+    incrSinkFF_.clear(); incrFFQGates_.clear(); incrFFDirectSinks_.clear(); incrFFDrivers_.clear();
+    incrGateCur_.clear(); incrFFArrOrig_.clear(); incrFFNeg_.clear();
+
+    std::unordered_map<std::string, FF*> innerFF;
+    for(auto& kv : FF_Map) for(FF* cf : kv.second->getClusterFF()) innerFF[cf->getInstanceName()] = cf;
+
+    std::unordered_map<Gate*,int> cnt;
+    std::queue<Gate*> q;
+    auto bump = [&](Gate* g){ if(++cnt[g] == g->getCell()->getInputCount()) q.push(g); };
+
+    // IO -> gate
+    for(auto& io_m : Input_Map){
+        Instance& ioInst = IO_Map[io_m.first];
+        for(auto& outPair : ioInst.getOutputInstances())
+            for(auto& tgt : outPair.second){
+                auto it = Gate_Map.find(tgt.first); if(it==Gate_Map.end()) continue;
+                Gate* g = it->second; Coor gpin = g->getCoor() + g->getPinCoor(tgt.second);
+                incrFanin_[g].push_back({0,nullptr,nullptr, DisplacementDelay*HPWL(ioInst.getCoor(), gpin), gpin});
+                bump(g);
+            }
+    }
+    // FF.Q -> gate, and FF.Q -> FF (direct)
+    for(auto& kv : innerFF){
+        FF* cf = kv.second;
+        for(auto& outPair : cf->getOutputInstances())
+            for(auto& tgt : outPair.second){
+                auto git = Gate_Map.find(tgt.first);
+                if(git!=Gate_Map.end()){
+                    Gate* g = git->second; Coor gpin = g->getCoor() + g->getPinCoor(tgt.second);
+                    incrFanin_[g].push_back({1,nullptr,cf, 0, gpin});
+                    incrFFQGates_[cf].push_back(g); bump(g);
+                } else {
+                    auto fit = innerFF.find(tgt.first);
+                    if(fit!=innerFF.end()) incrFFDirectSinks_[cf].push_back(fit->second);
+                }
+            }
+    }
+    // gate -> gate (build fanin) and gate -> FF (sinks). Topo via Kahn over the queue.
+    for(auto& kv : Gate_Map){
+        Gate* g = kv.second;
+        for(auto& outPair : g->getOutputInstances()){
+            Coor gout = g->getCoor() + g->getPinCoor(outPair.first);
+            for(auto& tgt : outPair.second){
+                auto git = Gate_Map.find(tgt.first);
+                if(git!=Gate_Map.end()){
+                    Gate* n = git->second; Coor npin = n->getCoor() + n->getPinCoor(tgt.second);
+                    incrFanin_[n].push_back({2,g,nullptr, DisplacementDelay*HPWL(gout,npin), npin});
+                    incrFanoutG_[g].push_back(n);
+                } else {
+                    auto fit = innerFF.find(tgt.first);
+                    if(fit!=innerFF.end()){ incrSinkFF_[g].push_back(fit->second); incrFFDrivers_[fit->second].push_back({g, gout}); }
+                }
+            }
+        }
+    }
+    // Kahn topo order (gate->gate edges; gates already seeded when all inputs counted)
+    while(!q.empty()){
+        Gate* g = q.front(); q.pop();
+        incrTopoIdx_[g] = (int)incrTopo_.size();
+        incrTopo_.push_back(g);
+        for(Gate* n : incrFanoutG_[g]) bump(n);
+    }
+
+    // Compute current + original gate arrivals in topo order.
+    std::unordered_map<Gate*,double> origArr;
+    for(Gate* g : incrTopo_){
+        double mc=-1e300, mo=-1e300;
+        for(auto& f : incrFanin_[g]){
+            double vc, vo;
+            if(f.kind==0){ vc=f.cnst; vo=f.cnst; }
+            else if(f.kind==1){
+                FF* cf=f.cf; FF* ph=cf->getPhysicalFF();
+                Coor cq = ph->getNewCoor()+ph->getPinCoor("Q"+cf->getPhysicalPinName());
+                vc = ph->getCell()->getQpinDelay() + DisplacementDelay*HPWL(cq, f.pin);
+                vo = cf->getOriginalQpinDelay() + DisplacementDelay*HPWL(cf->getOriginalQ(), f.pin);
+            } else { vc = incrGateCur_[f.g] + f.cnst; vo = origArr[f.g] + f.cnst; }
+            if(vc>mc) mc=vc; if(vo>mo) mo=vo;
+        }
+        incrGateCur_[g] = (mc==-1e300)?0:mc;
+        origArr[g]      = (mo==-1e300)?0:mo;
+    }
+    // Original arrival at each gate-driven FF's D.
+    for(auto& kv : incrFFDrivers_){
+        FF* cf = kv.first; double mo=-1e300;
+        for(auto& gp : kv.second){ double v = origArr[gp.first] + DisplacementDelay*HPWL(gp.second, cf->getOriginalD()); if(v>mo) mo=v; }
+        incrFFArrOrig_[cf] = (mo==-1e300)?0:mo;
+    }
+    // Initial TNS.
+    incrTNS_ = 0;
+    for(auto& kv : innerFF){ double s = incrFFSlack(kv.second); double n=(s<0)?-s:0; incrFFNeg_[kv.second]=n; incrTNS_+=n; }
+    incrBuilt_ = true;
+}
+
+double Manager::incrAccurateRecomputeFF(FF* movedPhys){
+    // Collect forward cone of gates from the moved FF's Q-pins.
+    std::unordered_set<Gate*> coneSet;
+    std::vector<Gate*> stack;
+    for(FF* cf : movedPhys->getClusterFF()){
+        auto it = incrFFQGates_.find(cf);
+        if(it!=incrFFQGates_.end()) for(Gate* g : it->second) if(coneSet.insert(g).second) stack.push_back(g);
+    }
+    for(size_t i=0;i<stack.size();i++){
+        auto it = incrFanoutG_.find(stack[i]);
+        if(it!=incrFanoutG_.end()) for(Gate* n : it->second) if(coneSet.insert(n).second) stack.push_back(n);
+    }
+    // Recompute cone gates in topological order.
+    std::vector<Gate*> cone(coneSet.begin(), coneSet.end());
+    std::sort(cone.begin(), cone.end(), [&](Gate* a, Gate* b){ return incrTopoIdx_[a] < incrTopoIdx_[b]; });
+    for(Gate* g : cone){
+        double mc=-1e300;
+        for(auto& f : incrFanin_[g]){
+            double vc;
+            if(f.kind==0) vc=f.cnst;
+            else if(f.kind==1){ FF* cf=f.cf; FF* ph=cf->getPhysicalFF(); Coor cq=ph->getNewCoor()+ph->getPinCoor("Q"+cf->getPhysicalPinName()); vc = ph->getCell()->getQpinDelay() + DisplacementDelay*HPWL(cq, f.pin); }
+            else vc = incrGateCur_[f.g] + f.cnst;
+            if(vc>mc) mc=vc;
+        }
+        incrGateCur_[g] = (mc==-1e300)?0:mc;
+    }
+    // Affected sinks: moved FF's bits + their FF-direct sinks + cone gates' sink FFs.
+    std::unordered_set<FF*> affected;
+    for(FF* cf : movedPhys->getClusterFF()){
+        affected.insert(cf);
+        auto it = incrFFDirectSinks_.find(cf);
+        if(it!=incrFFDirectSinks_.end()) for(FF* d : it->second) affected.insert(d);
+    }
+    for(Gate* g : cone){ auto it=incrSinkFF_.find(g); if(it!=incrSinkFF_.end()) for(FF* cf : it->second) affected.insert(cf); }
+    for(FF* cf : affected){
+        double s = incrFFSlack(cf); double newNeg=(s<0)?-s:0;
+        incrTNS_ += (newNeg - incrFFNeg_[cf]); incrFFNeg_[cf]=newNeg;
+    }
+    return incrTNS_;
+}
+
 double Manager::computeAccurateTNS(){
     // Dual-BFS mini-STA: computes arrival at every gate and FF using BOTH
     //   (a) original positions (post-CG, pre-banking) — the baseline for origSlack
@@ -2590,6 +3014,387 @@ double Manager::getCostDiff(Coor newbankCoor, Cell* bankCellType, std::vector<FF
         oldCost += MBFF->getCost();
     }
     return cost - oldCost;
+}
+
+// ==================== Timing-Driven Relocation ====================
+
+void Manager::timingDrivenRelocation(){
+    static const int maxCandidates = []{
+        const char* e = std::getenv("RELOC_K");
+        return e ? std::atoi(e) : 200;
+    }();
+    static const double critExp = []{
+        const char* e = std::getenv("RELOC_CRIT_EXP");
+        return e ? std::atof(e) : 2.0;
+    }();
+    static const double timeBudget = []{
+        const char* e = std::getenv("RELOC_TIME");
+        return e ? std::atof(e) : 120.0;
+    }();
+
+    if(!legalizer){
+        legalizer = new Legalizer(*this);
+        legalizer->initial();
+        for(const auto& fp : FF_Map)
+            if(fp.second->getCell()->getBits() > 1 && fp.second->getIsLegalize())
+                legalizer->UpdateRows(fp.second);
+    }
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]() -> double {
+        auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double>(now - startTime).count();
+    };
+
+    struct Candidate {
+        FF* mbff;
+        double worstSlack;
+        Coor timingTarget;
+    };
+    int rrounds = 1;
+    if(const char* e = std::getenv("RELOC_ROUNDS")) rrounds = std::atoi(e);
+    bool useIncr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
+    int validateEvery = 0;
+    if(const char* e = std::getenv("INCR_VALIDATE")) validateEvery = std::atoi(e);
+    if(useIncr) incrAccurateBuild();
+    double baseTNS = useIncr ? incrTNS_ : computeAccurateTNS();
+    if(useIncr){
+        double full = computeAccurateTNS();
+        std::cerr << "[RELOC] INCR build: incrTNS=" << std::fixed << incrTNS_
+                  << " fullTNS=" << full << " diff=" << (incrTNS_-full) << "\n";
+    }
+    std::cerr << "[RELOC] start baseTNS=" << std::fixed << baseTNS << "\n";
+    int tried = 0, moved = 0;
+    for(int rr = 0; rr < rrounds && elapsed() < timeBudget; rr++){
+    std::vector<Candidate> cands;
+    cands.reserve(FF_Map.size());
+
+    for(auto& fp : FF_Map){
+        FF* mbff = fp.second;
+        if(mbff->getCell()->getBits() <= 1) continue;
+        if(!mbff->getIsLegalize()) continue;
+
+        double worstSlack = 0;
+        double wx = 0, wy = 0, wsum = 0;
+        int slot = 0;
+        for(auto* cf : mbff->getClusterFF()){
+            double sl = cf->getSlack();
+            Coor pinOff = mbff->getPinCoor("D" + std::to_string(slot));
+
+            Coor driverPos;
+            bool hasDriver = false;
+            PrevInstance pi = cf->getPrevInstance();
+            if(pi.instance){
+                if(pi.cellType == CellType::IO){
+                    driverPos = pi.instance->getCoor();
+                } else if(pi.cellType == CellType::GATE){
+                    driverPos = pi.instance->getCoor() + pi.instance->getPinCoor(pi.pinName);
+                } else {
+                    FF* pff = dynamic_cast<FF*>(pi.instance);
+                    if(pff && pff->getPhysicalFF())
+                        driverPos = pff->getPhysicalFF()->getNewCoor() +
+                            pff->getPhysicalFF()->getPinCoor("Q" + pff->getPhysicalPinName());
+                    else
+                        driverPos = cf->getOriginalD();
+                }
+                hasDriver = true;
+            }
+
+            if(hasDriver){
+                Coor optPos(driverPos.x - pinOff.x, driverPos.y - pinOff.y);
+                double w = (sl < 0) ? std::pow(-sl, critExp) : 0.01;
+                wx += w * optPos.x;
+                wy += w * optPos.y;
+                wsum += w;
+            }
+            if(sl < worstSlack) worstSlack = sl;
+            slot++;
+        }
+        if(worstSlack >= 0) continue;
+        if(wsum < 1e-20) continue;
+
+        Coor target(wx / wsum, wy / wsum);
+        cands.push_back({mbff, worstSlack, target});
+    }
+
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate& a, const Candidate& b){
+                  return a.worstSlack < b.worstSlack;
+              });
+
+    int roundMoved = 0;
+    int limit = std::min(maxCandidates, (int)cands.size());
+    for(int i = 0; i < limit && elapsed() < timeBudget; i++){
+        FF* mbff = cands[i].mbff;
+        Coor oldPos = mbff->getNewCoor();
+
+        legalizer->FreeRect(oldPos, mbff->getCell()->getW(), mbff->getCell()->getH());
+        legalizer->RemoveNodeByFFPtr(mbff);
+
+        Coor newPos = legalizer->FindPlace(cands[i].timingTarget, mbff->getCell());
+        if(newPos.x == DBL_MAX || (newPos.x == oldPos.x && newPos.y == oldPos.y)){
+            mbff->setNewCoor(oldPos);
+            mbff->setCoor(oldPos);
+            legalizer->UpdateRows(mbff);
+            continue;
+        }
+
+        mbff->setNewCoor(newPos);
+        mbff->setCoor(newPos);
+        tried++;
+
+        double newTNS = useIncr ? incrAccurateRecomputeFF(mbff) : computeAccurateTNS();
+        if(newTNS < baseTNS){
+            legalizer->UpdateRows(mbff);
+            baseTNS = newTNS;
+            moved++; roundMoved++;
+            if(validateEvery && (moved % validateEvery == 0)){
+                double full = computeAccurateTNS();
+                std::cerr << "[INCR_CHK] moved=" << moved << " incr=" << std::fixed << incrTNS_
+                          << " full=" << full << " diff=" << (incrTNS_-full) << "\n";
+            }
+        } else {
+            mbff->setNewCoor(oldPos);
+            mbff->setCoor(oldPos);
+            legalizer->UpdateRows(mbff);
+            if(useIncr){ incrAccurateRecomputeFF(mbff); incrTNS_ = baseTNS; } // restore exactly (determinism)
+        }
+    }
+    std::cerr << "[RELOC] round=" << rr << " cands=" << cands.size()
+              << " roundMoved=" << roundMoved << " TNS=" << std::fixed << baseTNS
+              << " elapsed=" << elapsed() << "s\n";
+    if(roundMoved == 0) break;
+    } // end rounds
+    std::cerr << "[RELOC] tried=" << tried << " moved=" << moved
+              << " finalTNS=" << std::fixed << baseTNS
+              << " elapsed=" << elapsed() << "s\n";
+}
+
+// ==================== Critical-Path FF-Swap Refinement (NTU thesis 3.3 step1) ====================
+// Post-legalization, TNS-only local search. Swaps a critical (negative-slack)
+// physical FF with a nearby SAME-CELL physical FF (exchange positions). Same cell
+// => identical footprint => legality, Power, Area and bin-density are EXACTLY
+// preserved; only TNS changes. Accept a swap iff the local delta-TNS over the two
+// FFs' own D-pins PLUS their 1-hop downstream sinks (whose driver Q-pin moved)
+// is strictly negative. This attacks the post-merge PLACEMENT layer that the
+// ~40 merge/threshold sweeps never touched. Scored by the contest 1-hop getSlack
+// (the same model NTU uses; their refinement recovers tc2 TNS 14,370->5,309).
+namespace {
+    namespace bg_cs  = boost::geometry;
+    namespace bgi_cs = boost::geometry::index;
+    typedef bg_cs::model::point<double, 2, bg_cs::cs::cartesian> CSPoint;
+    typedef std::pair<CSPoint, int> CSPointID;
+    typedef bgi_cs::rtree<CSPointID, bgi_cs::quadratic<16>> CSRTree;
+}
+void Manager::criticalPathSwapRefine(){
+    int    K          = []{ const char* e=std::getenv("CRIT_SWAP_K");      return e?std::atoi(e):8;   }();
+    int    maxRounds  = []{ const char* e=std::getenv("CRIT_SWAP_ROUNDS"); return e?std::atoi(e):4;   }();
+    double timeBudget = []{ const char* e=std::getenv("CRIT_SWAP_TIME");   return e?std::atof(e):150.0;}();
+    double eps        = []{ const char* e=std::getenv("CRIT_SWAP_EPS");    return e?std::atof(e):1e-9; }();
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]{ return std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - t0).count(); };
+
+    // Physical FFs that are placed (one entry per physical instance in FF_Map).
+    std::vector<FF*> phys;
+    phys.reserve(FF_Map.size());
+    for(auto& kv : FF_Map) if(kv.second && kv.second->getIsLegalize()) phys.push_back(kv.second);
+    // determinism: stable candidate order independent of FF_Map hash order
+    std::sort(phys.begin(), phys.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+
+    // Affected sink set = the two FFs' own logical bits + their 1-hop downstream FFs.
+    auto collectAffected = [](FF* a, FF* b, std::vector<FF*>& aff){
+        aff.clear();
+        for(FF* p : {a, b}){
+            for(FF* cf : p->getClusterFF()){
+                aff.push_back(cf);
+                for(const auto& ns : cf->getNextStage()) if(ns.ff) aff.push_back(ns.ff);
+            }
+        }
+        std::sort(aff.begin(), aff.end());
+        aff.erase(std::unique(aff.begin(), aff.end()), aff.end());
+    };
+    auto localTNS = [](const std::vector<FF*>& aff){
+        double t = 0.0;
+        for(FF* f : aff){ double s = f->getSlack(); if(s < 0) t += -s; }
+        return t;
+    };
+
+    // C1: default to the faithful (verify) accept gate. The non-verify path scores via
+    // getSlack/collectAffected which only walks the single critical path (Preprocess
+    // populates nextStage along max-cost only), undercounting multi-fanout cones.
+    const char* csv = std::getenv("CRIT_SWAP_VERIFY");
+    bool verify = !csv || std::atoi(csv);
+    bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
+    if(verify && incr) incrAccurateBuild();
+    double baseAcc = verify ? (incr ? incrTNS_ : computeAccurateTNS()) : 0.0;  // faithful running TNS
+    if(verify) std::cerr << "[CRIT_SWAP] verify mode" << (incr?"(incr)":"") << " baseAccurateTNS=" << std::fixed << baseAcc << "\n";
+
+    long totalSwaps = 0;
+    for(int round = 0; round < maxRounds && elapsed() < timeBudget; round++){
+        // (Re)build per-cell rtrees from current positions.
+        std::unordered_map<Cell*, CSRTree> trees;
+        for(size_t i = 0; i < phys.size(); i++){
+            Coor c = phys[i]->getNewCoor();
+            trees[phys[i]->getCell()].insert({CSPoint(c.x, c.y), (int)i});
+        }
+        // Order physical FFs by worst (most negative) slack across their bits.
+        std::vector<std::pair<double,int>> order;
+        order.reserve(phys.size());
+        for(size_t i = 0; i < phys.size(); i++){
+            double worst = 0.0;
+            for(FF* cf : phys[i]->getClusterFF()){ double s = cf->getSlack(); if(s < worst) worst = s; }
+            if(worst < 0) order.push_back({worst, (int)i});
+        }
+        std::sort(order.begin(), order.end(),
+                  [](const std::pair<double,int>& x, const std::pair<double,int>& y){ return x.first != y.first ? x.first < y.first : x.second < y.second; });
+
+        long roundSwaps = 0;
+        std::vector<FF*> aff;
+        for(auto& od : order){
+            if(elapsed() > timeBudget) break;
+            int ia = od.second; FF* A = phys[ia];
+            Coor posA = A->getNewCoor();
+            auto& tree = trees[A->getCell()];
+            std::vector<CSPointID> near;
+            tree.query(bgi_cs::nearest(CSPoint(posA.x, posA.y), K + 1), std::back_inserter(near));
+
+            double bestDelta = -eps; int bestJb = -1; Coor bestPosB;
+            for(auto& nb : near){
+                int ib = nb.second; if(ib == ia) continue;
+                FF* B = phys[ib];
+                Coor posB = B->getNewCoor();
+                if(posA.x == posB.x && posA.y == posB.y) continue;
+                collectAffected(A, B, aff);
+                double before = localTNS(aff);
+                A->setNewCoor(posB); B->setNewCoor(posA);
+                double after = localTNS(aff);
+                A->setNewCoor(posA); B->setNewCoor(posB);
+                double delta = after - before;
+                if(delta < bestDelta){ bestDelta = delta; bestJb = ib; bestPosB = posB; }
+            }
+            if(bestJb >= 0){
+                FF* B = phys[bestJb];
+                // apply tentatively
+                A->setNewCoor(bestPosB); A->setCoor(bestPosB);
+                B->setNewCoor(posA);     B->setCoor(posA);
+                if(verify){
+                    // accept only if the faithful multi-hop TNS strictly improves
+                    double newAcc;
+                    if(incr){ incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B); newAcc = incrTNS_; }
+                    else newAcc = computeAccurateTNS();
+                    if(newAcc >= baseAcc - eps){
+                        A->setNewCoor(posA); A->setCoor(posA);
+                        B->setNewCoor(bestPosB); B->setCoor(bestPosB);
+                        if(incr){ incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B); incrTNS_ = baseAcc; }
+                        continue;
+                    }
+                    baseAcc = newAcc;
+                }
+                // rtree maintenance for this cell
+                tree.remove({CSPoint(posA.x, posA.y), ia});
+                tree.remove({CSPoint(bestPosB.x, bestPosB.y), bestJb});
+                tree.insert({CSPoint(bestPosB.x, bestPosB.y), ia});
+                tree.insert({CSPoint(posA.x, posA.y), bestJb});
+                roundSwaps++;
+            }
+        }
+        totalSwaps += roundSwaps;
+        std::cerr << "[CRIT_SWAP] round=" << round << " swaps=" << roundSwaps
+                  << " elapsed=" << std::fixed << elapsed() << "s\n";
+        if(roundSwaps == 0) break;
+    }
+    std::cerr << "[CRIT_SWAP] totalSwaps=" << totalSwaps << "\n";
+}
+
+// ==================== Bit-level Re-pairing Refinement ====================
+// Swap one clusterFF bit between two nearby SAME-CELL, SAME-CLK MBFFs. Both MBFFs
+// stay in place => Power, Area, bin-density and legality are EXACTLY preserved
+// (still two same-cell same-clk MBFFs); only the logical->physical bit assignment
+// changes, letting each FF sit in the MBFF nearest its driver. Faithful-scored by
+// the incremental engine. Attacks the merge-PAIRING limiter that position refine
+// cannot (the ~755K post-hoc ceiling). Requires INCR engine (always builds it).
+void Manager::bitRepairRefine(){
+    int    K         = []{ const char* e=std::getenv("BIT_REPAIR_K");      return e?std::atoi(e):8;   }();
+    int    maxRounds = []{ const char* e=std::getenv("BIT_REPAIR_ROUNDS"); return e?std::atoi(e):20;  }();
+    double timeBudget= []{ const char* e=std::getenv("BIT_REPAIR_TIME");   return e?std::atof(e):400.0;}();
+    double eps = 1e-9;
+    int validateEvery = 0;
+    if(const char* e = std::getenv("INCR_VALIDATE")) validateEvery = std::atoi(e);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-t0).count(); };
+
+    incrAccurateBuild();
+    double baseAcc = incrTNS_;
+    { double full = computeAccurateTNS();
+      std::cerr << "[BIT_REPAIR] baseTNS=" << std::fixed << baseAcc << " full=" << full << " diff=" << (baseAcc-full) << "\n"; }
+
+    std::vector<FF*> mb;
+    for(auto& kv : FF_Map)
+        if(kv.second && kv.second->getIsLegalize() && !kv.second->getFixed() && kv.second->getCell()->getBits() > 1) mb.push_back(kv.second);
+    // determinism: stable candidate order independent of FF_Map hash order
+    std::sort(mb.begin(), mb.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+
+    long total = 0;
+    for(int round = 0; round < maxRounds && elapsed() < timeBudget; round++){
+        std::unordered_map<Cell*, CSRTree> trees;
+        for(size_t i = 0; i < mb.size(); i++){ Coor c = mb[i]->getNewCoor(); trees[mb[i]->getCell()].insert({CSPoint(c.x,c.y),(int)i}); }
+        std::vector<std::pair<double,int>> order;
+        for(size_t i = 0; i < mb.size(); i++){
+            double worst = 0; for(FF* cf : mb[i]->getClusterFF()){ double s=incrFFSlack(cf); if(s<worst) worst=s; }
+            if(worst < 0) order.push_back({worst,(int)i});
+        }
+        std::sort(order.begin(), order.end(), [](const std::pair<double,int>&a, const std::pair<double,int>&b){ return a.first!=b.first ? a.first<b.first : a.second<b.second; });
+
+        long roundSwaps = 0;
+        for(auto& od : order){
+            if(elapsed() > timeBudget) break;
+            int ia = od.second; FF* A = mb[ia]; Coor posA = A->getNewCoor();
+            auto& tree = trees[A->getCell()];
+            std::vector<CSPointID> near; tree.query(bgi_cs::nearest(CSPoint(posA.x,posA.y), K+1), std::back_inserter(near));
+
+            double bestDelta = -eps; int bestIb=-1, bestSa=-1, bestSb=-1;
+            int nA = (int)A->getClusterFF().size();
+            for(auto& nb : near){
+                int ib = nb.second; if(ib==ia) continue;
+                FF* B = mb[ib];
+                if(B->getClkIdx() != A->getClkIdx()) continue;
+                int nB = (int)B->getClusterFF().size();
+                for(int sa=0; sa<nA; sa++) for(int sb=0; sb<nB; sb++){
+                    FF* cfa = A->getClusterFF()[sa];
+                    FF* cfb = B->getClusterFF()[sb];
+                    A->getClusterFF()[sa]=cfb; B->getClusterFF()[sb]=cfa;
+                    cfb->setPhysicalFF(A,sa); cfa->setPhysicalFF(B,sb);
+                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    double delta = incrTNS_ - baseAcc;
+                    A->getClusterFF()[sa]=cfa; B->getClusterFF()[sb]=cfb;
+                    cfa->setPhysicalFF(A,sa); cfb->setPhysicalFF(B,sb);
+                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrTNS_ = baseAcc; // determinism: pin to known-good (avoid FP drift over trials)
+                    if(delta < bestDelta){ bestDelta=delta; bestIb=ib; bestSa=sa; bestSb=sb; }
+                }
+            }
+            if(bestIb>=0){
+                FF* B = mb[bestIb];
+                FF* cfa = A->getClusterFF()[bestSa];
+                FF* cfb = B->getClusterFF()[bestSb];
+                A->getClusterFF()[bestSa]=cfb; B->getClusterFF()[bestSb]=cfa;
+                cfb->setPhysicalFF(A,bestSa); cfa->setPhysicalFF(B,bestSb);
+                incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                baseAcc = incrTNS_; roundSwaps++;
+                if(validateEvery && (total+roundSwaps) % validateEvery == 0){
+                    double full = computeAccurateTNS();
+                    std::cerr << "[BIT_CHK] swaps=" << (total+roundSwaps) << " incr=" << std::fixed << incrTNS_ << " full=" << full << " diff=" << (incrTNS_-full) << "\n";
+                }
+            }
+        }
+        total += roundSwaps;
+        std::cerr << "[BIT_REPAIR] round=" << round << " swaps=" << roundSwaps << " TNS=" << std::fixed << baseAcc << " elapsed=" << elapsed() << "s\n";
+        if(roundSwaps==0) break;
+    }
+    std::cerr << "[BIT_REPAIR] totalSwaps=" << total << " finalTNS=" << std::fixed << baseAcc << "\n";
 }
 
 // ==================== Evaluator-Guided Refinement (EGR) ====================

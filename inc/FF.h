@@ -9,6 +9,8 @@
 #include "Manager.h"
 #include "Util.h"
 
+class Net;
+
 class Manager;
 class FF;
 class Gate;
@@ -83,6 +85,14 @@ private:
     // Set by Manager::refreshArrivalCorrections(), consumed by getSlack().
     double arrCorrection_;
 
+    // Net HPWL infrastructure (set by Manager::buildNetHPWLInfra).
+    // dNet_: the net connected to this inner FF's D pin in the original netlist.
+    // qNet_: the net connected to this inner FF's Q pin in the original netlist.
+    // Used by the NET_HPWL=1 timing model to compute per-net bounding-box HPWL
+    // instead of per-sink two-point HPWL.
+    Net* dNet_;
+    Net* qNet_;
+
 public:
     FF();
     explicit FF(int size);
@@ -112,6 +122,10 @@ public:
     void clearBankingReleasedSlackD();
     void setArrCorrection(double c);
     double getArrCorrection()const;
+    void setDNet(Net* n);
+    void setQNet(Net* n);
+    Net* getDNet()const;
+    Net* getQNet()const;
     // Getter
     double getTimingSlack(const std::string &pinName)const;
     std::vector<FF*>& getClusterFF();

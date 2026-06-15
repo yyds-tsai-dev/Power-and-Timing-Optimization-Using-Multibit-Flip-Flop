@@ -64,7 +64,8 @@ int main(int argc, char *argv[]){
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("Banking.out"); }
     printStageCost("banking", mgr);
 
-    STAGE("postBankingOpt",    mgr.postBankingOptimize());
+    if(!std::getenv("SKIP_CG") || std::string(std::getenv("SKIP_CG")) == "0")
+        STAGE("postBankingOpt",    mgr.postBankingOptimize());
     if(!production){ mgr.getOverallCost(cost_verbose, 0); mgr.dumpVisual("PostCG.out"); }
     printStageCost("postBankingOpt", mgr);
 
@@ -109,6 +110,14 @@ int main(int argc, char *argv[]){
             STAGE("dp-round",             mgr.detailplacement());
         }
     }
+    if(std::getenv("RELOC") && std::atoi(std::getenv("RELOC"))){
+        STAGE("refreshArr(pre-reloc)", mgr.refreshArrivalCorrections());
+        STAGE("timingReloc",           mgr.timingDrivenRelocation());
+    }
+    if(std::getenv("CRIT_SWAP") && std::atoi(std::getenv("CRIT_SWAP")))
+        STAGE("critSwapRefine", mgr.criticalPathSwapRefine());
+    if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR")))
+        STAGE("bitRepair", mgr.bitRepairRefine());
     if(std::getenv("EGR") && std::atoi(std::getenv("EGR")))
         STAGE("evalRefinement", mgr.evaluatorRefinement(argv[1]));
     if(!production){
@@ -116,6 +125,9 @@ int main(int argc, char *argv[]){
         mgr.dumpVisual("DetailPlacement.out");
         mgr.checker();
     }
+
+    if(std::getenv("TNS_ORACLE_VALIDATE"))
+        STAGE("oracleValidate", mgr.validateTNSOracle(true));
 
     STAGE("dump",              mgr.dump(argv[2]));
 

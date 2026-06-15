@@ -22,7 +22,9 @@ FF::FF() :
     fixed(true),
     redistributedSlackD(0),
     bankingReleasedSlackD(0),
-    arrCorrection_(0){
+    arrCorrection_(0),
+    dNet_(nullptr),
+    qNet_(nullptr){
 }
 
 FF::FF(int size) : Instance(), clusterFF(size, nullptr){
@@ -168,6 +170,10 @@ double FF::getBankingReleasedSlackD()const{
 
 void FF::setArrCorrection(double c){ arrCorrection_ = c; }
 double FF::getArrCorrection()const{ return arrCorrection_; }
+void FF::setDNet(Net* n){ dNet_ = n; }
+void FF::setQNet(Net* n){ qNet_ = n; }
+Net* FF::getDNet()const{ return dNet_; }
+Net* FF::getQNet()const{ return qNet_; }
 
 double FF::getEffectiveSlack(){
     return getSlack() + bankingReleasedSlackD;
@@ -416,7 +422,8 @@ double FF::getSlack(){
         delta_hpwl += old_hpwl - new_hpwl;
     }
     // get new slack
-    double newSlack = cur_ff->getTimingSlack("D") + (delta_q) + FF::DisplacementDelay * delta_hpwl;
+    double newSlack = cur_ff->getTimingSlack("D") + (delta_q) + FF::DisplacementDelay * delta_hpwl
+                    + cur_ff->arrCorrection_;
     return newSlack;
 }
 
@@ -480,6 +487,10 @@ double FF::getAllSlack(){
 }
 
 double FF::getCost(){
+    static const double dpTnsScale = []{
+        const char* e = std::getenv("DP_TNS_SCALE");
+        return e ? std::atof(e) : 1.0;
+    }();
     double timingCost = 0;
     double areaCost = cell->getArea();
     double powerCost = cell->getGatePower();
@@ -492,5 +503,5 @@ double FF::getCost(){
             timingCost += slack < 0 ? -slack : 0;
         }
     }
-    return FF::alpha * timingCost + FF::beta * powerCost + FF::gamma * areaCost;
+    return dpTnsScale * FF::alpha * timingCost + FF::beta * powerCost + FF::gamma * areaCost;
 }

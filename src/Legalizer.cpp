@@ -488,14 +488,37 @@ bool Legalizer::canPlaceFootprint(const Coor &coor, Cell *cell){
 
 void Legalizer::Tetris(){
     DEBUG_LGZ("Start Legalize FF");
-    std::sort(ffs.begin(), ffs.end(), [](const Node *a, const Node *b){
-        double costA = a->getH() * a->getW();
-        double costB = b->getH() * b->getW();
-        if(costA != costB)
+    static const int lgSort = []{
+        const char* e = std::getenv("LG_SORT");
+        return e ? std::atoi(e) : 0;
+    }();
+    if(lgSort == 1){
+        std::sort(ffs.begin(), ffs.end(), [](const Node *a, const Node *b){
+            double tnsA = a->getTNS(), tnsB = b->getTNS();
+            if(tnsA != tnsB) return tnsA > tnsB;
+            double costA = a->getH() * a->getW();
+            double costB = b->getH() * b->getW();
             return costA > costB;
-        else
-            return a->getTNS() > b->getTNS();
-    });
+        });
+    } else if(lgSort == 2){
+        std::sort(ffs.begin(), ffs.end(), [](const Node *a, const Node *b){
+            double costA = a->getH() * a->getW();
+            double costB = b->getH() * b->getW();
+            double tnsA = a->getTNS(), tnsB = b->getTNS();
+            double scoreA = costA + 1e6 * tnsA;
+            double scoreB = costB + 1e6 * tnsB;
+            return scoreA > scoreB;
+        });
+    } else {
+        std::sort(ffs.begin(), ffs.end(), [](const Node *a, const Node *b){
+            double costA = a->getH() * a->getW();
+            double costB = b->getH() * b->getW();
+            if(costA != costB)
+                return costA > costB;
+            else
+                return a->getTNS() > b->getTNS();
+        });
+    }
 
     // start to legalize all ff
     size_t total = ffs.size();
@@ -733,7 +756,8 @@ void Legalizer::PredictFFLGPlace(const Coor &coor, Cell* cell, size_t row_idx, b
 
 
 double Legalizer::PlaceFF(Node *ff, size_t row_idx, bool &placeable){
-    double minDisplacement = ff->getDisplacement();
+    const Coor &gpC = ff->getGPCoor();
+    double minDisplacement = getDisplacement(gpC, ff->getLGCoor());
     const auto &subrows = rows[row_idx]->getSubrows();
     bool skip = false;
     bool rowCanPlace = false;
@@ -741,22 +765,21 @@ double Legalizer::PlaceFF(Node *ff, size_t row_idx, bool &placeable){
     for(size_t i = 0; i < subrows.size(); i++){
         const auto &subrow = subrows[i];
         if(subrow->hasCell(ff->getCell())) continue;
-        double alignedStartX = rows[row_idx]->getStartCoor().x + std::ceil((int)(subrow->getStartX() - rows[row_idx]->getStartCoor().x) / rows[row_idx]->getSiteWidth()) * rows[row_idx]->getSiteWidth(); 
+        double alignedStartX = rows[row_idx]->getStartCoor().x + std::ceil((int)(subrow->getStartX() - rows[row_idx]->getStartCoor().x) / rows[row_idx]->getSiteWidth()) * rows[row_idx]->getSiteWidth();
         bool subrowSkip = false;
         bool subrowCanPlace = false;
         for(int x = alignedStartX; x <= subrow->getEndX() && x != rows[row_idx]->getEndX(); x += rows[row_idx]->getSiteWidth()){
             Coor currCoor = Coor(x, rows[row_idx]->getStartCoor().y);
-            if(ff->getDisplacement(currCoor) > minDisplacement){
+            if(getDisplacement(gpC, currCoor) > minDisplacement){
                 subrowSkip = true;
                 skip = true;
                 Coor subrowEndCoor = Coor(subrow->getEndX(), rows[row_idx]->getStartCoor().y);
-                // If current subrow can't find better solution
-                if(ff->getDisplacement(subrowEndCoor) > minDisplacement) break;
+                if(getDisplacement(gpC, subrowEndCoor) > minDisplacement) break;
                 continue;
             }
             bool canPlace = ContinousAndEmpty(x, rows[row_idx]->getStartCoor().y, ff->getW(), ff->getH(), row_idx);
-            double displacement = ff->getDisplacement(currCoor);
-                
+            double displacement = getDisplacement(gpC, currCoor);
+
             if(canPlace){
                 rowCanPlace = true;
                 subrowCanPlace = true;
@@ -780,6 +803,9 @@ double Legalizer::PlaceFF(Node *ff, size_t row_idx, bool &placeable){
 
 
 double Legalizer::getDisplacement(const Coor &Coor1, const Coor &Coor2){
+    static const bool manhattan = std::getenv("LG_MANHATTAN") && std::atoi(std::getenv("LG_MANHATTAN"));
+    if(manhattan)
+        return std::abs(Coor1.x - Coor2.x) + std::abs(Coor1.y - Coor2.y);
     return std::sqrt(std::pow(Coor1.x - Coor2.x, 2) + std::pow(Coor1.y - Coor2.y, 2));
 } 
     

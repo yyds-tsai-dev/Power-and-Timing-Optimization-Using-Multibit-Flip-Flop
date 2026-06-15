@@ -52,10 +52,12 @@ public:
     void ClusterResult();
     void computePinTNS(const std::vector<FF*>& FFToBank, Cell* targetCell,
                        const Coor& placeCoor, double& oldTNS, double& newTNS,
-                       double* downstreamMargin = nullptr);
+                       double* downstreamMargin = nullptr,
+                       bool forceNetHPWL = false);
     Coor findWindowOptimal(const std::vector<FF*>& FFToBank, Cell* targetCell,
                            double xlo, double xhi, double ylo, double yhi);
     double CostCompare(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank);
+    double CostCompareNetHPWL(const Coor clusterCoor, Cell* chooseCell, std::vector<FF*> FFToBank);
     Coor ComputeOptimalPosition(Cell* chooseCell, const std::vector<FF*>& FFToBank);
     static double weightedMedian(std::vector<std::pair<double,double>>& coordWeights);
 

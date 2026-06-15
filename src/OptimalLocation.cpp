@@ -181,7 +181,13 @@ void preprocessObjFunction::getWeight(FF* cur_ff, std::vector<double>& weight){
 }
 
 postBankingObjFunction::postBankingObjFunction(Manager&mgr, std::unordered_map<std::string, FF*>& FF_list, std::unordered_map<string, int>& idx_map, int totalFF, std::vector<FF*>& FFs)
-    : objFunction(mgr, FF_list, idx_map, totalFF, FFs){
+    : objFunction(mgr, FF_list, idx_map, totalFF, FFs),
+      cgNetWeight_(std::getenv("CG_NET_WEIGHT") && std::atoi(std::getenv("CG_NET_WEIGHT"))),
+      cgWmax_(std::getenv("CG_WMAX") ? std::atof(std::getenv("CG_WMAX")) : 5.0),
+      cgP_(std::getenv("CG_P") ? std::atof(std::getenv("CG_P")) : 2.0),
+      cgBase_(std::getenv("CG_BASE") ? std::atof(std::getenv("CG_BASE")) : 0.0),
+      maxNegSlack_(0)
+{
     grad_ = std::vector<Coor>(FFs.size());
     for(size_t i=0;i<FFs.size();i++){
         size_t size = 0;
@@ -193,6 +199,8 @@ postBankingObjFunction::postBankingObjFunction(Manager&mgr, std::unordered_map<s
         y_pos[i] = std::vector<double>(size);
         y_neg[i] = std::vector<double>(size);
     }
+    if(cgNetWeight_)
+        computeMaxNegSlack();
 }
 
 postBankingObjFunction::~postBankingObjFunction(){
@@ -278,6 +286,14 @@ double postBankingObjFunction::forward(){
 }
 
 vector<Coor>& postBankingObjFunction::backward(int step, bool onlyNegative){
+    static const double rowPenalty = []{
+        const char* e = std::getenv("CG_ROW_PENALTY");
+        return e ? std::atof(e) : 0.0;
+    }();
+    const auto& prows = mgr.die.getPlacementRows();
+    const double rowStartY = prows.empty() ? 0 : prows[0].startCoor.y;
+    const double siteH = prows.empty() ? 1 : prows[0].siteHeight;
+
     for(size_t i=0;i<grad_.size();i++){
         grad_[i].x = 0;
         grad_[i].y = 0;
@@ -301,7 +317,7 @@ vector<Coor>& postBankingObjFunction::backward(int step, bool onlyNegative){
             Coor curCoor = cur_ff->physicalFF->getNewCoor() + cur_ff->physicalFF->getPinCoor("D" + cur_ff->getPhysicalPinName());
             if(cur_ff->getInputInstances().size() >= 1){
                 grad_[i].x += weight[curWeight] * ((exp(curCoor.x / gamma) / x_pos[i][net]) - (exp(-curCoor.x / gamma) / x_neg[i][net]));
-                grad_[i].y += weight[curWeight] * ((exp(curCoor.y / gamma) / y_pos[i][net]) - (exp(-curCoor.y / gamma) / y_neg[i][net]));   
+                grad_[i].y += weight[curWeight] * ((exp(curCoor.y / gamma) / y_pos[i][net]) - (exp(-curCoor.y / gamma) / y_neg[i][net]));
             }
             net++;
             curWeight++;
@@ -309,13 +325,38 @@ vector<Coor>& postBankingObjFunction::backward(int step, bool onlyNegative){
             curCoor = cur_ff->physicalFF->getNewCoor() + cur_ff->physicalFF->getPinCoor("Q" + cur_ff->getPhysicalPinName());
             for(size_t k=0;k<cur_ff->getNextStage().size();k++){
                 grad_[i].x += weight[curWeight] * ((exp(curCoor.x / gamma) / x_pos[i][net]) - (exp(-curCoor.x / gamma) / x_neg[i][net]));
-                grad_[i].y += weight[curWeight] * ((exp(curCoor.y / gamma) / y_pos[i][net]) - (exp(-curCoor.y / gamma) / y_neg[i][net])); 
+                grad_[i].y += weight[curWeight] * ((exp(curCoor.y / gamma) / y_pos[i][net]) - (exp(-curCoor.y / gamma) / y_neg[i][net]));
                 net++;
                 curWeight++;
             }
         }
+
+        if(rowPenalty > 0 && (grad_[i].x != 0 || grad_[i].y != 0)){
+            double y = MBFF->getNewCoor().y;
+            double cellH = MBFF->getCell()->getH();
+            double nearestK = std::round((y - rowStartY) / siteH);
+            double nearestRowY = rowStartY + nearestK * siteH;
+            double dy = (y - nearestRowY) / cellH;
+            grad_[i].y += rowPenalty * 2.0 * dy;
+        }
     }
     return grad_;
+}
+
+void postBankingObjFunction::computeMaxNegSlack(){
+    maxNegSlack_ = 0;
+    for(size_t i = 0; i < FFs.size(); i++){
+        FF* MBFF = FFs[i];
+        for(auto cur_ff : MBFF->getClusterFF()){
+            double s = cur_ff->physicalFF->getTimingSlack("D" + cur_ff->getPhysicalPinName());
+            if(s < maxNegSlack_) maxNegSlack_ = s;
+            for(auto& ns : cur_ff->getNextStage()){
+                double ds = ns.ff->physicalFF->getTimingSlack("D" + ns.ff->getPhysicalPinName());
+                if(ds < maxNegSlack_) maxNegSlack_ = ds;
+            }
+        }
+    }
+    if(maxNegSlack_ >= 0) maxNegSlack_ = -1;
 }
 
 void postBankingObjFunction::getWeight(FF* MBFF, std::vector<double>& weight){
@@ -361,6 +402,27 @@ void postBankingObjFunction::getWeight(FF* MBFF, std::vector<double>& weight){
     if(!hasNegative){
         for(size_t i=0;i<weight.size();i++)
             weight[i] = 0;
+    }
+    if(cgNetWeight_ && hasNegative){
+        double maxCrit = 0;
+        for(auto cur_ff : MBFF->getClusterFF()){
+            double s = cur_ff->physicalFF->getTimingSlack("D" + cur_ff->getPhysicalPinName());
+            double c = std::max(0.0, s / maxNegSlack_);
+            if(c > maxCrit) maxCrit = c;
+            for(auto& ns : cur_ff->getNextStage()){
+                double ds = ns.ff->physicalFF->getTimingSlack("D" + ns.ff->getPhysicalPinName());
+                double dc = std::max(0.0, ds / maxNegSlack_);
+                if(dc > maxCrit) maxCrit = dc;
+            }
+        }
+        double scale = 1.0 + cgWmax_ * std::pow(maxCrit, cgP_);
+        for(size_t i=0;i<weight.size();i++)
+            weight[i] *= scale;
+    }
+    if(cgNetWeight_ && !hasNegative && cgBase_ > 0){
+        double uniform = cgBase_ / weight.size();
+        for(size_t i=0;i<weight.size();i++)
+            weight[i] = uniform;
     }
 }
 

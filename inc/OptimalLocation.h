@@ -34,8 +34,15 @@ class preprocessObjFunction : public objFunction{
 };
 
 class postBankingObjFunction : public objFunction{
+    private:
+        bool   cgNetWeight_;
+        double cgWmax_;
+        double cgP_;
+        double cgBase_;
+        double maxNegSlack_;
+        void computeMaxNegSlack();
     public:
-        postBankingObjFunction(Manager&mgr, std::unordered_map<std::string, FF*>& FF_list, 
+        postBankingObjFunction(Manager&mgr, std::unordered_map<std::string, FF*>& FF_list,
                             std::unordered_map<string, int>& idx_map, int totalFF, std::vector<FF*>& FFs);
         ~postBankingObjFunction();
         double forward() override;
