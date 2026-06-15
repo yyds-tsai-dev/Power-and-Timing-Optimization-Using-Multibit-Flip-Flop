@@ -10,7 +10,7 @@
 
 ### Best Results vs NTU (ICCAD 2024 Contest Winner)
 
-> **Current best** = HEAD on branch `main` (Adaptive MATCH_K + DP_SLOT_ASSIGN=2+INTRA_ONLY + GS_K=8 + Adaptive DIST_BONUS + Per-pin CostCompare + LEMON matching). Run: `BANKING_MODE=matching PRODUCTION=1`.
+> **Current best** = branch `v3_experimental` with the post-legalization faithful-metric refinement: base banking (Adaptive MATCH_K + DP_SLOT_ASSIGN=2+INTRA_ONLY + GS_K=8 + Adaptive DIST_BONUS + Per-pin CostCompare + LEMON matching) **plus** the incremental-STA-scored refinement pipeline RELOC + CRIT_SWAP + BIT_REPAIR with cone-disjoint dynasearch. Run: `BANKING_MODE=matching PRODUCTION=1 INCR_RELOC=1 RELOC=1 CRIT_SWAP=1 BIT_REPAIR=1 BIT_REPAIR_DYNA=1` (+ per-stage budgets). All refinement gates are default-off (byte-exact); the base-only `BANKING_MODE=matching PRODUCTION=1` run reproduces the pre-refinement numbers.
 > NTU reference scores from the ICCAD 2024 winner's LBR paper (Cheng-Yen Li, NTU).
 > **Lower = better. Bold = beats NTU.**
 
