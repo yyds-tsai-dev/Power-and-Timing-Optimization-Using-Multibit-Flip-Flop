@@ -27,6 +27,17 @@ public:
     bool ready() const { return built; }
     int  totalViolations() const { return curViolations; }
 
+    // Read-only geometry / state accessors (density repair pass)
+    double binW() const { return BinW; }
+    double binH() const { return BinH; }
+    double dieX() const { return DieStartX; }
+    double dieY() const { return DieStartY; }
+    int    nx()   const { return numBinsX; }
+    int    ny()   const { return numBinsY; }
+    bool   violating(int bx, int by) const { return built && binAreas[bx][by] > maxArea; }
+    double areaOf(int bx, int by)    const { return binAreas[bx][by]; }
+    double capArea() const { return maxArea; }
+
     // Hypothetical Δviolations if we removed all `removedFFs` from FF_Map and
     // added a single new MBFF of `newCell` at `newCoor`. Pure read-only.
     // Returns positive if MORE violations would result.

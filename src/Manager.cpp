@@ -3076,10 +3076,11 @@ void Manager::timingDrivenRelocation(){
     std::vector<Candidate> cands;
     cands.reserve(FF_Map.size());
 
+    static const bool relocAllFF = std::getenv("REFINE_ALLFF") && std::atoi(std::getenv("REFINE_ALLFF"));
     for(auto& fp : FF_Map){
         FF* mbff = fp.second;
         if(mbff->getCell()->getBits() <= 1) continue;
-        if(!mbff->getIsLegalize()) continue;
+        if(!relocAllFF && !mbff->getIsLegalize()) continue;
 
         double worstSlack = 0;
         double wx = 0, wy = 0, wsum = 0;
@@ -3206,7 +3207,8 @@ void Manager::criticalPathSwapRefine(){
     // Physical FFs that are placed (one entry per physical instance in FF_Map).
     std::vector<FF*> phys;
     phys.reserve(FF_Map.size());
-    for(auto& kv : FF_Map) if(kv.second && kv.second->getIsLegalize()) phys.push_back(kv.second);
+    bool csAllFF = std::getenv("REFINE_ALLFF") && std::atoi(std::getenv("REFINE_ALLFF"));
+    for(auto& kv : FF_Map) if(kv.second && (csAllFF || kv.second->getIsLegalize())) phys.push_back(kv.second);
     // determinism: stable candidate order independent of FF_Map hash order
     std::sort(phys.begin(), phys.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
 
@@ -3453,6 +3455,17 @@ void Manager::bitRepairRefine(){
     // batch apply per round. 0 = off (legacy serial greedy). Throughput >> serial (parallel +
     // 1 cone-walk/candidate vs 4); descent identical class of moves, far more per wall-second.
     int    dyna      = []{ const char* e=std::getenv("BIT_REPAIR_DYNA"); return e?std::atoi(e):0; }();
+    // Batch-apply throughput mode for the dynasearch engines. 0 = legacy greedy
+    // aff-disjoint apply (byte-exact). The legacy filter drops every improving candidate
+    // whose affected-FF set overlaps an earlier apply this round (~90% of candidates),
+    // even though each candidate is re-priced by evalBitSwapDelta against the CURRENT
+    // committed state right before apply — overlap cannot make that delta stale.
+    //  1 = serial exact-repricing apply: keep the per-candidate re-verify, drop the
+    //      aff-disjointness skip. Same per-round cost, ~10x more applies per round.
+    //  2 = sub-batch parallel repricing: conflicted candidates stay alive and are
+    //      re-priced in PARALLEL (OMP) between aff-disjoint sub-batches; every improving
+    //      candidate is either applied or proven non-improving.
+    int    batchMode = []{ const char* e=std::getenv("BIT_REPAIR_BATCH"); return e?std::atoi(e):0; }();
     double eps = 1e-9;
     int validateEvery = 0;
     if(const char* e = std::getenv("INCR_VALIDATE")) validateEvery = std::atoi(e);
@@ -3465,9 +3478,13 @@ void Manager::bitRepairRefine(){
     { double full = computeAccurateTNS();
       std::cerr << "[BIT_REPAIR] baseTNS=" << std::fixed << baseAcc << " full=" << full << " diff=" << (baseAcc-full) << "\n"; }
 
+    // REFINE_ALLFF=1: drop the getIsLegalize() candidate filter. That flag is Banking's
+    // "skip in Legalize stage" marker, NOT placement liveness — FFs placed by the final
+    // Legalizer keep it false forever, silently excluding them (hc02: 32% of physicals).
+    bool allff = std::getenv("REFINE_ALLFF") && std::atoi(std::getenv("REFINE_ALLFF"));
     std::vector<FF*> mb;
     for(auto& kv : FF_Map)
-        if(kv.second && kv.second->getIsLegalize() && !kv.second->getFixed() && kv.second->getCell()->getBits() > 1) mb.push_back(kv.second);
+        if(kv.second && (allff || kv.second->getIsLegalize()) && !kv.second->getFixed() && kv.second->getCell()->getBits() > 1) mb.push_back(kv.second);
     // determinism: stable candidate order independent of FF_Map hash order
     std::sort(mb.begin(), mb.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
 
@@ -3519,20 +3536,75 @@ void Manager::bitRepairRefine(){
                 if(a.ia!=b.ia) return a.ia<b.ia; if(a.ib!=b.ib) return a.ib<b.ib;
                 if(a.sa!=b.sa) return a.sa<b.sa; return a.sb<b.sb; });
             std::unordered_set<int> usedMB; std::unordered_set<FF*> usedFF; std::vector<int> markDirty; long applied=0;
-            for(auto& c : cands){
-                if(usedMB.count(c.ia) || usedMB.count(c.ib)) continue;
-                FF* A=mb[c.ia]; FF* B=mb[c.ib]; std::vector<FF*> aff;
-                double d=evalBitSwapDelta(A,c.sa,B,c.sb,nullptr,&aff);
-                if(d>=-eps){ dirty[c.ia]=1; continue; }
-                bool conflict=false; for(FF* f: aff) if(usedFF.count(f)){ conflict=true; break; }
-                if(conflict) continue;
-                FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
-                A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
-                usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: aff) usedFF.insert(f);
-                applied++;
-                markDirty.push_back(c.ia); markDirty.push_back(c.ib);
-                for(FF* f: aff){ auto it=mbIdx.find(f->getPhysicalFF()); if(it!=mbIdx.end()) markDirty.push_back(it->second); }
+            if(batchMode==0){
+                for(auto& c : cands){
+                    if(usedMB.count(c.ia) || usedMB.count(c.ib)) continue;
+                    FF* A=mb[c.ia]; FF* B=mb[c.ib]; std::vector<FF*> aff;
+                    double d=evalBitSwapDelta(A,c.sa,B,c.sb,nullptr,&aff);
+                    if(d>=-eps){ dirty[c.ia]=1; continue; }
+                    bool conflict=false; for(FF* f: aff) if(usedFF.count(f)){ conflict=true; break; }
+                    if(conflict) continue;
+                    FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
+                    A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
+                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: aff) usedFF.insert(f);
+                    applied++;
+                    markDirty.push_back(c.ia); markDirty.push_back(c.ib);
+                    for(FF* f: aff){ auto it=mbIdx.find(f->getPhysicalFF()); if(it!=mbIdx.end()) markDirty.push_back(it->second); }
+                }
+            } else if(batchMode==1){
+                // serial exact-repricing apply: d is exact vs the current committed state,
+                // so no aff-disjointness skip; aff only feeds dirty propagation.
+                for(auto& c : cands){
+                    if(usedMB.count(c.ia) || usedMB.count(c.ib)) continue;
+                    FF* A=mb[c.ia]; FF* B=mb[c.ib]; std::vector<FF*> aff;
+                    double d=evalBitSwapDelta(A,c.sa,B,c.sb,nullptr,&aff);
+                    if(d>=-eps){ dirty[c.ia]=1; continue; }
+                    FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
+                    A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
+                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    usedMB.insert(c.ia); usedMB.insert(c.ib);
+                    applied++;
+                    markDirty.push_back(c.ia); markDirty.push_back(c.ib);
+                    for(FF* f: aff){ auto it=mbIdx.find(f->getPhysicalFF()); if(it!=mbIdx.end()) markDirty.push_back(it->second); }
+                }
+            } else {
+                // sub-batch parallel repricing: within a sub-batch applies are aff-disjoint
+                // (deltas exact vs sub-batch-start state); conflicted candidates survive and
+                // are re-priced in parallel against the new committed state.
+                int M=(int)cands.size();
+                std::vector<char> alive(M,1);
+                std::vector<double> rd(M,0.0);
+                std::vector<std::vector<FF*>> raff(M);
+                while(true){
+                    #pragma omp parallel for schedule(dynamic,16)
+                    for(int ci=0;ci<M;ci++){
+                        if(!alive[ci]) continue;
+                        const Cand& c=cands[ci];
+                        if(usedMB.count(c.ia)||usedMB.count(c.ib)) continue;  // usedMB frozen during this loop
+                        raff[ci].clear();
+                        rd[ci]=evalBitSwapDelta(mb[c.ia],c.sa,mb[c.ib],c.sb,nullptr,&raff[ci]);
+                    }
+                    long appliedThis=0;
+                    std::unordered_set<FF*> batchFF;
+                    for(int ci=0;ci<M;ci++){
+                        if(!alive[ci]) continue;
+                        const Cand& c=cands[ci];
+                        if(usedMB.count(c.ia)||usedMB.count(c.ib)){ alive[ci]=0; continue; }
+                        if(rd[ci]>=-eps){ alive[ci]=0; dirty[c.ia]=1; continue; }
+                        bool conflict=false; for(FF* f: raff[ci]) if(batchFF.count(f)){ conflict=true; break; }
+                        if(conflict) continue;  // stays alive; re-priced next sub-batch
+                        FF* A=mb[c.ia]; FF* B=mb[c.ib];
+                        FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
+                        A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
+                        incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                        usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: raff[ci]) batchFF.insert(f);
+                        alive[ci]=0; appliedThis++; applied++;
+                        markDirty.push_back(c.ia); markDirty.push_back(c.ib);
+                        for(FF* f: raff[ci]){ auto it=mbIdx.find(f->getPhysicalFF()); if(it!=mbIdx.end()) markDirty.push_back(it->second); }
+                    }
+                    if(appliedThis==0 || elapsed()>timeBudget) break;
+                }
             }
             // dirty propagation: swapped MBFFs + affected FFs' MBFFs (markDirty) + spatial neighbors
             // of swapped MBFFs + any MBFF whose current best-swap TARGETS a swapped MBFF (reverse).
@@ -3617,19 +3689,67 @@ void Manager::bitRepairRefine(){
             // greedy cone-disjoint batch apply (affected-FF + MBFF disjoint => deltas additive)
             std::unordered_set<int> usedMB; std::unordered_set<FF*> usedFF;
             long applied=0;
-            for(auto& c : cands){
-                if(usedMB.count(c.ia) || usedMB.count(c.ib)) continue;
-                FF* A=mb[c.ia]; FF* B=mb[c.ib];
-                std::vector<FF*> aff;
-                double d=evalBitSwapDelta(A,c.sa,B,c.sb,nullptr,&aff);
-                if(d>=-eps) continue;
-                bool conflict=false; for(FF* f : aff) if(usedFF.count(f)){ conflict=true; break; }
-                if(conflict) continue;
-                FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
-                A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
-                usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f : aff) usedFF.insert(f);
-                applied++;
+            if(batchMode==0){
+                for(auto& c : cands){
+                    if(usedMB.count(c.ia) || usedMB.count(c.ib)) continue;
+                    FF* A=mb[c.ia]; FF* B=mb[c.ib];
+                    std::vector<FF*> aff;
+                    double d=evalBitSwapDelta(A,c.sa,B,c.sb,nullptr,&aff);
+                    if(d>=-eps) continue;
+                    bool conflict=false; for(FF* f : aff) if(usedFF.count(f)){ conflict=true; break; }
+                    if(conflict) continue;
+                    FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
+                    A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
+                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f : aff) usedFF.insert(f);
+                    applied++;
+                }
+            } else if(batchMode==1){
+                // serial exact-repricing apply (see batchMode doc above): no aff-disjoint skip
+                for(auto& c : cands){
+                    if(usedMB.count(c.ia) || usedMB.count(c.ib)) continue;
+                    FF* A=mb[c.ia]; FF* B=mb[c.ib];
+                    double d=evalBitSwapDelta(A,c.sa,B,c.sb);
+                    if(d>=-eps) continue;
+                    FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
+                    A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
+                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    usedMB.insert(c.ia); usedMB.insert(c.ib);
+                    applied++;
+                }
+            } else {
+                // sub-batch parallel repricing (see batchMode doc above)
+                int M=(int)cands.size();
+                std::vector<char> alive(M,1);
+                std::vector<double> rd(M,0.0);
+                std::vector<std::vector<FF*>> raff(M);
+                while(true){
+                    #pragma omp parallel for schedule(dynamic,16)
+                    for(int ci=0;ci<M;ci++){
+                        if(!alive[ci]) continue;
+                        const Cand& c=cands[ci];
+                        if(usedMB.count(c.ia)||usedMB.count(c.ib)) continue;
+                        raff[ci].clear();
+                        rd[ci]=evalBitSwapDelta(mb[c.ia],c.sa,mb[c.ib],c.sb,nullptr,&raff[ci]);
+                    }
+                    long appliedThis=0;
+                    std::unordered_set<FF*> batchFF;
+                    for(int ci=0;ci<M;ci++){
+                        if(!alive[ci]) continue;
+                        const Cand& c=cands[ci];
+                        if(usedMB.count(c.ia)||usedMB.count(c.ib)){ alive[ci]=0; continue; }
+                        if(rd[ci]>=-eps){ alive[ci]=0; continue; }
+                        bool conflict=false; for(FF* f: raff[ci]) if(batchFF.count(f)){ conflict=true; break; }
+                        if(conflict) continue;
+                        FF* A=mb[c.ia]; FF* B=mb[c.ib];
+                        FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
+                        A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
+                        incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                        usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: raff[ci]) batchFF.insert(f);
+                        alive[ci]=0; appliedThis++; applied++;
+                    }
+                    if(appliedThis==0 || elapsed()>timeBudget) break;
+                }
             }
             baseAcc = incrTNS_; total += applied;
             std::cerr << "[BIT_REPAIR] dyna round=" << round << " applied=" << applied << " cands=" << cands.size()
@@ -3853,6 +3973,277 @@ Manager::EGRUndoEntry Manager::debankWithUndo(FF* mbff){
     Cell* oneBitCell = Bit_FF_Map[1][0];
     entry.freedFFs = debankFF(mbff, oneBitCell);
     return entry;
+}
+
+// ==================== Oracle-Priced Structural Rebanking ====================
+// Post-LG structural moves the bit-swap engine cannot express: merge two 2-bit MBFFs
+// into one 4-bit (mode 1) and consolidate four 1-bit FFs into one 4-bit (mode 2).
+// Historical rebanking attempts (MATCH_HIGHER_BIT, unbankRebank) cascaded because the
+// crude 1-hop model committed mispriced merges. Here every move is TRIAL-APPLIED via
+// bankFF_deferred (FF_Map untouched until finalize), priced exactly — dTNS by the
+// incremental-STA oracle, dPower/dArea from the lib, dViolations by BinDensityTable —
+// and committed only if alpha*dTNS + beta*dP + gamma*dA + lambda*dViol < 0, strictly
+// monotone, else rolled back exactly. FindPlace failure = reject (never overlap).
+// Gate: ORACLE_REBANK=1 (requires INCR_RELOC=1). Default off, byte-exact.
+void Manager::oracleRebankRefine(){
+    double timeBudget = []{ const char* e=std::getenv("REBANK_TIME");   return e?std::atof(e):120.0; }();
+    int    K          = []{ const char* e=std::getenv("REBANK_K");      return e?std::atoi(e):8;     }();
+    int    maxRounds  = []{ const char* e=std::getenv("REBANK_ROUNDS"); return e?std::atoi(e):10;    }();
+    int    modes      = []{ const char* e=std::getenv("REBANK_MODES");  return e?std::atoi(e):3;     }();
+    bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
+    if(!incr){ std::cerr << "[REBANK] skipped (needs INCR_RELOC=1)\n"; return; }
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-t0).count(); };
+
+    incrAccurateBuild();
+    double curTNS = incrTNS_;
+    if(!binTable.ready()){ binTable.invalidate(); binTable.build(*this); }
+
+    auto bestCellOf = [&](int bits)->Cell*{
+        auto it = Bit_FF_Map.find(bits);
+        if(it==Bit_FF_Map.end() || it->second.empty()) return nullptr;
+        return it->second[0];      // sorted by libScoring score
+    };
+    Cell* best4 = bestCellOf(4);
+    auto wcost = [&](Cell* c){ return beta*c->getGatePower() + gamma*c->getArea(); };
+
+    long accTotal=0, triedTotal=0;
+    for(int round=0; round<maxRounds && elapsed()<timeBudget; round++){
+        long accepted=0;
+        // ---- candidate pools, deterministic order ----
+        // NOTE: no getIsLegalize() filter — that flag is Banking's "skip in Legalize stage"
+        // work-queue marker, NOT a placement-liveness bit: every FF placed by the final
+        // Legalizer keeps it false forever (hc02: 32% of physicals). Post-DP, FF_Map
+        // membership IS the placement truth (the dump/checkers prove it every run).
+        std::vector<FF*> src2, src1;
+        for(auto& kv : FF_Map){
+            FF* f=kv.second;
+            if(!f || f->getFixed()) continue;
+            int b=f->getCell()->getBits();
+            if(b==2 && (int)f->getClusterFF().size()==2) src2.push_back(f);
+            else if(b==1 && (int)f->getClusterFF().size()==1) src1.push_back(f);
+        }
+        auto byName=[](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); };
+        std::sort(src2.begin(), src2.end(), byName);
+        std::sort(src1.begin(), src1.end(), byName);
+        if(round==0){
+            std::unordered_set<int> clks2; for(FF* f : src2) clks2.insert(f->getClkIdx());
+            std::cerr << "[REBANK] pools: src2=" << src2.size() << " (clks=" << clks2.size()
+                      << ") src1=" << src1.size() << " best4=" << (best4?best4->getCellName():"NONE");
+            if(best4 && !src2.empty())
+                std::cerr << " wc4=" << wcost(best4) << " wc2x2=" << 2*wcost(src2[0]->getCell());
+            std::cerr << "\n";
+        }
+
+        // one merge attempt: trial-apply {group} -> tgtCell near centroid, exact price, keep or revert
+        auto tryMerge = [&](std::vector<FF*>& group, Cell* tgt)->bool{
+            double cx=0, cy=0, dPA = wcost(tgt);
+            std::vector<Coor> oldPos(group.size());
+            std::vector<BinDensityTable::Rect> oldRects(group.size());
+            for(size_t g=0; g<group.size(); g++){
+                FF* f=group[g]; oldPos[g]=f->getNewCoor();
+                oldRects[g]={oldPos[g].x, oldPos[g].y, (double)f->getW(), (double)f->getH()};
+                cx+=oldPos[g].x; cy+=oldPos[g].y; dPA -= wcost(f->getCell());
+            }
+            if(dPA >= 0) return false;   // no structural saving => oracle TNS cost can't be paid back
+            triedTotal++;
+            for(size_t g=0; g<group.size(); g++){
+                legalizer->FreeRect(oldPos[g], group[g]->getCell()->getW(), group[g]->getCell()->getH());
+                legalizer->RemoveNodeByFFPtr(group[g]);
+            }
+            Coor place = legalizer->FindPlace(Coor(cx/group.size(), cy/group.size()), tgt);
+            if(place.x==DBL_MAX){
+                for(FF* f : group) legalizer->UpdateRows(f);
+                return false;
+            }
+            int dv = binTable.estimateViolationDelta(group, place, tgt);
+            BankUndo undo;
+            FF* nf = bankFF_deferred(place, tgt, group, undo);
+            double newTNS = incrAccurateRecomputeFF(nf);
+            double delta = alpha*(newTNS-curTNS) + dPA + lambda*dv;
+            if(delta < -1e-9){
+                commitFinalizeBank(undo);                       // recycles group pointers — rects pre-snapshotted
+                nf->setIsLegalize(true);
+                legalizer->UpdateRows(nf);
+                binTable.applyMutation(oldRects, {{place.x, place.y, tgt->getW(), tgt->getH()}});
+                curTNS = newTNS;
+                return true;
+            }
+            rollbackBank(undo);
+            for(FF* f : group){ incrAccurateRecomputeFF(f); legalizer->UpdateRows(f); }
+            incrTNS_ = curTNS;                                  // pin exactly (determinism)
+            return false;
+        };
+
+        // ---- mode 1: 2b + 2b -> 4b ----
+        if((modes&1) && best4 && src2.size()>=2){
+            std::unordered_map<int, CSRTree> trees;   // per clkIdx
+            for(size_t i=0;i<src2.size();i++){ Coor c=src2[i]->getNewCoor(); trees[src2[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
+            std::vector<char> consumed(src2.size(),0);
+            for(size_t i=0;i<src2.size() && elapsed()<timeBudget;i++){
+                if(consumed[i]) continue;
+                FF* A=src2[i]; Coor pA=A->getNewCoor();
+                std::vector<CSPointID> nr; trees[A->getClkIdx()].query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+1), std::back_inserter(nr));
+                // deterministic neighbor order: by distance then index
+                std::sort(nr.begin(), nr.end(), [&](const CSPointID&a, const CSPointID&b){
+                    double da=std::abs(a.first.get<0>()-pA.x)+std::abs(a.first.get<1>()-pA.y);
+                    double db=std::abs(b.first.get<0>()-pA.x)+std::abs(b.first.get<1>()-pA.y);
+                    if(da!=db) return da<db; return a.second<b.second; });
+                for(auto& nb : nr){
+                    int j=nb.second;
+                    if(j==(int)i || consumed[j]) continue;
+                    std::vector<FF*> group = {A, src2[j]};
+                    if(tryMerge(group, best4)){ consumed[i]=1; consumed[j]=1; accepted++; break; }
+                }
+            }
+        }
+
+        // ---- mode 2: 4 x 1b -> 4b ----
+        if((modes&2) && best4 && src1.size()>=4){
+            std::unordered_map<int, CSRTree> trees;
+            for(size_t i=0;i<src1.size();i++){ Coor c=src1[i]->getNewCoor(); trees[src1[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
+            std::vector<char> consumed(src1.size(),0);
+            for(size_t i=0;i<src1.size() && elapsed()<timeBudget;i++){
+                if(consumed[i]) continue;
+                FF* A=src1[i]; Coor pA=A->getNewCoor();
+                std::vector<CSPointID> nr; trees[A->getClkIdx()].query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+3), std::back_inserter(nr));
+                std::sort(nr.begin(), nr.end(), [&](const CSPointID&a, const CSPointID&b){
+                    double da=std::abs(a.first.get<0>()-pA.x)+std::abs(a.first.get<1>()-pA.y);
+                    double db=std::abs(b.first.get<0>()-pA.x)+std::abs(b.first.get<1>()-pA.y);
+                    if(da!=db) return da<db; return a.second<b.second; });
+                std::vector<FF*> group = {A}; std::vector<int> gidx = {(int)i};
+                for(auto& nb : nr){
+                    int j=nb.second;
+                    if(j==(int)i || consumed[j]) continue;
+                    group.push_back(src1[j]); gidx.push_back(j);
+                    if(group.size()==4) break;
+                }
+                if(group.size()!=4) continue;
+                if(tryMerge(group, best4)){ for(int g : gidx) consumed[g]=1; accepted++; }
+            }
+        }
+
+        accTotal += accepted;
+        std::cerr << "[REBANK] round=" << round << " accepted=" << accepted
+                  << " tried=" << triedTotal << " TNS=" << std::fixed << curTNS
+                  << " elapsed=" << elapsed() << "s\n";
+        if(accepted==0) break;
+    }
+    std::cerr << "[REBANK] total accepted=" << accTotal << " tried=" << triedTotal
+              << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << elapsed() << "s\n";
+}
+
+// ==================== Bin-Density Repair Refinement ====================
+// The density term of the score — lambda x #violating bins — is invisible to every other
+// refinement operator: RELOC prices pure TNS and can move an MBFF into an over-utilized
+// bin, silently buying a lambda penalty larger than its TNS gain; banking's bin pricing
+// ends at legalization. This pass runs after the ALT loop: for each violating bin it
+// evicts FFs to nearby legal sites outside the bin, priced jointly and exactly — dTNS by
+// the incremental-STA oracle, dViolations by BinDensityTable. A per-bin eviction chain is
+// committed only if alpha*dTNS_chain + lambda*dViol < 0, else fully reverted.
+// Gate: DENSITY_REPAIR=1 (requires INCR_RELOC=1 for the oracle). Default off, byte-exact.
+void Manager::densityRepairRefine(){
+    double timeBudget = []{ const char* e=std::getenv("DENSITY_REPAIR_TIME"); return e?std::atof(e):60.0; }();
+    bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
+    if(!incr){ std::cerr << "[DENSITY] skipped (needs INCR_RELOC=1)\n"; return; }
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-t0).count(); };
+
+    binTable.invalidate();
+    binTable.build(*this);
+    if(binTable.totalViolations()==0){ std::cerr << "[DENSITY] no violating bins\n"; return; }
+    incrAccurateBuild();
+    double curTNS = incrTNS_;
+
+    const double BW=binTable.binW(), BH=binTable.binH(), DX=binTable.dieX(), DY=binTable.dieY();
+    std::vector<std::pair<int,int>> viols;
+    for(int bx=0;bx<binTable.nx();bx++) for(int by=0;by<binTable.ny();by++)
+        if(binTable.violating(bx,by)) viols.push_back({bx,by});
+    std::cerr << "[DENSITY] violating bins=" << viols.size() << " lambda=" << lambda
+              << " baseTNS=" << std::fixed << curTNS << "\n";
+
+    long evicted=0, chainsCommitted=0; int violFixed=0;
+    for(auto& vb : viols){
+        if(elapsed()>timeBudget) break;
+        if(!binTable.violating(vb.first, vb.second)) continue;   // already fixed as a side effect
+        double binLx = DX + vb.first*BW, binLy = DY + vb.second*BH;
+        double binRx = binLx + BW,       binRy = binLy + BH;
+
+        // movable FFs overlapping this bin, largest overlap first (deterministic order)
+        std::vector<std::pair<double,FF*>> cand;
+        double ffOverlapSum = 0;
+        for(auto& kv : FF_Map){
+            FF* ff = kv.second;
+            if(!ff || ff->getFixed()) continue;   // isLegalize is a Banking work-queue marker, not liveness
+            Coor c = ff->getNewCoor();
+            double ox = std::min(binRx, c.x+ff->getW()) - std::max(binLx, c.x);
+            double oy = std::min(binRy, c.y+ff->getH()) - std::max(binLy, c.y);
+            if(ox>0 && oy>0){ cand.push_back({ox*oy, ff}); ffOverlapSum += ox*oy; }
+        }
+        // infeasible bin: even evicting every FF cannot reach the cap (gate area dominates)
+        if(binTable.areaOf(vb.first,vb.second) - ffOverlapSum > binTable.capArea()) continue;
+        std::sort(cand.begin(), cand.end(), [](const std::pair<double,FF*>&a, const std::pair<double,FF*>&b){
+            if(a.first!=b.first) return a.first>b.first;
+            return a.second->getInstanceName() < b.second->getInstanceName(); });
+
+        struct Undo { FF* ff; Coor oldPos; Coor newPos; };
+        std::vector<Undo> chain;
+        int    violBase = binTable.totalViolations();
+        double tnsBase  = curTNS;
+
+        for(auto& pr : cand){
+            if(elapsed()>timeBudget) break;
+            if(!binTable.violating(vb.first, vb.second)) break;  // bin fixed, chain done
+            FF* ff = pr.second; Coor oldPos = ff->getNewCoor();
+            double w = ff->getCell()->getW(), h = ff->getCell()->getH();
+            legalizer->FreeRect(oldPos, w, h);
+            legalizer->RemoveNodeByFFPtr(ff);
+            // escape targets just outside the bin (L,R,D,U); FindPlace snaps to legal sites
+            Coor tgts[4] = { Coor(binLx - w, oldPos.y), Coor(binRx, oldPos.y),
+                             Coor(oldPos.x, binLy - h), Coor(oldPos.x, binRy) };
+            bool has=false; double bestCost=0, bestDT=0; Coor bestPos = oldPos;
+            for(int t=0;t<4;t++){
+                Coor p = legalizer->FindPlace(tgts[t], ff->getCell());
+                if(p.x==DBL_MAX) continue;
+                if(p.x==oldPos.x && p.y==oldPos.y) continue;
+                int dv = binTable.estimateViolationDelta({ff}, p, ff->getCell());
+                ff->setNewCoor(p); double nt = incrAccurateRecomputeFF(ff);
+                double dt = nt - curTNS;
+                ff->setNewCoor(oldPos); incrAccurateRecomputeFF(ff); incrTNS_ = curTNS;  // exact restore
+                double cost = alpha*dt + lambda*dv;
+                if(!has || cost < bestCost - 1e-12){ has=true; bestCost=cost; bestDT=dt; bestPos=p; }
+            }
+            // guard: a chain whose TNS bill already exceeds the recoverable penalty can't win
+            if(!has || alpha*((curTNS - tnsBase) + bestDT) > lambda*1.5){
+                ff->setNewCoor(oldPos); ff->setCoor(oldPos); legalizer->UpdateRows(ff);
+                continue;
+            }
+            ff->setNewCoor(bestPos); ff->setCoor(bestPos); legalizer->UpdateRows(ff);
+            curTNS = incrAccurateRecomputeFF(ff);
+            binTable.applyMutation({{oldPos.x,oldPos.y,w,h}}, {{bestPos.x,bestPos.y,w,h}});
+            chain.push_back({ff, oldPos, bestPos});
+        }
+        int dViol = binTable.totalViolations() - violBase;
+        bool commit = !chain.empty() && (alpha*(curTNS - tnsBase) + lambda*dViol < -1e-9);
+        if(commit){
+            chainsCommitted++; evicted += (long)chain.size(); if(dViol<0) violFixed += -dViol;
+        } else {
+            for(int i=(int)chain.size()-1;i>=0;i--){
+                FF* ff = chain[i].ff; double w=ff->getCell()->getW(), h=ff->getCell()->getH();
+                legalizer->FreeRect(chain[i].newPos, w, h);
+                legalizer->RemoveNodeByFFPtr(ff);
+                ff->setNewCoor(chain[i].oldPos); ff->setCoor(chain[i].oldPos);
+                legalizer->UpdateRows(ff);
+                incrAccurateRecomputeFF(ff);
+                binTable.applyMutation({{chain[i].newPos.x,chain[i].newPos.y,w,h}},
+                                       {{chain[i].oldPos.x,chain[i].oldPos.y,w,h}});
+            }
+            incrTNS_ = tnsBase; curTNS = tnsBase;   // pin exactly (determinism)
+        }
+    }
+    std::cerr << "[DENSITY] chains=" << chainsCommitted << " evicted=" << evicted
+              << " violFixed=" << violFixed << " remaining=" << binTable.totalViolations()
+              << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << elapsed() << "s\n";
 }
 
 void Manager::reLegalizeFreedFFs(EGRUndoEntry& entry){

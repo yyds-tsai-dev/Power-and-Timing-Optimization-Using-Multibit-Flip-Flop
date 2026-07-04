@@ -126,8 +126,12 @@ int main(int argc, char *argv[]){
                 STAGE("critSwapRefine", mgr.criticalPathSwapRefine());
             if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR")))
                 STAGE("bitRepair", mgr.bitRepairRefine());
+            if(std::getenv("ORACLE_REBANK") && std::atoi(std::getenv("ORACLE_REBANK")))
+                STAGE("oracleRebank", mgr.oracleRebankRefine());
         }
     }
+    if(std::getenv("DENSITY_REPAIR") && std::atoi(std::getenv("DENSITY_REPAIR")))
+        STAGE("densityRepair", mgr.densityRepairRefine());
     if(std::getenv("EGR") && std::atoi(std::getenv("EGR")))
         STAGE("evalRefinement", mgr.evaluatorRefinement(argv[1]));
     if(!production){
