@@ -11,17 +11,17 @@
 ### Best Results vs ICCAD 2024 Contest Top-3
 
 > **Reference** = best score among the three top contest teams per case (ICCAD 2024 contest results). **Lower = better. Bold = beats the contest best.**
-> **Ours** = base banking (LEMON max-weight matching + adaptive cost) **plus** env-gated post-legalization refinement v2 (2026-07-04, commit `c702d48`): interleaved RELOC + CRIT_SWAP + BIT_REPAIR (batch dynasearch, full-FF candidate set) + oracle-priced structural rebanking (2b+2b→4b, 4×1b→4b) + bin-density repair, all scored by the faithful incremental-STA engine. All scores from the real `preliminary-evaluator`, all legal (`Check pass` + sanity + placement_checker). Run: `BANKING_MODE=matching PRODUCTION=1 INCR_RELOC=1 RELOC=1 CRIT_SWAP=1 BIT_REPAIR=1 BIT_REPAIR_DYNA={1:hc02,hc03; 2:others} BIT_REPAIR_BATCH=1 REFINE_ALLFF=1 ALT_ROUNDS=2 BIT_REPAIR_TIME=600 ORACLE_REBANK=1 REBANK_TIME=240 DENSITY_REPAIR=1` (all gates default-off byte-exact).
+> **Ours** = base banking (LEMON max-weight matching + adaptive cost) **plus** env-gated post-legalization refinement v2 (2026-07-04, commit `c702d48`): interleaved RELOC + CRIT_SWAP + BIT_REPAIR (batch dynasearch, full-FF candidate set) + oracle-priced structural rebanking (2b+2b→4b, 4×1b→4b) + bin-density repair, all scored by the faithful incremental-STA engine. Official solo runs 2026-07-05. All scores from the real `preliminary-evaluator`, all legal (`Check pass` + sanity + placement_checker). Run: `BANKING_MODE=matching PRODUCTION=1 INCR_RELOC=1 RELOC=1 CRIT_SWAP=1 BIT_REPAIR=1 BIT_REPAIR_DYNA={1:hc02,hc03; 2:others} BIT_REPAIR_BATCH=1 REFINE_ALLFF=1 ALT_ROUNDS=2 BIT_REPAIR_TIME=600 ORACLE_REBANK=1 REBANK_TIME=240 DENSITY_REPAIR=1` (all gates default-off byte-exact).
 
 | Testcase | Contest top-3 best | **Ours** | Δ | β |
 |---|---:|---:|---:|---:|
 | testcase1_0812 | 739,200,000 | **734,810,950** | **−0.59%** | 2000 |
-| testcase2_0812 | 748,000 | **724,954** | **−3.08%** | 400 |
-| testcase3 | 729,300,000 | **726,187,285** | **−0.43%** | 10000 |
+| testcase2_0812 | 748,000 | **724,816** | **−3.10%** | 400 |
+| testcase3 | 729,300,000 | **726,167,604** | **−0.43%** | 10000 |
 | hiddencase01 | 31,510,000 | **30,188,054** | **−4.20%** | 200000 |
-| hiddencase02 | 13,280,000 | **10,193,516** | **−23.24%** | 40000 |
-| hiddencase03 | 55,940,000 | **55,795,736** | **−0.26%** | 400 |
-| hiddencase04 | 728,700,000 | **726,287,287** | **−0.33%** | 10000 |
+| hiddencase02 | 13,280,000 | **10,187,367** | **−23.29%** | 40000 |
+| hiddencase03 | 55,940,000 | **55,795,744** | **−0.26%** | 400 |
+| hiddencase04 | 728,700,000 | **726,265,769** | **−0.33%** | 10000 |
 
 > **Beats the ICCAD 2024 contest top-3 (best entry per case) on all 7 cases; composite ratio 0.954.** Key unlock: `isLegalize` is Banking's work-queue marker, not placement liveness — the refinement suite had been silently excluding every Legalizer-placed FF (hc02: its entire 2-bit population). Details in `Project Knowledge/reports/v1/2026-07-04_exp_refine_allff_batch_rebank_density.md`.
 
