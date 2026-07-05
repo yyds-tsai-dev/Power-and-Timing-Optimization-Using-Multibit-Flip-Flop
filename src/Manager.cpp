@@ -3437,19 +3437,17 @@ double Manager::evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
 
 // Side-effect-free group-move ΔTNS (see decl). Mirrors evalBitSwapDelta with a
 // per-bit override map for D/Q positions AND Qpin delay (the target cell differs).
-double Manager::evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& place,
-                                   Cell* newCell, std::vector<FF*>* affOut){
+// Fully general structural delta oracle: each bit carries its own hypothetical
+// D/Q position and clock-to-Q delay. Prices merges, splits, resyntheses and any
+// mixed remap with one mechanism. Read-only on committed caches => thread-safe.
+double Manager::evalRemapDelta(const std::vector<FF*>& bits,
+                               const std::vector<Coor>& nD,
+                               const std::vector<Coor>& nQ,
+                               const std::vector<double>& nQpdV,
+                               std::vector<FF*>* affOut){
     int nb=(int)bits.size();
     std::unordered_map<FF*,int> ovIdx; ovIdx.reserve(nb*2);
-    std::vector<Coor> nD(nb), nQ(nb);
-    bool multi = newCell->getBits() > 1;
-    for(int g=0; g<nb; g++){
-        ovIdx[bits[g]] = g;
-        std::string suf = multi ? std::to_string(g) : std::string();
-        nD[g] = place + newCell->getPinCoor("D"+suf);
-        nQ[g] = place + newCell->getPinCoor("Q"+suf);
-    }
-    double nQpd = newCell->getQpinDelay();
+    for(int g=0; g<nb; g++) ovIdx[bits[g]] = g;
 
     auto topoIdx = [&](Gate* g)->int{ auto it=incrTopoIdx_.find(g); return it!=incrTopoIdx_.end()?it->second:0; };
     auto gateCur = [&](Gate* g)->double{ auto it=incrGateCur_.find(g); return it!=incrGateCur_.end()?it->second:0.0; };
@@ -3458,7 +3456,8 @@ double Manager::evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& pla
         FF* ph=cf->getPhysicalFF(); return ph->getNewCoor()+ph->getPinCoor("Q"+cf->getPhysicalPinName());
     };
     auto qpd = [&](FF* cf)->double{
-        return ovIdx.count(cf) ? nQpd : cf->getPhysicalFF()->getCell()->getQpinDelay();
+        auto it=ovIdx.find(cf);
+        return it!=ovIdx.end() ? nQpdV[it->second] : cf->getPhysicalFF()->getCell()->getQpinDelay();
     };
 
     // union forward cone of all moved bits' Q gates (read-only BFS)
@@ -3550,6 +3549,20 @@ double Manager::evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& pla
     }
     if(affOut) *affOut = std::move(aff);
     return delta;
+}
+
+// Wrapper: all bits onto ONE new cell at `place` (slot g = group order).
+double Manager::evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& place,
+                                   Cell* newCell, std::vector<FF*>* affOut){
+    int nb=(int)bits.size();
+    std::vector<Coor> nD(nb), nQ(nb); std::vector<double> nQpd(nb, newCell->getQpinDelay());
+    bool multi = newCell->getBits() > 1;
+    for(int g=0; g<nb; g++){
+        std::string suf = multi ? std::to_string(g) : std::string();
+        nD[g] = place + newCell->getPinCoor("D"+suf);
+        nQ[g] = place + newCell->getPinCoor("Q"+suf);
+    }
+    return evalRemapDelta(bits, nD, nQ, nQpd, affOut);
 }
 
 // ==================== Bit-level Re-pairing Refinement ====================
@@ -4350,6 +4363,181 @@ double Manager::oracleCostSnapshot(){
         pa += beta*f->getCell()->getGatePower() + gamma*f->getCell()->getArea(); }
     double tnsTerm = incrBuilt_ ? alpha*incrTNS_ : -1.0;
     return tnsTerm < 0 ? -1.0 : tnsTerm + pa + calculateBinDensityCost();
+}
+
+// ==================== Oracle-Priced Merge Ejection (EJECT) ====================
+// The inverse of rebanking: split an MBFF whose merge is mispriced — the bits'
+// exact TNS cost exceeds the power/area saving the merge bought. Split modes:
+// 4b->2x2b, 4b->4x1b, 2b->2x1b. Screening prices the split with each piece at
+// its timing-ideal site via the general remap oracle (parallel, side-effect-free);
+// only candidates clearing the margin enter the exact phase, which uses the EGR
+// debank/relegalize/revert machinery with monotone full-objective accept.
+// Gate: ORACLE_EJECT=1 (requires INCR_RELOC=1). Default off, byte-exact.
+void Manager::oracleEjectRefine(){
+    double timeBudget = []{ const char* e=std::getenv("EJECT_TIME");    return e?std::atof(e):120.0; }();
+    double margin     = []{ const char* e=std::getenv("EJECT_MARGIN");  return e?std::atof(e):0.0;   }();
+    long   patience   = []{ const char* e=std::getenv("EJECT_PATIENCE");return e?std::atol(e):300L;  }();
+    bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
+    if(!incr){ std::cerr << "[EJECT] skipped (needs INCR_RELOC=1)\n"; return; }
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto elapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-t0).count(); };
+
+    incrAccurateBuild();
+    double curTNS = incrTNS_;
+    if(!binTable.ready()){ binTable.invalidate(); binTable.build(*this); }
+
+    auto bestCellOf = [&](int bits)->Cell*{
+        auto it = Bit_FF_Map.find(bits);
+        if(it==Bit_FF_Map.end() || it->second.empty()) return nullptr;
+        return it->second[0];
+    };
+    auto wcost = [&](Cell* c){ return beta*c->getGatePower() + gamma*c->getArea(); };
+    Cell* c1 = bestCellOf(1); Cell* c2 = bestCellOf(2);
+
+    // timing-ideal site of one bit: its driver pin position (D-pin at the driver)
+    auto idealOf = [&](FF* cf)->Coor{
+        PrevInstance pi = cf->getPrevInstance();
+        if(pi.instance){
+            if(pi.cellType==CellType::IO) return pi.instance->getCoor();
+            if(pi.cellType==CellType::GATE) return pi.instance->getCoor()+pi.instance->getPinCoor(pi.pinName);
+            FF* pf=static_cast<FF*>(pi.instance);
+            if(pf && pf->getPhysicalFF())
+                return pf->getPhysicalFF()->getNewCoor()+pf->getPhysicalFF()->getPinCoor("Q"+pf->getPhysicalPinName());
+        }
+        return cf->getPhysicalFF()->getNewCoor();
+    };
+
+    // candidates: multi-bit physicals with any negative-slack bit
+    std::vector<FF*> mbs;
+    for(auto& kv : FF_Map){
+        FF* f=kv.second;
+        if(!f || f->getFixed()) continue;
+        if(f->getCell()->getBits() < 2) continue;
+        bool neg=false;
+        for(FF* cf : f->getClusterFF()) if(incrFFSlack(cf) < 0){ neg=true; break; }
+        if(neg) mbs.push_back(f);
+    }
+    std::sort(mbs.begin(), mbs.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+
+    struct EjCand { double est; int i; int mode; };   // mode: 1 = ->1b pieces, 2 = 4b->2x2b
+    std::vector<EjCand> cands;
+    for(size_t i=0;i<mbs.size();i++){
+        int b=mbs[i]->getCell()->getBits();
+        if(c1) cands.push_back({0.0,(int)i,1});
+        if(b==4 && c2) cands.push_back({0.0,(int)i,2});
+    }
+
+    int M=(int)cands.size();
+    #pragma omp parallel for schedule(dynamic,16)
+    for(int ci=0; ci<M; ci++){
+        EjCand& c=cands[ci];
+        FF* A=mbs[c.i];
+        std::vector<FF*> bits(A->getClusterFF().begin(), A->getClusterFF().end());
+        int nb=(int)bits.size();
+        std::vector<Coor> nD(nb), nQ(nb); std::vector<double> nQpd(nb);
+        double splitPA;
+        if(c.mode==1){
+            splitPA = nb*wcost(c1) - wcost(A->getCell());
+            for(int g=0; g<nb; g++){
+                Coor site = idealOf(bits[g]);
+                nD[g]=site+c1->getPinCoor("D"); nQ[g]=site+c1->getPinCoor("Q"); nQpd[g]=c1->getQpinDelay();
+            }
+        } else {
+            splitPA = 2*wcost(c2) - wcost(A->getCell());
+            for(int g=0; g<nb; g++){
+                Coor site = idealOf(bits[g&~1]);   // pair (0,1) and (2,3) share a site
+                std::string suf = std::to_string(g&1);
+                nD[g]=site+c2->getPinCoor("D"+suf); nQ[g]=site+c2->getPinCoor("Q"+suf); nQpd[g]=c2->getQpinDelay();
+            }
+        }
+        if(splitPA <= 0){ c.est = 1e18; continue; }   // pieces cheaper than whole: rebank's job, skip
+        double dt = evalRemapDelta(bits, nD, nQ, nQpd);
+        c.est = alpha*dt + splitPA;                   // idealized (V priced at exact phase)
+    }
+    std::sort(cands.begin(), cands.end(), [](const EjCand&x, const EjCand&y){
+        if(x.est!=y.est) return x.est<y.est;
+        if(x.i!=y.i) return x.i<y.i; return x.mode<y.mode; });
+
+    long tried=0, accepted=0, dry=0;
+    std::vector<char> used(mbs.size(),0);
+    for(auto& c : cands){
+        if(c.est >= margin) break;
+        if(elapsed()>timeBudget || (patience>0 && dry>=patience)) break;
+        if(used[c.i]) continue;
+        FF* A=mbs[c.i];
+        if(FF_Map.find(A->getInstanceName())==FF_Map.end()){ used[c.i]=1; continue; }
+        tried++;
+        double tnsBefore = curTNS;
+        int violBefore = binTable.totalViolations();
+        Coor oldPos = A->getNewCoor();
+        Cell* oldCell = A->getCell();
+        std::vector<FF*> bits(A->getClusterFF().begin(), A->getClusterFF().end());
+
+        // universal revert: gather the bits' CURRENT physicals (any mix of pieces),
+        // free them, and re-bank the original cell at its old position. bankFF's own
+        // binTable hook keeps the density accounting consistent in both directions.
+        auto revertAll = [&](){
+            std::unordered_set<FF*> phSet;
+            for(FF* cf : bits) phSet.insert(cf->getPhysicalFF());
+            std::vector<FF*> pieces(phSet.begin(), phSet.end());
+            std::sort(pieces.begin(), pieces.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+            for(FF* p : pieces){
+                legalizer->FreeRect(p->getNewCoor(), p->getCell()->getW(), p->getCell()->getH());
+                legalizer->RemoveNodeByFFPtr(p);
+            }
+            FF* restored = bankFF(oldPos, oldCell, pieces);
+            restored->setNewCoor(oldPos); restored->setCoor(oldPos); restored->setIsLegalize(true);
+            legalizer->UpdateRows(restored);
+            incrAccurateRecomputeFF(restored);
+            incrTNS_ = tnsBefore; curTNS = tnsBefore;
+        };
+
+        EGRUndoEntry undo = debankWithUndo(A);   // frees 4b rect, removes node, 1b pieces at bit-preserving coords (binTable hooked)
+        bool placedOK=true;
+        if(c.mode==1){
+            for(FF* nf : undo.freedFFs){
+                Coor init = nf->getNewCoor();
+                Coor tgt = idealOf(nf->getClusterFF()[0]);
+                Coor p = legalizer->FindPlace(tgt, nf->getCell());
+                if(p.x==DBL_MAX){ placedOK=false; break; }
+                nf->setNewCoor(p); nf->setCoor(p); nf->setIsLegalize(true);
+                legalizer->UpdateRows(nf);
+                binTable.applyMutation({{init.x,init.y,nf->getCell()->getW(),nf->getCell()->getH()}},
+                                       {{p.x,p.y,nf->getCell()->getW(),nf->getCell()->getH()}});
+            }
+        } else {
+            if((int)undo.freedFFs.size()!=4) placedOK=false;
+            for(int pr=0; pr<2 && placedOK; pr++){
+                std::vector<FF*> pairv = {undo.freedFFs[2*pr], undo.freedFFs[2*pr+1]};
+                Coor tgt = idealOf(pairv[0]->getClusterFF()[0]);
+                Coor p = legalizer->FindPlace(tgt, c2);
+                if(p.x==DBL_MAX){ placedOK=false; break; }
+                FF* nf2 = bankFF(p, c2, pairv);        // binTable hooked (singles at current coords -> 2b at p)
+                nf2->setNewCoor(p); nf2->setCoor(p); nf2->setIsLegalize(true);
+                legalizer->UpdateRows(nf2);
+            }
+        }
+        if(!placedOK){ revertAll(); dry++; used[c.i]=1; continue; }
+
+        // exact pricing of the realized split
+        std::unordered_set<FF*> phSet;
+        for(FF* cf : bits) phSet.insert(cf->getPhysicalFF());
+        std::vector<FF*> pieces(phSet.begin(), phSet.end());
+        std::sort(pieces.begin(), pieces.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+        double newTNS=curTNS;
+        for(FF* p : pieces) newTNS = incrAccurateRecomputeFF(p);
+        double paNow=0; for(FF* p : pieces) paNow += wcost(p->getCell());
+        double dPA = paNow - wcost(oldCell);
+        int dViol = binTable.totalViolations() - violBefore;
+        double delta = alpha*(newTNS - tnsBefore) + dPA + lambda*dViol;
+        if(delta < -1e-9){
+            curTNS = newTNS; accepted++; dry=0; used[c.i]=1;
+        } else {
+            revertAll(); dry++; used[c.i]=1;
+        }
+    }
+    std::cerr << "[EJECT] cands=" << M << " tried=" << tried << " accepted=" << accepted
+              << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << elapsed() << "s\n";
 }
 
 // ==================== Bin-Density Repair Refinement ====================

@@ -193,6 +193,7 @@ public:
     void bitRepairRefine();        // re-pair individual bits between nearby same-cell/same-clk MBFFs (power/area-fixed)
     void densityRepairRefine();    // evict FFs out of violating bins; per-bin chain commit iff a*sumdTNS + l*dViol < 0 (DENSITY_REPAIR=1)
     void oracleRebankRefine();     // post-LG structural rebank (2b+2b->4b, 4x1b->4b) with exact oracle+lib+bin pricing (ORACLE_REBANK=1)
+    void oracleEjectRefine();      // split mispriced merges (kb -> pieces) with exact oracle pricing (ORACLE_EJECT=1)
     double oracleCostSnapshot();   // alpha*incrTNS_ + exact P/A + bin term (EVAL_CHECKPOINT)
     void captureOrigSlack();  // record clean input-file D-slack per logical FF (call once post-preprocess)
     double validateTNSOracle(bool restore); // recompute TNS from clean base; returns oracle TNS
@@ -227,6 +228,10 @@ public:
     // also overrides the Qpin delay (cell type changes). Read-only on global caches =>
     // thread-safe; used for parallel ORACLE_REBANK screening (estimate: slot order =
     // group order, place = centroid; the exact trial-apply after screening re-prices).
+    // Fully general structural delta oracle: per-bit hypothetical (D, Q, Qpd).
+    double evalRemapDelta(const std::vector<FF*>& bits,
+                          const std::vector<Coor>& nD, const std::vector<Coor>& nQ,
+                          const std::vector<double>& nQpd, std::vector<FF*>* affOut = nullptr);
     double evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& place,
                               Cell* newCell, std::vector<FF*>* affOut = nullptr);
     double runEvaluator(const std::string& testcasePath, const std::string& outputPath);

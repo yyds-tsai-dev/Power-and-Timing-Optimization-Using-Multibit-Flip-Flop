@@ -139,6 +139,9 @@ int main(int argc, char *argv[]){
             if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR"))){
                 STAGE("bitRepair", mgr.bitRepairRefine()); ckpt("bitRepair", alt);
             }
+            if(std::getenv("ORACLE_EJECT") && std::atoi(std::getenv("ORACLE_EJECT"))){
+                STAGE("oracleEject", mgr.oracleEjectRefine()); ckpt("eject", alt);
+            }
             if(std::getenv("ORACLE_REBANK") && std::atoi(std::getenv("ORACLE_REBANK"))){
                 STAGE("oracleRebank", mgr.oracleRebankRefine()); ckpt("rebank", alt);
             }
