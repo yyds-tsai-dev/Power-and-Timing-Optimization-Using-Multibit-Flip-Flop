@@ -221,6 +221,13 @@ public:
     double evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
                             std::vector<Gate*>* coneOut = nullptr,
                             std::vector<FF*>*  affOut  = nullptr);
+    // Side-effect-free dTNS of moving a GROUP of logical bits onto a hypothetical new
+    // physical cell (newCell at `place`, bit g -> slot g). Generalizes evalBitSwapDelta:
+    // also overrides the Qpin delay (cell type changes). Read-only on global caches =>
+    // thread-safe; used for parallel ORACLE_REBANK screening (estimate: slot order =
+    // group order, place = centroid; the exact trial-apply after screening re-prices).
+    double evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& place,
+                              Cell* newCell, std::vector<FF*>* affOut = nullptr);
     double runEvaluator(const std::string& testcasePath, const std::string& outputPath);
     double computeInlineCost();
     std::vector<FF*> rankMBFFByDisplacement();

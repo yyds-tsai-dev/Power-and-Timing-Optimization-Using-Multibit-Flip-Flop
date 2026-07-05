@@ -3291,12 +3291,12 @@ void Manager::criticalPathSwapRefine(){
                 if(verify){
                     // accept only if the faithful multi-hop TNS strictly improves
                     double newAcc;
-                    if(incr){ incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B); newAcc = incrTNS_; }
+                    if(incr){ incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B); newAcc = incrTNS_; }
                     else newAcc = computeAccurateTNS();
                     if(newAcc >= baseAcc - eps){
                         A->setNewCoor(posA); A->setCoor(posA);
                         B->setNewCoor(bestPosB); B->setCoor(bestPosB);
-                        if(incr){ incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B); incrTNS_ = baseAcc; }
+                        if(incr){ incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B); incrTNS_ = baseAcc; }
                         continue;
                     }
                     baseAcc = newAcc;
@@ -3435,6 +3435,123 @@ double Manager::evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
     return delta;
 }
 
+// Side-effect-free group-move ΔTNS (see decl). Mirrors evalBitSwapDelta with a
+// per-bit override map for D/Q positions AND Qpin delay (the target cell differs).
+double Manager::evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& place,
+                                   Cell* newCell, std::vector<FF*>* affOut){
+    int nb=(int)bits.size();
+    std::unordered_map<FF*,int> ovIdx; ovIdx.reserve(nb*2);
+    std::vector<Coor> nD(nb), nQ(nb);
+    bool multi = newCell->getBits() > 1;
+    for(int g=0; g<nb; g++){
+        ovIdx[bits[g]] = g;
+        std::string suf = multi ? std::to_string(g) : std::string();
+        nD[g] = place + newCell->getPinCoor("D"+suf);
+        nQ[g] = place + newCell->getPinCoor("Q"+suf);
+    }
+    double nQpd = newCell->getQpinDelay();
+
+    auto topoIdx = [&](Gate* g)->int{ auto it=incrTopoIdx_.find(g); return it!=incrTopoIdx_.end()?it->second:0; };
+    auto gateCur = [&](Gate* g)->double{ auto it=incrGateCur_.find(g); return it!=incrGateCur_.end()?it->second:0.0; };
+    auto qpos = [&](FF* cf)->Coor{
+        auto it=ovIdx.find(cf); if(it!=ovIdx.end()) return nQ[it->second];
+        FF* ph=cf->getPhysicalFF(); return ph->getNewCoor()+ph->getPinCoor("Q"+cf->getPhysicalPinName());
+    };
+    auto qpd = [&](FF* cf)->double{
+        return ovIdx.count(cf) ? nQpd : cf->getPhysicalFF()->getCell()->getQpinDelay();
+    };
+
+    // union forward cone of all moved bits' Q gates (read-only BFS)
+    std::unordered_set<Gate*> coneSet;
+    std::vector<Gate*> stack;
+    for(FF* cf : bits){
+        auto it=incrFFQGates_.find(cf);
+        if(it!=incrFFQGates_.end()) for(Gate* g : it->second) if(coneSet.insert(g).second) stack.push_back(g);
+    }
+    for(size_t i=0;i<stack.size();i++){
+        auto it=incrFanoutG_.find(stack[i]);
+        if(it!=incrFanoutG_.end()) for(Gate* n : it->second) if(coneSet.insert(n).second) stack.push_back(n);
+    }
+    std::vector<Gate*> cone(coneSet.begin(), coneSet.end());
+    std::sort(cone.begin(), cone.end(), [&](Gate* a, Gate* b){ return topoIdx(a) < topoIdx(b); });
+
+    std::unordered_map<Gate*,double> gateOv; gateOv.reserve(cone.size()*2+1);
+    for(Gate* g : cone){
+        double mc=-1e300;
+        auto fit=incrFanin_.find(g);
+        if(fit!=incrFanin_.end()) for(auto& f : fit->second){
+            double vc;
+            if(f.kind==0) vc=f.cnst;
+            else if(f.kind==1){ FF* cf=f.cf; vc = qpd(cf) + DisplacementDelay*HPWL(qpos(cf), f.pin); }
+            else { auto ov=gateOv.find(f.g); vc = (ov!=gateOv.end()?ov->second:gateCur(f.g)) + f.cnst; }
+            if(vc>mc) mc=vc;
+        }
+        gateOv[g] = (mc==-1e300)?0:mc;
+    }
+
+    auto slackOv = [&](FF* cf)->double{
+        double origSlack = cf->getTimingSlack("D");
+        PrevInstance prev = cf->getPrevInstance();
+        if(!prev.instance) return origSlack;
+        Coor curD;
+        auto oit=ovIdx.find(cf);
+        if(oit!=ovIdx.end()) curD=nD[oit->second];
+        else { FF* phys=cf->getPhysicalFF(); curD = phys->getNewCoor()+phys->getPinCoor("D"+cf->getPhysicalPinName()); }
+        double arrChange=0;
+        if(prev.cellType==CellType::GATE){
+            auto it=incrFFDrivers_.find(cf);
+            if(it!=incrFFDrivers_.end() && !it->second.empty()){
+                double cur=-1e300;
+                for(auto& gp : it->second){
+                    auto ov=gateOv.find(gp.first);
+                    double gArr = (ov!=gateOv.end()?ov->second:gateCur(gp.first));
+                    double v = gArr + DisplacementDelay*HPWL(gp.second, curD);
+                    if(v>cur) cur=v;
+                }
+                auto ao=incrFFArrOrig_.find(cf);
+                arrChange = cur - (ao!=incrFFArrOrig_.end()?ao->second:0.0);
+            } else {
+                Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
+                arrChange = DisplacementDelay*(HPWL(gateOut,curD) - HPWL(gateOut, cf->getOriginalD()));
+                const PrevStage& ps = cf->getPrevStage();
+                if(ps.ff){
+                    Coor newQ = qpos(ps.ff);
+                    Coor origQ = ps.ff->getOriginalQ();
+                    double dqpd = qpd(ps.ff) - ps.ff->getOriginalQpinDelay();
+                    Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
+                    arrChange += dqpd + DisplacementDelay*(HPWL(firstGatePin,newQ) - HPWL(firstGatePin,origQ));
+                }
+            }
+        } else if(prev.cellType==CellType::IO){
+            Coor ioCoor = prev.instance->getCoor();
+            arrChange = DisplacementDelay*(HPWL(ioCoor,curD) - HPWL(ioCoor, cf->getOriginalD()));
+        } else {
+            FF* prevFF = static_cast<FF*>(prev.instance);
+            Coor newQ = qpos(prevFF);
+            Coor origQ = prevFF->getOriginalQ();
+            double origArr = prevFF->getOriginalQpinDelay() + DisplacementDelay*HPWL(origQ, cf->getOriginalD());
+            double newArr  = qpd(prevFF) + DisplacementDelay*HPWL(newQ, curD);
+            arrChange = newArr - origArr;
+        }
+        return origSlack - arrChange;
+    };
+
+    std::unordered_set<FF*> affSet; std::vector<FF*> aff;
+    auto addAff=[&](FF* cf){ if(affSet.insert(cf).second) aff.push_back(cf); };
+    for(FF* cf : bits) addAff(cf);
+    for(FF* cf : bits){ auto it=incrFFDirectSinks_.find(cf); if(it!=incrFFDirectSinks_.end()) for(FF* d : it->second) addAff(d); }
+    for(Gate* g : cone){ auto it=incrSinkFF_.find(g); if(it!=incrSinkFF_.end()) for(FF* cf : it->second) addAff(cf); }
+
+    double delta=0;
+    for(FF* cf : aff){
+        double s=slackOv(cf); double newNeg=(s<0)?-s:0;
+        auto it=incrFFNeg_.find(cf); double oldNeg=(it!=incrFFNeg_.end()?it->second:0.0);
+        delta += newNeg - oldNeg;
+    }
+    if(affOut) *affOut = std::move(aff);
+    return delta;
+}
+
 // ==================== Bit-level Re-pairing Refinement ====================
 // Swap one clusterFF bit between two nearby SAME-CELL, SAME-CLK MBFFs. Both MBFFs
 // stay in place => Power, Area, bin-density and legality are EXACTLY preserved
@@ -3451,6 +3568,10 @@ void Manager::bitRepairRefine(){
     // individually possibly non-improving, and commits only the max-cumulative-gain
     // prefix -> tunnels the plateau where no single swap improves but a chain does.
     int    chainDepth= []{ const char* e=std::getenv("BIT_REPAIR_CHAIN_DEPTH"); return e?std::atoi(e):0; }();
+    // BIT_REPAIR_INTRA=1: also consider slot swaps WITHIN one MBFF (A==B, sa<sb).
+    // Post-merge/post-RELOC slot assignments come from the crude assignSlot Hungarian;
+    // the oracle re-prices the permutation exactly. Default off, byte-exact.
+    int    intra     = []{ const char* e=std::getenv("BIT_REPAIR_INTRA"); return e?std::atoi(e):0; }();
     // Dynasearch: parallel side-effect-free best-swap search (evalBitSwapDelta) + cone-disjoint
     // batch apply per round. 0 = off (legacy serial greedy). Throughput >> serial (parallel +
     // 1 cone-walk/candidate vs 4); descent identical class of moves, far more per wall-second.
@@ -3502,8 +3623,14 @@ void Manager::bitRepairRefine(){
         bIb.assign(mb.size(),-1); bSa.assign(mb.size(),-1); bSb.assign(mb.size(),-1);
         bDelta.assign(mb.size(),0.0); dirty.assign(mb.size(),1);
     }
+    // BIT_REPAIR_RESCAN=N: every N dyna2 rounds force a full rescore (all dirty).
+    // dyna2's dirty propagation is conservative-but-not-complete; the periodic full
+    // rescan folds dyna1's exhaustive-rescan advantage into the incremental engine,
+    // removing the per-case dyna1-vs-dyna2 choice. 0 = off (byte-exact).
+    int rescanEvery = []{ const char* e=std::getenv("BIT_REPAIR_RESCAN"); return e?std::atoi(e):0; }();
     for(int round = 0; round < maxRounds && elapsed() < timeBudget; round++){
         if(dyna==2){
+            if(rescanEvery>0 && round>0 && (round % rescanEvery)==0) std::fill(dirty.begin(), dirty.end(), (char)1);
             // ---------- Incremental dynasearch round (rescore only dirty MBFFs) ----------
             struct Cand { double delta; int ia, ib, sa, sb; };
             int N=(int)mb.size(); long rescored=0;
@@ -3516,6 +3643,15 @@ void Manager::bitRepairRefine(){
                 if(tit!=dynTrees.end()){
                     std::vector<CSPointID> nr; tit->second.query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+1), std::back_inserter(nr));
                     int nA=(int)A->getClusterFF().size();
+                    if(intra){
+                        for(int sa=0;sa<nA;sa++) for(int sb=sa+1;sb<nA;sb++){
+                            double d=evalBitSwapDelta(A,sa,A,sb);
+                            bool better=false;
+                            if(d<bd-1e-12) better=true;
+                            else if(d<=bd+1e-12 && ib2>=0){ if((int)i!=ib2) better=(int)i<ib2; else if(sa!=sa2) better=sa<sa2; else better=sb<sb2; }
+                            if(better){ bd=d; ib2=(int)i; sa2=sa; sb2=sb; }
+                        }
+                    }
                     for(auto& nb : nr){ int ib=nb.second; if(ib==i) continue; FF* B=mb[ib]; if(B->getClkIdx()!=A->getClkIdx()) continue;
                         int nB=(int)B->getClusterFF().size();
                         for(int sa=0;sa<nA;sa++) for(int sb=0;sb<nB;sb++){
@@ -3546,7 +3682,7 @@ void Manager::bitRepairRefine(){
                     if(conflict) continue;
                     FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
                     A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                     usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: aff) usedFF.insert(f);
                     applied++;
                     markDirty.push_back(c.ia); markDirty.push_back(c.ib);
@@ -3562,7 +3698,7 @@ void Manager::bitRepairRefine(){
                     if(d>=-eps){ dirty[c.ia]=1; continue; }
                     FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
                     A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                     usedMB.insert(c.ia); usedMB.insert(c.ib);
                     applied++;
                     markDirty.push_back(c.ia); markDirty.push_back(c.ib);
@@ -3597,7 +3733,7 @@ void Manager::bitRepairRefine(){
                         FF* A=mb[c.ia]; FF* B=mb[c.ib];
                         FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
                         A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                        incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                        incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                         usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: raff[ci]) batchFF.insert(f);
                         alive[ci]=0; appliedThis++; applied++;
                         markDirty.push_back(c.ia); markDirty.push_back(c.ib);
@@ -3649,9 +3785,9 @@ void Manager::bitRepairRefine(){
                             double ed=evalBitSwapDelta(A,sa,B,sb);
                             FF* cfa=A->getClusterFF()[sa]; FF* cfb=B->getClusterFF()[sb];
                             A->getClusterFF()[sa]=cfb; B->getClusterFF()[sb]=cfa; cfb->setPhysicalFF(A,sa); cfa->setPhysicalFF(B,sb);
-                            incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B); double rd=incrTNS_-baseAcc;
+                            incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B); double rd=incrTNS_-baseAcc;
                             A->getClusterFF()[sa]=cfa; B->getClusterFF()[sb]=cfb; cfa->setPhysicalFF(A,sa); cfb->setPhysicalFF(B,sb);
-                            incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B); incrTNS_=baseAcc;
+                            incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B); incrTNS_=baseAcc;
                             double ad=std::abs(ed-rd); if(ad>maxAbs) maxAbs=ad; checked++;
                         }
                     }
@@ -3667,6 +3803,15 @@ void Manager::bitRepairRefine(){
                 auto tit=trees.find(A->getCell()); if(tit==trees.end()) continue;
                 std::vector<CSPointID> nr; tit->second.query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+1), std::back_inserter(nr));
                 double bd=-eps; int bib=-1,bsa=-1,bsb=-1; int nA=(int)A->getClusterFF().size();
+                if(intra){
+                    for(int sa=0;sa<nA;sa++) for(int sb=sa+1;sb<nA;sb++){
+                        double d=evalBitSwapDelta(A,sa,A,sb);
+                        bool better=false;
+                        if(d<bd-1e-12) better=true;
+                        else if(d<=bd+1e-12 && bib>=0){ if(ia!=bib) better=ia<bib; else if(sa!=bsa) better=sa<bsa; else better=sb<bsb; }
+                        if(better){ bd=d; bib=ia; bsa=sa; bsb=sb; }
+                    }
+                }
                 for(auto& nb : nr){ int ib=nb.second; if(ib==ia) continue; FF* B=mb[ib]; if(B->getClkIdx()!=A->getClkIdx()) continue;
                     int nB=(int)B->getClusterFF().size();
                     for(int sa=0;sa<nA;sa++) for(int sb=0;sb<nB;sb++){
@@ -3700,7 +3845,7 @@ void Manager::bitRepairRefine(){
                     if(conflict) continue;
                     FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
                     A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                     usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f : aff) usedFF.insert(f);
                     applied++;
                 }
@@ -3713,7 +3858,7 @@ void Manager::bitRepairRefine(){
                     if(d>=-eps) continue;
                     FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
                     A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                     usedMB.insert(c.ia); usedMB.insert(c.ib);
                     applied++;
                 }
@@ -3744,7 +3889,7 @@ void Manager::bitRepairRefine(){
                         FF* A=mb[c.ia]; FF* B=mb[c.ib];
                         FF* cfa=A->getClusterFF()[c.sa]; FF* cfb=B->getClusterFF()[c.sb];
                         A->getClusterFF()[c.sa]=cfb; B->getClusterFF()[c.sb]=cfa; cfb->setPhysicalFF(A,c.sa); cfa->setPhysicalFF(B,c.sb);
-                        incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                        incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                         usedMB.insert(c.ia); usedMB.insert(c.ib); for(FF* f: raff[ci]) batchFF.insert(f);
                         alive[ci]=0; appliedThis++; applied++;
                     }
@@ -3862,11 +4007,11 @@ void Manager::bitRepairRefine(){
                     FF* cfb = B->getClusterFF()[sb];
                     A->getClusterFF()[sa]=cfb; B->getClusterFF()[sb]=cfa;
                     cfb->setPhysicalFF(A,sa); cfa->setPhysicalFF(B,sb);
-                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                     double delta = incrTNS_ - baseAcc;
                     A->getClusterFF()[sa]=cfa; B->getClusterFF()[sb]=cfb;
                     cfa->setPhysicalFF(A,sa); cfb->setPhysicalFF(B,sb);
-                    incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                    incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                     incrTNS_ = baseAcc; // determinism: pin to known-good (avoid FP drift over trials)
                     if(delta < bestDelta){ bestDelta=delta; bestIb=ib; bestSa=sa; bestSb=sb; }
                 }
@@ -3877,7 +4022,7 @@ void Manager::bitRepairRefine(){
                 FF* cfb = B->getClusterFF()[bestSb];
                 A->getClusterFF()[bestSa]=cfb; B->getClusterFF()[bestSb]=cfa;
                 cfb->setPhysicalFF(A,bestSa); cfa->setPhysicalFF(B,bestSb);
-                incrAccurateRecomputeFF(A); incrAccurateRecomputeFF(B);
+                incrAccurateRecomputeFF(A); if(B!=A) incrAccurateRecomputeFF(B);
                 baseAcc = incrTNS_; roundSwaps++;
                 if(validateEvery && (total+roundSwaps) % validateEvery == 0){
                     double full = computeAccurateTNS();
@@ -3990,6 +4135,7 @@ void Manager::oracleRebankRefine(){
     int    K          = []{ const char* e=std::getenv("REBANK_K");      return e?std::atoi(e):8;     }();
     int    maxRounds  = []{ const char* e=std::getenv("REBANK_ROUNDS"); return e?std::atoi(e):10;    }();
     int    modes      = []{ const char* e=std::getenv("REBANK_MODES");  return e?std::atoi(e):3;     }();
+    double margin     = []{ const char* e=std::getenv("REBANK_MARGIN"); return e?std::atof(e):0.0;   }();
     bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
     if(!incr){ std::cerr << "[REBANK] skipped (needs INCR_RELOC=1)\n"; return; }
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -4075,53 +4221,87 @@ void Manager::oracleRebankRefine(){
             return false;
         };
 
-        // ---- mode 1: 2b + 2b -> 4b ----
+        // ---- candidate enumeration (deterministic) ----
+        struct RbCand { double est; int mode; int a, b, c, d; };
+        std::vector<RbCand> cands;
         if((modes&1) && best4 && src2.size()>=2){
             std::unordered_map<int, CSRTree> trees;   // per clkIdx
             for(size_t i=0;i<src2.size();i++){ Coor c=src2[i]->getNewCoor(); trees[src2[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
-            std::vector<char> consumed(src2.size(),0);
-            for(size_t i=0;i<src2.size() && elapsed()<timeBudget;i++){
-                if(consumed[i]) continue;
+            std::vector<std::pair<int,int>> pairs;
+            for(size_t i=0;i<src2.size();i++){
                 FF* A=src2[i]; Coor pA=A->getNewCoor();
                 std::vector<CSPointID> nr; trees[A->getClkIdx()].query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+1), std::back_inserter(nr));
-                // deterministic neighbor order: by distance then index
-                std::sort(nr.begin(), nr.end(), [&](const CSPointID&a, const CSPointID&b){
-                    double da=std::abs(a.first.get<0>()-pA.x)+std::abs(a.first.get<1>()-pA.y);
-                    double db=std::abs(b.first.get<0>()-pA.x)+std::abs(b.first.get<1>()-pA.y);
-                    if(da!=db) return da<db; return a.second<b.second; });
-                for(auto& nb : nr){
-                    int j=nb.second;
-                    if(j==(int)i || consumed[j]) continue;
-                    std::vector<FF*> group = {A, src2[j]};
-                    if(tryMerge(group, best4)){ consumed[i]=1; consumed[j]=1; accepted++; break; }
-                }
+                for(auto& nb : nr){ int j=nb.second; if(j==(int)i) continue;
+                    pairs.push_back({std::min((int)i,j), std::max((int)i,j)}); }
             }
+            std::sort(pairs.begin(), pairs.end());
+            pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+            for(auto& pr : pairs) cands.push_back({0.0, 1, pr.first, pr.second, -1, -1});
         }
-
-        // ---- mode 2: 4 x 1b -> 4b ----
         if((modes&2) && best4 && src1.size()>=4){
             std::unordered_map<int, CSRTree> trees;
             for(size_t i=0;i<src1.size();i++){ Coor c=src1[i]->getNewCoor(); trees[src1[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
-            std::vector<char> consumed(src1.size(),0);
-            for(size_t i=0;i<src1.size() && elapsed()<timeBudget;i++){
-                if(consumed[i]) continue;
+            for(size_t i=0;i<src1.size();i++){
                 FF* A=src1[i]; Coor pA=A->getNewCoor();
                 std::vector<CSPointID> nr; trees[A->getClkIdx()].query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+3), std::back_inserter(nr));
                 std::sort(nr.begin(), nr.end(), [&](const CSPointID&a, const CSPointID&b){
                     double da=std::abs(a.first.get<0>()-pA.x)+std::abs(a.first.get<1>()-pA.y);
                     double db=std::abs(b.first.get<0>()-pA.x)+std::abs(b.first.get<1>()-pA.y);
                     if(da!=db) return da<db; return a.second<b.second; });
-                std::vector<FF*> group = {A}; std::vector<int> gidx = {(int)i};
-                for(auto& nb : nr){
-                    int j=nb.second;
-                    if(j==(int)i || consumed[j]) continue;
-                    group.push_back(src1[j]); gidx.push_back(j);
-                    if(group.size()==4) break;
-                }
-                if(group.size()!=4) continue;
-                if(tryMerge(group, best4)){ for(int g : gidx) consumed[g]=1; accepted++; }
+                int q[3]; int qn=0;
+                for(auto& nb : nr){ int j=nb.second; if(j==(int)i) continue; q[qn++]=j; if(qn==3) break; }
+                if(qn==3) cands.push_back({0.0, 2, (int)i, q[0], q[1], q[2]});
             }
         }
+
+        // ---- parallel screening: side-effect-free full-cost estimate per candidate ----
+        // (oracle caches, binTable and positions are read-only here => thread-safe;
+        //  estimate uses group-order slots at the centroid; exact re-price at apply)
+        int M=(int)cands.size();
+        #pragma omp parallel for schedule(dynamic,32)
+        for(int ci=0; ci<M; ci++){
+            RbCand& c=cands[ci];
+            std::vector<FF*> group; std::vector<FF*> gbits;
+            double cx=0, cy=0, dPA=wcost(best4);
+            auto add=[&](FF* f){ group.push_back(f); Coor p=f->getNewCoor(); cx+=p.x; cy+=p.y;
+                                 dPA-=wcost(f->getCell());
+                                 for(FF* cf : f->getClusterFF()) gbits.push_back(cf); };
+            if(c.mode==1){ add(src2[c.a]); add(src2[c.b]); }
+            else { add(src1[c.a]); add(src1[c.b]); add(src1[c.c]); add(src1[c.d]); }
+            if(dPA>=0){ c.est=1e18; continue; }
+            Coor cen(cx/group.size(), cy/group.size());
+            int dv = binTable.estimateViolationDelta(group, cen, best4);
+            double dt = evalGroupMoveDelta(gbits, cen, best4);
+            c.est = alpha*dt + dPA + lambda*dv;
+        }
+
+        // ---- best-first exact phase: FindPlace + trial-apply, monotone accept ----
+        std::sort(cands.begin(), cands.end(), [](const RbCand&x, const RbCand&y){
+            if(x.est!=y.est) return x.est<y.est;
+            if(x.mode!=y.mode) return x.mode<y.mode;
+            if(x.a!=y.a) return x.a<y.a; if(x.b!=y.b) return x.b<y.b;
+            if(x.c!=y.c) return x.c<y.c; return x.d<y.d; });
+        std::vector<char> used2(src2.size(),0), used1(src1.size(),0);
+        long screened=0, dryRun=0;
+        static const long patience = []{ const char* e=std::getenv("REBANK_PATIENCE"); return e?std::atol(e):600L; }();
+        for(auto& c : cands){
+            if(c.est >= margin) break;                 // sorted: the rest are worse
+            if(elapsed()>timeBudget) break;
+            if(patience>0 && dryRun>=patience) break;  // long dry tail of estimate false-positives
+            screened++;
+            bool ok=false;
+            if(c.mode==1){
+                if(used2[c.a]||used2[c.b]) continue;
+                std::vector<FF*> group = {src2[c.a], src2[c.b]};
+                if((ok=tryMerge(group, best4))){ used2[c.a]=1; used2[c.b]=1; accepted++; }
+            } else {
+                if(used1[c.a]||used1[c.b]||used1[c.c]||used1[c.d]) continue;
+                std::vector<FF*> group = {src1[c.a], src1[c.b], src1[c.c], src1[c.d]};
+                if((ok=tryMerge(group, best4))){ used1[c.a]=1; used1[c.b]=1; used1[c.c]=1; used1[c.d]=1; accepted++; }
+            }
+            if(ok) dryRun=0; else dryRun++;
+        }
+        std::cerr << "[REBANK] screen: cands=" << M << " passed=" << screened << "\n";
 
         accTotal += accepted;
         std::cerr << "[REBANK] round=" << round << " accepted=" << accepted
