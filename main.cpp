@@ -117,21 +117,42 @@ int main(int argc, char *argv[]){
     {
         int altRounds = 1;
         if(const char* e = std::getenv("ALT_ROUNDS")) altRounds = std::atoi(e);
+        const char* ckptPfx = std::getenv("EVAL_CHECKPOINT");   // prefix path; dumps solution per stage
+        auto ckpt = [&](const char* name, int alt){
+            if(!ckptPfx) return;
+            auto now = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(now - _all_s).count();
+            std::string f = std::string(ckptPfx) + "_a" + std::to_string(alt) + "_" + name + "_" + std::to_string((long)ms) + ".out";
+            mgr.dump(f);
+            std::cerr << "[CKPT] " << name << " alt=" << alt << " t_ms=" << (long)ms
+                      << " oracleCost=" << std::fixed << mgr.oracleCostSnapshot() << " file=" << f << "\n";
+        };
+        ckpt("start", -1);
         for(int alt = 0; alt < altRounds; alt++){
             if(std::getenv("RELOC") && std::atoi(std::getenv("RELOC"))){
                 STAGE("refreshArr(pre-reloc)", mgr.refreshArrivalCorrections());
-                STAGE("timingReloc",           mgr.timingDrivenRelocation());
+                STAGE("timingReloc",           mgr.timingDrivenRelocation()); ckpt("timingReloc", alt);
             }
-            if(std::getenv("CRIT_SWAP") && std::atoi(std::getenv("CRIT_SWAP")))
-                STAGE("critSwapRefine", mgr.criticalPathSwapRefine());
-            if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR")))
-                STAGE("bitRepair", mgr.bitRepairRefine());
-            if(std::getenv("ORACLE_REBANK") && std::atoi(std::getenv("ORACLE_REBANK")))
-                STAGE("oracleRebank", mgr.oracleRebankRefine());
+            if(std::getenv("CRIT_SWAP") && std::atoi(std::getenv("CRIT_SWAP"))){
+                STAGE("critSwapRefine", mgr.criticalPathSwapRefine()); ckpt("critSwap", alt);
+            }
+            if(std::getenv("BIT_REPAIR") && std::atoi(std::getenv("BIT_REPAIR"))){
+                STAGE("bitRepair", mgr.bitRepairRefine()); ckpt("bitRepair", alt);
+            }
+            if(std::getenv("ORACLE_REBANK") && std::atoi(std::getenv("ORACLE_REBANK"))){
+                STAGE("oracleRebank", mgr.oracleRebankRefine()); ckpt("rebank", alt);
+            }
         }
     }
     if(std::getenv("DENSITY_REPAIR") && std::atoi(std::getenv("DENSITY_REPAIR")))
         STAGE("densityRepair", mgr.densityRepairRefine());
+    if(std::getenv("EVAL_CHECKPOINT")){
+        auto now = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - _all_s).count();
+        std::string f = std::string(std::getenv("EVAL_CHECKPOINT")) + "_final_" + std::to_string((long)ms) + ".out";
+        mgr.dump(f);
+        std::cerr << "[CKPT] final t_ms=" << (long)ms << " oracleCost=" << std::fixed << mgr.oracleCostSnapshot() << " file=" << f << "\n";
+    }
     if(std::getenv("EGR") && std::atoi(std::getenv("EGR")))
         STAGE("evalRefinement", mgr.evaluatorRefinement(argv[1]));
     if(!production){

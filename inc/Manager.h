@@ -193,6 +193,7 @@ public:
     void bitRepairRefine();        // re-pair individual bits between nearby same-cell/same-clk MBFFs (power/area-fixed)
     void densityRepairRefine();    // evict FFs out of violating bins; per-bin chain commit iff a*sumdTNS + l*dViol < 0 (DENSITY_REPAIR=1)
     void oracleRebankRefine();     // post-LG structural rebank (2b+2b->4b, 4x1b->4b) with exact oracle+lib+bin pricing (ORACLE_REBANK=1)
+    double oracleCostSnapshot();   // alpha*incrTNS_ + exact P/A + bin term (EVAL_CHECKPOINT)
     void captureOrigSlack();  // record clean input-file D-slack per logical FF (call once post-preprocess)
     double validateTNSOracle(bool restore); // recompute TNS from clean base; returns oracle TNS
 

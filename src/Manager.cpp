@@ -4138,6 +4138,14 @@ void Manager::oracleRebankRefine(){
     double margin     = []{ const char* e=std::getenv("REBANK_MARGIN"); return e?std::atof(e):0.0;   }();
     bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
     if(!incr){ std::cerr << "[REBANK] skipped (needs INCR_RELOC=1)\n"; return; }
+    // REBANK_PROXY=1: controlled counterfactual for the paper — identical operator,
+    // identical candidates and commit machinery, but the ACCEPT decision is quoted by
+    // the inherited one-hop proxy (Banking::CostCompare, positive = gain) instead of
+    // the exact oracle. Screening still ranks by oracle estimate (same candidate order)
+    // so the ONLY variable is the accept pricing. Default off (byte-exact).
+    bool proxyAccept = std::getenv("REBANK_PROXY") && std::atoi(std::getenv("REBANK_PROXY"));
+    std::unique_ptr<Banking> proxyBanker;
+    if(proxyAccept) proxyBanker.reset(new Banking(*this));
     auto t0 = std::chrono::high_resolution_clock::now();
     auto elapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-t0).count(); };
 
@@ -4207,6 +4215,27 @@ void Manager::oracleRebankRefine(){
             FF* nf = bankFF_deferred(place, tgt, group, undo);
             double newTNS = incrAccurateRecomputeFF(nf);
             double delta = alpha*(newTNS-curTNS) + dPA + lambda*dv;
+            if(proxyAccept){
+                // quote the SAME move with the inherited proxy; CostCompare gain>0 = accept.
+                // (rollback first so the proxy prices the pre-move state, as it would in-flow)
+                rollbackBank(undo);
+                for(FF* f : group){ incrAccurateRecomputeFF(f); }
+                incrTNS_ = curTNS;
+                double gain = proxyBanker->CostCompare(place, tgt, group);
+                if(gain > 0){
+                    BankUndo undo2;
+                    FF* nf2 = bankFF_deferred(place, tgt, group, undo2);
+                    double nt2 = incrAccurateRecomputeFF(nf2);
+                    commitFinalizeBank(undo2);
+                    nf2->setIsLegalize(true);
+                    legalizer->UpdateRows(nf2);
+                    binTable.applyMutation(oldRects, {{place.x, place.y, tgt->getW(), tgt->getH()}});
+                    curTNS = nt2;
+                    return true;
+                }
+                for(FF* f : group) legalizer->UpdateRows(f);
+                return false;
+            }
             if(delta < -1e-9){
                 commitFinalizeBank(undo);                       // recycles group pointers — rects pre-snapshotted
                 nf->setIsLegalize(true);
@@ -4311,6 +4340,16 @@ void Manager::oracleRebankRefine(){
     }
     std::cerr << "[REBANK] total accepted=" << accTotal << " tried=" << triedTotal
               << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << elapsed() << "s\n";
+}
+
+// Oracle-maintained official-cost snapshot (for EVAL_CHECKPOINT): alpha*incrTNS_
+// + exact lib power/area sums + the real bin-violation term. Read-only.
+double Manager::oracleCostSnapshot(){
+    double pa=0;
+    for(auto& kv : FF_Map){ FF* f=kv.second; if(!f) continue;
+        pa += beta*f->getCell()->getGatePower() + gamma*f->getCell()->getArea(); }
+    double tnsTerm = incrBuilt_ ? alpha*incrTNS_ : -1.0;
+    return tnsTerm < 0 ? -1.0 : tnsTerm + pa + calculateBinDensityCost();
 }
 
 // ==================== Bin-Density Repair Refinement ====================
