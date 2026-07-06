@@ -197,6 +197,30 @@ int main(int argc, char *argv[]){
                       << " dmultihop=" << (mh1-mh0) << "\n";
         }
     }
+    // PROBE_CELL="<ffName> <libCell>": swap ONE 1-bit physical FF's cell in place
+    // (choose an equal-footprint, equal-power variant so the evaluator diff is a
+    // pure alpha*dTNS from the Qpd/pin-offset change). Companion to PROBE_MOVE:
+    // isolates structural-op pricing semantics from wirelength pricing.
+    if(const char* pc = std::getenv("PROBE_CELL")){
+        std::string s(pc); size_t sp = s.find(' ');
+        std::string name = s.substr(0, sp), cn = s.substr(sp + 1);
+        auto it = mgr.FF_Map.find(name);
+        Cell* nc = nullptr;
+        for(auto c : mgr.Bit_FF_Map[1]) if(c->getCellName() == cn) nc = c;
+        if(it == mgr.FF_Map.end() || !nc){ std::cerr << "[PROBEC] not found: " << s << "\n"; }
+        else{
+            FF* ff = it->second;
+            auto sum1hop = [&](){ double t=0; for(auto& kv : mgr.FF_Map) t += kv.second->getTNS(); return t; };
+            mgr.incrAccurateBuild();
+            double mh0 = mgr.incrTNS_, oh0 = sum1hop();
+            Cell* oc = ff->getCell();
+            ff->setCell(nc);  // equal-footprint variants only; no legalizer update needed
+            double mh1 = mgr.incrAccurateRecomputeFF(ff), oh1 = sum1hop();
+            std::cerr << "[PROBEC] ff=" << name << " " << oc->getCellName() << "->" << cn
+                      << " dQpd=" << std::fixed << (nc->getQpinDelay() - oc->getQpinDelay())
+                      << " d1hop=" << (oh1 - oh0) << " dmultihop=" << (mh1 - mh0) << "\n";
+        }
+    }
     if(std::getenv("TNS_ORACLE_VALIDATE"))
         STAGE("oracleValidate", mgr.validateTNSOracle(true));
 
