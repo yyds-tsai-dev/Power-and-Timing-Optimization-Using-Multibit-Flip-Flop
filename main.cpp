@@ -164,6 +164,39 @@ int main(int argc, char *argv[]){
         mgr.checker();
     }
 
+    // PROBE_MOVE="<ffName> <dx> <dy>": displace ONE physical FF to the nearest legal
+    // site at (old+dx, old+dy) just before dump, printing the 1-hop and multihop model
+    // deltas for the realized move. Evaluator diff vs an unprobed run gives the true
+    // delta — the three-way comparison pins down the evaluator's timing semantics.
+    // (Oracle-gap probe harness; see reports/v1/2026-07-06_diagnosis_*.md)
+    if(const char* pv = std::getenv("PROBE_MOVE")){
+        std::string s(pv); std::string name; double dx=0, dy=0;
+        { size_t a=s.find(' '); size_t b=s.rfind(' ');
+          if(a!=std::string::npos && b!=std::string::npos && b>a){
+              name=s.substr(0,a); dx=std::atof(s.substr(a+1,b-a-1).c_str()); dy=std::atof(s.substr(b+1).c_str()); } }
+        auto it = mgr.FF_Map.find(name);
+        if(it==mgr.FF_Map.end()){ std::cerr << "[PROBE] FF not found: " << name << "\n"; }
+        else{
+            FF* ff = it->second;
+            auto sum1hop=[&](){ double t=0; for(auto& kv : mgr.FF_Map) t += kv.second->getTNS(); return t; };
+            mgr.incrAccurateBuild();
+            double mh0 = mgr.incrTNS_;
+            double oh0 = sum1hop();
+            Coor oldP = ff->getNewCoor();
+            mgr.legalizer->FreeRect(oldP, ff->getCell()->getW(), ff->getCell()->getH());
+            mgr.legalizer->RemoveNodeByFFPtr(ff);
+            Coor p = mgr.legalizer->FindPlace(Coor(oldP.x+dx, oldP.y+dy), ff->getCell());
+            if(p.x==DBL_MAX){ p = oldP; std::cerr << "[PROBE] FindPlace failed, restoring\n"; }
+            ff->setNewCoor(p); ff->setCoor(p);
+            mgr.legalizer->UpdateRows(ff);
+            double mh1 = mgr.incrAccurateRecomputeFF(ff);
+            double oh1 = sum1hop();
+            std::cerr << "[PROBE] ff=" << name << " old=(" << oldP.x << "," << oldP.y << ")"
+                      << " new=(" << p.x << "," << p.y << ")"
+                      << " d1hop=" << std::fixed << (oh1-oh0)
+                      << " dmultihop=" << (mh1-mh0) << "\n";
+        }
+    }
     if(std::getenv("TNS_ORACLE_VALIDATE"))
         STAGE("oracleValidate", mgr.validateTNSOracle(true));
 
