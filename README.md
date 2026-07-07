@@ -1,142 +1,103 @@
-# 2024 ICCAD Problem B — MBFF Banking & Placement
+# Exact-Oracle Post-Placement Refinement for MBFF Banking
 
-> Fork of [coherent17's solution](https://github.com/coherent17/2024-ICCAD-Problem-B), extended with parallel banking, slack-aware cost infrastructure, and thesis research (Method D: Slack Redistribution + Max-Weight Matching).
+Solver for **ICCAD 2024 CAD Contest Problem B** (multi-bit flip-flop banking + placement).
+Fork of [coherent17's open-source contest flow](https://github.com/coherent17/2024-ICCAD-Problem-B), first strengthened in the front end (max-weight-matching banking, per-pin pricing, DP repairs), then rebuilt from detailed placement onward around an **evaluator-exact, side-effect-free incremental timing oracle** that prices every refinement move against the official cost function.
 
 ---
 
-## Performance Comparison
+## Results (official evaluator, 2026-07-06 record runs)
 
 ![Score Comparison](docs/score_comparison.png)
 
-### Best Results vs ICCAD 2024 Contest Top-3
+One **unified configuration** — a single environment recipe, zero per-case hyperparameters — beats the contest top-3 best entry on **all seven cases**. Every solution passes the official `preliminary-evaluator` (`Check pass`) plus the contest `sanity` and `placement_checker`.
 
-> **Reference** = best score among the three top contest teams per case (ICCAD 2024 contest results). **Lower = better. Bold = beats the contest best.**
-> **Ours** = base banking (LEMON max-weight matching + adaptive cost) **plus** env-gated post-legalization refinement v2 (2026-07-04, commit `c702d48`): interleaved RELOC + CRIT_SWAP + BIT_REPAIR (batch dynasearch, full-FF candidate set) + oracle-priced structural rebanking (2b+2b→4b, 4×1b→4b) + bin-density repair, all scored by the faithful incremental-STA engine. Official solo runs 2026-07-05. All scores from the real `preliminary-evaluator`, all legal (`Check pass` + sanity + placement_checker). Run: `BANKING_MODE=matching PRODUCTION=1 INCR_RELOC=1 RELOC=1 CRIT_SWAP=1 BIT_REPAIR=1 BIT_REPAIR_DYNA={1:hc02,hc03; 2:others} BIT_REPAIR_BATCH=1 REFINE_ALLFF=1 ALT_ROUNDS=2 BIT_REPAIR_TIME=600 ORACLE_REBANK=1 REBANK_TIME=240 DENSITY_REPAIR=1` (all gates default-off byte-exact).
-
-| Testcase | Contest top-3 best | **Ours** | Δ | β |
-|---|---:|---:|---:|---:|
-| testcase1_0812 | 739,200,000 | **734,810,950** | **−0.59%** | 2000 |
-| testcase2_0812 | 748,000 | **724,816** | **−3.10%** | 400 |
-| testcase3 | 729,300,000 | **726,167,604** | **−0.43%** | 10000 |
-| hiddencase01 | 31,510,000 | **30,188,054** | **−4.20%** | 200000 |
-| hiddencase02 | 13,280,000 | **10,187,367** | **−23.29%** | 40000 |
-| hiddencase03 | 55,940,000 | **55,795,744** | **−0.26%** | 400 |
-| hiddencase04 | 728,700,000 | **726,265,769** | **−0.33%** | 10000 |
-
-> **Beats the ICCAD 2024 contest top-3 (best entry per case) on all 7 cases; composite ratio 0.954.** Key unlock: `isLegalize` is Banking's work-queue marker, not placement liveness — the refinement suite had been silently excluding every Legalizer-placed FF (hc02: its entire 2-bit population). Details in `Project Knowledge/reports/v1/2026-07-04_exp_refine_allff_batch_rebank_density.md`.
-
-### Historical Per-Phase Scores (lower = better)
-
-| Testcase | Baseline | Stage B v2 | DP-v2 | Pin-offset | Adaptive DIST_BONUS | **Current (2026-06-15, best)** |
-|---|---:|---:|---:|---:|---:|---:|
-| testcase1_0812 | 743,005,833 | 742,555,934 | 741,282,699 | 740,426,488 | 740,715,329 | **735,461,390** |
-| testcase2_0812 | 830,273 | 815,494 | 799,642 | 772,711 | 771,385 | **743,940** |
-| testcase3 | 728,870,766 | 728,538,922 | 728,181,612 | 728,677,742 | 728,292,737 | **727,140,578** |
-| hiddencase01 | 32,732,137 | 31,462,728 | 31,239,556 | 31,070,005 | 31,108,205 | **30,281,151** |
-| hiddencase02 | 13,863,364 | 13,468,811 | 12,589,252 | 12,325,446 | 12,056,721 | **11,099,145** |
-| hiddencase03 | 55,941,538 | 55,934,849 | 55,917,540 | 55,860,767 | 55,866,361 | **55,846,482** |
-| hiddencase04 | 729,383,529 | 728,875,222 | 728,590,247 | 728,289,561 | 728,299,384 | **727,191,554** |
-
-### Banking Wall Time
-
-| Testcase | Baseline | Current Shipped | Delta |
+| Testcase | Contest top-3 best* | **Ours** | Δ |
 |---|---:|---:|---:|
-| testcase1_0812 | 6.7s | **5.4s** | **-20%** |
-| testcase2_0812 | 18.1s | **16.8s** | **-7%** |
-| testcase3 | 5.6s | **4.6s** | **-17%** |
-| testcase1_MBFF | 6.9s | **5.3s** | **-24%** |
-| testcase2_MBFF | 18.1s | **16.7s** | **-8%** |
-| hiddencase01 | 5.0s | **4.9s** | **-2%** |
-| hiddencase02 | 17.7s | **14.8s** | **-16%** |
-| hiddencase03 | 17.8s | **14.9s** | **-17%** |
-| hiddencase04 | 5.6s | **4.6s** | **-17%** |
+| testcase1_0812 | 739,235,861 | **734,319,834** | **−0.66%** |
+| testcase2_0812 | 744,231 | **723,165** | **−2.83%** |
+| testcase3 | 727,971,140 | **726,041,482** | **−0.27%** |
+| hiddencase01 | 31,507,917 | **30,062,537** | **−4.59%** |
+| hiddencase02 | 13,408,414 | **10,089,886** | **−24.75%** |
+| hiddencase03 | 55,941,500 | **55,781,010** | **−0.29%** |
+| hiddencase04 | 728,497,353 | **726,015,652** | **−0.34%** |
+
+**Composite ratio ≈ 0.952** against the top-3-best baseline. Strongest published methods on this benchmark reach 0.979 (DATE'26) and 0.991 (DAC'25 LBR, recomputed under the same baseline).
+\*exact per-case top-3 costs as re-evaluated in the DATE'26 study.
+
+Reproducibility: deterministic in practice — six of seven cases are byte-identical across repeats (hiddencase04 has one floating-point-noise accept, ~2×10⁻⁴% of score). Reference machine: 2.2 GHz Xeon E5-2630 v4, 8 threads, <4 GB RAM per case; full suite ≈ 3–5 h. Faster CPUs may score slightly better on the two wall-clock-capped cases (tc2, hc02) — the accept loop is monotone, so extra budget only helps.
 
 ---
 
-## Shipped Improvements
+## Method
 
-| Phase | Date | Change | Key Metric |
-|---|---|---|---|
-| 1.5 | 2026-04-13 | Disable mid-stage evaluator fork | Wall time **-29% to -65%** |
-| 3A-(a) | 2026-04-15 | Per-clkIDX parallel banking + thread-0 canonical reuse | Banking **-15~18%**, score -0.05~-0.08% |
-| 3C-T5 | 2026-04-16 | Bucketed parallel SliceRowsByGate | preLegalize **-13~15%**, banking **-7~18%** |
-| 3D-A | 2026-04-16 | Slack redistribution infra (experimental, env knob) | Infrastructure only; `SLACK_REDIST_MODE=0` default |
-| B-v1 | 2026-04-16 | LEMON max-weight matching for 2-bit banking | hc01 -3.88%, t2_0812 -2.24%, t2_MBFF -2.16% |
-| B-v2 | 2026-04-17 | Proximity-bonus edge weighting for matching | t3 -0.05%, hc03 -0.01% (minor tuning) |
-| DP-v1 | 2026-04-17 | Cost-aware GlobalSwap + enable ChangeCell | t2_0812 -2.02%, t2_MBFF -1.43%, hc02 -0.74% (vs B-v2) |
-| DP-v2 | 2026-04-17 | K=5 nearest GlobalSwap | hc02 -5.84%, hc01 -0.78%, t2_MBFF -0.81% (vs DP-v1) |
-| Per-pin | 2026-04-17 | Per-pin CostCompare: driver/load HPWL + max(0,-slack) TNS filter | t2_0812 -1.7%, hc02 -0.9% (vs old CostCompare, no DP) |
-| DP-v3 | 2026-04-17 | Iterative GS+CC with RtreeMap rebuild (fix DP-v2 stale rtree bug) | t2_0812 -1.40%, t2_MBFF -1.88%, hc02 -0.91% (vs DP-v2) |
-| Pin-offset | 2026-04-17 | Fix CostCompare: use target cell pin offsets instead of cell origin | t2_0812 -1.99%, hc02 -1.20% (vs per-pin without fix) |
-| Adaptive DIST_BONUS | 2026-04-18 | Per-edge adaptive DIST_BONUS: zero bonus for neg-slack pairs, THRESH=20 | hc02 -2.18%, t2_MBFF -1.25%, t2_0812 -0.17% (vs pin-offset) |
-| DP_SLOT_ASSIGN | 2026-04-20 | DetailAssignmentMBFF intra-only Hungarian as default | **strict 7-case win**: tc2 -0.189%, hc02 -0.791%, others -0.004~0 |
-| **Adaptive MATCH_K** | 2026-04-20 | **Banking MATCH_K=8 when β≤500, else 15 (β is the discriminator)** | **tc2 -0.997%, hc03 +0.019% noise, 5 cases byte-exact** |
+```
+inherited front end (proxy-priced)          refinement layer (exact-priced, this work)
+─────────────────────────────────           ──────────────────────────────────────────
+parse → debank → global place →       →     ┌ batch bit re-pairing  ┐
+cluster → bank → legalize → DP              │ structural rebanking  │ ←→ incremental
+                                            │ relocation / swap     │     timing oracle
+                                            │ merge ejection        │  (evaluator-exact,
+                                            └ bin-density eviction  ┘   side-effect-free)
+                                            interleaved rounds to convergence → dump
+                                            → official evaluator + both checkers
+```
+
+**Oracle.** All timing state is keyed by immutable logical objects (debanked single-bit FFs and gates), so banking never invalidates a cache; positions and clock-to-Q delays are read live through one logical→physical indirection. Three modes share a single cone-propagation core: full pass (validation ground truth), incremental cone recompute (after commits), and a side-effect-free delta mode that prices a hypothetical move through a per-bit override map in thread-local scratch — thousands of candidates are screened concurrently against one frozen state (~4,000 candidates/s at 8 threads; an exact trial-apply ≈ 12 ms). Incremental vs. full recomputation agrees to 0.000000 every round; deltas match apply-and-revert to 7.4×10⁻¹³.
+
+**Operators.** Batch bit re-pairing (inter-cell exchange + intra-cell slot permutation; exact re-pricing at apply time replaces conflict-disjoint batching, an order-of-magnitude commit-throughput gain at identical safety) · structural rebanking (2×2b→4b, 4×1b→4b; parallel screening at centroid → best-first staged exact trials with full rollback) · merge ejection (the inverse move: splits merges that exact pricing exposes as unprofitable; strict 7/7-case win on top of the converged configuration) · relocation & critical-pair swap (inherited move generators, re-priced by the oracle) · bin-density eviction (prices the λ·V term together with exact timing). All structural commits are monotone in the official cost; the schedule is anytime — interrupting at any stage boundary yields a legal solution, and the official score descends monotonically across all recorded checkpoints.
 
 ---
 
-## Thesis Direction: Method D
+## Quick Start
 
-**Slack Redistribution + Max-Weight Matching for Timing-Constrained MBFF Banking**
+```bash
+make boost          # first time only (downloads boost headers)
+make release        # NDEBUG build → ./cadb_0015_final
+# unified production configuration (the one behind every number above):
+env OMP_NUM_THREADS=8 BANKING_MODE=matching PRODUCTION=1 INCR_RELOC=1 \
+    RELOC=1 CRIT_SWAP=1 BIT_REPAIR=1 BIT_REPAIR_DYNA=2 BIT_REPAIR_RESCAN=4 \
+    BIT_REPAIR_BATCH=1 REFINE_ALLFF=1 BIT_REPAIR_INTRA=1 ALT_ROUNDS=2 \
+    BIT_REPAIR_TIME=1200 ORACLE_REBANK=1 REBANK_TIME=600 DENSITY_REPAIR=1 \
+    ORACLE_EJECT=1 EJECT_TIME=180 \
+    ./cadb_0015_final testcase/testcase2_0812.txt out.txt
+# verify with the official tools:
+evaluator/preliminary-evaluator testcase/testcase2_0812.txt out.txt
+checker/sanity testcase/testcase2_0812.txt out.txt
+checker/placement_checker testcase/testcase2_0812.txt out.txt
+```
 
-- **Stage A** (shipped): Redistribute D-pin slack along timing paths to per-FF budgets
-- **Stage B v2** (shipped): LEMON MaxWeightedMatching for pairwise 2-bit banking; greedy 4-bit+ fallback; proximity-bonus edge weighting
-- **Per-pin CostCompare + pin-offset fix** (shipped): Direction-aware per-pin D/Q HPWL with correct target cell pin offsets + max(0,-slack) TNS filter
-- **DP-v3** (shipped): Iterative GlobalSwap+ChangeCell with RtreeMap rebuild after cell type changes
-- **ComputeOptimalPosition** (implemented, not active): Slack-weighted median of driver/load positions; tested but doesn't improve 2-bit matching (pre-placement already near-optimal)
-- **Stage C** (planned): Iterative 2-bit -> 4-bit -> 8-bit extension (v2 attempted, hc01 regression — needs skip logic)
-- **Stage D** (planned): Critical-FF rescue pass
+Requirements: g++ ≥ 9 (OpenMP), network for `make boost`. LEMON is vendored under `lib/lemon`. OR-Tools is optional (experimental LP path only, off by default).
+
+### Configuration switches
+
+Every algorithmic gate is an environment variable and is **byte-exact when off** — setting any gate to 0 reproduces the pre-feature behavior exactly.
+
+| Switch | Meaning |
+|---|---|
+| `BANKING_MODE=matching` | max-weight-matching banking (mandatory for scoring runs) |
+| `BIT_REPAIR=1` + `BIT_REPAIR_BATCH/INTRA/RESCAN/DYNA` | batch bit re-pairing family (budget `BIT_REPAIR_TIME`, s) |
+| `REFINE_ALLFF=1` | full move space (removes a stale work-queue-flag exclusion) |
+| `ORACLE_REBANK=1` | oracle-priced structural rebanking (budget `REBANK_TIME`, s) |
+| `ORACLE_EJECT=1` | oracle-priced merge ejection (budget `EJECT_TIME`, s) |
+| `DENSITY_REPAIR=1` | bin-density eviction with combined timing+density pricing |
+| `ALT_ROUNDS=2` | interleaved operator rounds |
+| `EVAL_CHECKPOINT=<prefix>` | dump a scoreable solution at every stage boundary |
+| `PROBE_MOVE` / `PROBE_CELL` | single-cell perturbation harnesses (model-vs-evaluator audits) |
 
 ---
 
-## Flow
+## Repository layout
 
-```mermaid
-graph TD;
-    Start-->Parser;
-    Parser-->Cell_library_Scoring;
-    Cell_library_Scoring-->Debanking_All_MBFF;
-    Debanking_All_MBFF-->Pre-GlobalPlacement;
-    Pre-GlobalPlacement-->Legalize_All_single-bit_FF;
-    Legalize_All_single-bit_FF-->SlackRedistribution;
-    SlackRedistribution-->MeanShift_Clustering;
-    MeanShift_Clustering-->Post-GlobalPlacement;
-    Post-GlobalPlacement-->Legalize;
-    Legalize-->DetailPlacement;
+```
+src/ inc/ main.cpp     flow + refinement implementation (C++14, OpenMP)
+evaluator/ checker/    official contest scoring and legality tools
+lib/lemon              vendored LEMON (max-weight matching)
+scripts/               benchmark / sweep helpers
+docs/                  charts
 ```
 
-## Usage
+Branches: `main` = this release line; `v3_experimental` = development head.
 
-Install Boost Package
-```
-$ sudo apt-get install libboost-all-dev
-$ make boost
-```
+## Credits
 
-Compile
-```
-$ make or make -j
-```
-
-Run testcase
-```
-$ make run1
-$ make run2
-$ make run3
-$ make run4
-$ make run5
-```
-
-Run with LEMON matching banking (Stage B)
-```
-$ BANKING_MODE=matching PRODUCTION=1 make run1
-```
-
-Run with slack redistribution (experimental)
-```
-$ SLACK_REDIST_MODE=1 SLACK_OVERSHOOT_WEIGHT=1.0 make run1
-```
-
-Update performance chart
-```
-$ python3 ../scripts/plot_score_comparison.py
-```
+Base flow: [coherent17/2024-ICCAD-Problem-B](https://github.com/coherent17/2024-ICCAD-Problem-B) (ICCAD 2024 contest reference-flow implementation). Contest benchmarks, evaluator, and checkers © ICCAD 2024 CAD Contest organizers.
