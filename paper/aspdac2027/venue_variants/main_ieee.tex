@@ -1,0 +1,33 @@
+% DATE/ICCAD-style IEEE variant — same section sources, IEEEtran wrapper.
+% Build from paper_aspdac2027/: latexmk -pdf -output-directory=venue_variants venue_variants/main_ieee.tex
+\documentclass[conference]{IEEEtran}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{amsmath}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\tns}{\mathit{TNS}}
+% acmart-compat shims
+\providecommand{\ccsdesc}[2][]{}
+\begin{document}
+\title{Exact-Oracle Post-Placement Refinement for Multi-Bit Flip-Flop Banking: Structural Rebanking without Cascades}
+\author{\IEEEauthorblockN{Anonymous Author(s)}\IEEEauthorblockA{Anonymous Institution}}
+\maketitle
+\begin{abstract}
+\input{venue_variants/abstract_body}
+\end{abstract}
+\begin{IEEEkeywords}
+multi-bit flip-flop, banking, incremental timing analysis, detailed placement, local search
+\end{IEEEkeywords}
+\input{sections/01_intro}
+\input{sections/02_background}
+\input{sections/03_oracle}
+\input{sections/04_operators}
+\input{sections/05_experiments}
+\input{sections/06_conclusion}
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+\end{document}

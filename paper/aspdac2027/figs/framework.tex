@@ -1,0 +1,42 @@
+% Framework overview (Fig. 1) — explicit-grid layout, \resizebox-guaranteed page fit
+\begin{figure*}[t]
+\centering
+\resizebox{0.86\textwidth}{!}{%
+\begin{tikzpicture}[font=\footnotesize, x=1mm, y=1mm,
+  stage/.style={draw=black!55, rounded corners=1.5pt, align=center, inner sep=3pt},
+  inherited/.style={stage, fill=black!6},
+  ours/.style={stage, fill=blue!8},
+  arr/.style={-{Stealth[length=1.8mm]}, black!70, semithick}]
+
+% ---- operator row (top): 4 boxes, 30mm wide, 5mm gaps, centered on x=0
+\node[ours, minimum width=30mm, minimum height=9mm] (op1) at (-52.5, 16) {batch bit\\ re-pairing};
+\node[ours, minimum width=30mm, minimum height=9mm] (op2) at (-17.5, 16) {structural\\ rebanking};
+\node[ours, minimum width=30mm, minimum height=9mm] (op3) at ( 17.5, 16) {relocation\\ / swap};
+\node[ours, minimum width=30mm, minimum height=9mm] (op4) at ( 52.5, 16) {density\\ eviction};
+
+% ---- oracle bar (bottom, spanning under the operator row)
+\node[ours, minimum width=135mm, minimum height=10mm] (oracle) at (0, 0)
+  {\textbf{evaluator-exact incremental oracle}\quad
+   side-effect-free\; $\Delta = \alpha\Delta\tns + \beta\Delta P + \gamma\Delta A + \lambda\Delta V$};
+
+% vertical price/commit arrows, one per operator, no crossings
+\foreach \o in {op1,op2,op3,op4} \draw[arr, <->] (\o.south) -- (\o.south |- oracle.north);
+
+% ---- flanks
+\node[inherited, minimum width=27mm, minimum height=23mm, font=\scriptsize] (front) at (-88, 8)
+  {\textbf{\footnotesize inherited front end}\\[1.5pt]
+   debank $\to$ global place\\ $\to$ cluster $\to$ bank $\to$\\ legalize $\to$ detailed place\\[1.5pt] (all proxy-priced)};
+\node[stage, minimum width=24mm, minimum height=21mm] (out) at (88, 8)
+  {\textbf{legal}\\ \textbf{solution}\\[2pt] evaluator\\ $+$ checkers};
+
+\draw[arr] (front.east) -- (-71.5, 8);
+\draw[arr] (71.5, 8) -- (out.west);
+
+% ---- dashed frame around ours, label OUTSIDE at top
+\draw[dashed, black!45, rounded corners=2pt] (-71.5, -6.5) rectangle (71.5, 22.5);
+\node[font=\scriptsize, black!55, anchor=south] at (0, 22.8)
+  {interleaved rounds; each operator exits at its convergence fixpoint};
+\end{tikzpicture}}
+\caption{Framework: operators price every accept through one side-effect-free exact-delta interface; outputs are verified by the official evaluator and checkers.}
+\label{fig:framework}
+\end{figure*}

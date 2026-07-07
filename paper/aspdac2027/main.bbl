@@ -1,0 +1,324 @@
+%%% -*-BibTeX-*-
+%%% Do NOT edit. File created by BibTeX with style
+%%% ACM-Reference-Format-Journals [18-Jan-2012].
+
+\begin{thebibliography}{22}
+
+%%% ====================================================================
+%%% NOTE TO THE USER: you can override these defaults by providing
+%%% customized versions of any of these macros before the \bibliography
+%%% command.  Each of them MUST provide its own final punctuation,
+%%% except for \shownote{} and \showURL{}.  The latter two
+%%% do not use final punctuation, in order to avoid confusing it with
+%%% the Web address.
+%%%
+%%% To suppress output of a particular field, define its macro to expand
+%%% to an empty string, or better, \unskip, like this:
+%%%
+%%% \newcommand{\showURL}[1]{\unskip}   % LaTeX syntax
+%%%
+%%% \def \showURL #1{\unskip}           % plain TeX syntax
+%%%
+%%% ====================================================================
+
+\ifx \showCODEN    \undefined \def \showCODEN     #1{\unskip}     \fi
+\ifx \showISBNx    \undefined \def \showISBNx     #1{\unskip}     \fi
+\ifx \showISBNxiii \undefined \def \showISBNxiii  #1{\unskip}     \fi
+\ifx \showISSN     \undefined \def \showISSN      #1{\unskip}     \fi
+\ifx \showLCCN     \undefined \def \showLCCN      #1{\unskip}     \fi
+\ifx \shownote     \undefined \def \shownote      #1{#1}          \fi
+\ifx \showarticletitle \undefined \def \showarticletitle #1{#1}   \fi
+\ifx \showURL      \undefined \def \showURL       {\relax}        \fi
+% The following commands are used for tagged output and should be
+% invisible to TeX
+\providecommand\bibfield[2]{#2}
+\providecommand\bibinfo[2]{#2}
+\providecommand\natexlab[1]{#1}
+\providecommand\showeprint[2][]{arXiv:#2}
+
+\bibitem[Chang et~al\mbox{.}(2010)]%
+        {chang2010postplacement}
+\bibfield{author}{\bibinfo{person}{Ya-Ting Chang}, \bibinfo{person}{Chih-Cheng
+  Hsu}, \bibinfo{person}{Mark Po-Hung Lin}, \bibinfo{person}{Yao-Wen Tsai},
+  {and} \bibinfo{person}{Sheng-Fong Chen}.} \bibinfo{year}{2010}\natexlab{}.
+\newblock \showarticletitle{Post-placement Power Optimization with Multi-Bit
+  Flip-Flops}. In \bibinfo{booktitle}{\emph{Proc.\ IEEE/ACM International
+  Conference on Computer-Aided Design (ICCAD)}}.
+\newblock
+\href{https://doi.org/10.1109/ICCAD.2010.5654155}{doi:\nolinkurl{10.1109/ICCAD.2010.5654155}}
+
+
+\bibitem[Chen et~al\mbox{.}(2026)]%
+        {chen2026agile}
+\bibfield{author}{\bibinfo{person}{Huan-Yuan Chen}, \bibinfo{person}{Yu-Ruei
+  Lin}, \bibinfo{person}{Mark Po-Hung Lin}, {and} \bibinfo{person}{Hung-Ming
+  Chen}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \showarticletitle{Optimizing Multibit Flip-Flop Banking via Agile
+  In-Placement {PPA} Co-Optimization}. In \bibinfo{booktitle}{\emph{Proc.\
+  Design, Automation and Test in Europe (DATE)}}.
+\newblock
+\href{https://doi.org/10.23919/DATE69613.2026.11539424}{doi:\nolinkurl{10.23919/DATE69613.2026.11539424}}
+
+
+\bibitem[Chen et~al\mbox{.}(2008)]%
+        {chen2008ntuplace3}
+\bibfield{author}{\bibinfo{person}{Tung-Chieh Chen}, \bibinfo{person}{Zhe-Wei
+  Jiang}, \bibinfo{person}{Tien-Chang Hsu}, \bibinfo{person}{Hsin-Chen Chen},
+  {and} \bibinfo{person}{Yao-Wen Chang}.} \bibinfo{year}{2008}\natexlab{}.
+\newblock \showarticletitle{{NTUplace3}: An Analytical Placer for Large-Scale
+  Mixed-Size Designs with Preplaced Blocks and Density Constraints}.
+\newblock \bibinfo{journal}{\emph{IEEE Transactions on Computer-Aided Design of
+  Integrated Circuits and Systems}} \bibinfo{volume}{27}, \bibinfo{number}{7}
+  (\bibinfo{year}{2008}), \bibinfo{pages}{1228--1240}.
+\newblock
+\href{https://doi.org/10.1109/TCAD.2008.923063}{doi:\nolinkurl{10.1109/TCAD.2008.923063}}
+
+
+\bibitem[Chen et~al\mbox{.}(2024)]%
+        {chen2024slackredist}
+\bibfield{author}{\bibinfo{person}{Yen-Yu Chen}, \bibinfo{person}{Hao-Yu Wu},
+  \bibinfo{person}{Iris Hui-Ru Jiang}, \bibinfo{person}{Cheng-Hong Tsai}, {and}
+  \bibinfo{person}{Chien-Cheng Wu}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Slack Redistributed Register Clustering with
+  Mixed-Driving Strength Multi-bit Flip-Flops}. In
+  \bibinfo{booktitle}{\emph{Proc.\ International Symposium on Physical Design
+  (ISPD)}}.
+\newblock
+\href{https://doi.org/10.1145/3626184.3633327}{doi:\nolinkurl{10.1145/3626184.3633327}}
+
+
+\bibitem[{coherent17}(2024)]%
+        {baselineRepo}
+\bibfield{author}{\bibinfo{person}{{coherent17}}.}
+  \bibinfo{year}{2024}\natexlab{}.
+\newblock \bibinfo{title}{2024-{ICCAD}-{Problem}-{B}: open-source contest
+  flow}.
+\newblock
+  \bibinfo{howpublished}{\url{https://github.com/coherent17/2024-ICCAD-Problem-B}}.
+\newblock
+\newblock
+\shownote{Third-party baseline implementation}.
+
+
+\bibitem[Congram et~al\mbox{.}(2002)]%
+        {congram2002dynasearch}
+\bibfield{author}{\bibinfo{person}{Richard~K. Congram},
+  \bibinfo{person}{Chris~N. Potts}, {and} \bibinfo{person}{Steef~L. van~de
+  Velde}.} \bibinfo{year}{2002}\natexlab{}.
+\newblock \showarticletitle{An Iterated Dynasearch Algorithm for the
+  Single-Machine Total Weighted Tardiness Scheduling Problem}.
+\newblock \bibinfo{journal}{\emph{INFORMS Journal on Computing}}
+  \bibinfo{volume}{14}, \bibinfo{number}{1} (\bibinfo{year}{2002}),
+  \bibinfo{pages}{52--67}.
+\newblock
+\href{https://doi.org/10.1287/ijoc.14.1.52.7712}{doi:\nolinkurl{10.1287/ijoc.14.1.52.7712}}
+
+
+\bibitem[Das~Sarma et~al\mbox{.}(2026)]%
+        {dassarma2026timber}
+\bibfield{author}{\bibinfo{person}{Aditya Das~Sarma}, \bibinfo{person}{Shui
+  Jiang}, \bibinfo{person}{Wan-Luan Lee}, \bibinfo{person}{Tsung-Yi Ho}, {and}
+  \bibinfo{person}{Tsung-Wei Huang}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \showarticletitle{{TIMBER}: A Fast Algorithm for Timing and Power
+  Optimization using Multi-bit Flip-flops}. In \bibinfo{booktitle}{\emph{Proc.\
+  Asia and South Pacific Design Automation Conference (ASP-DAC)}}.
+\newblock
+\href{https://doi.org/10.1109/ASP-DAC66049.2026.11420570}{doi:\nolinkurl{10.1109/ASP-DAC66049.2026.11420570}}
+
+
+\bibitem[Fang et~al\mbox{.}(2024)]%
+        {fang2024overview}
+\bibfield{author}{\bibinfo{person}{Shao-Yun Fang}, \bibinfo{person}{Yi-Yu Liu},
+  \bibinfo{person}{Chung-Kuan Cheng}, {and} \bibinfo{person}{Tsun-Ming Tseng}.}
+  \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Overview of 2024 {CAD} Contest at {ICCAD}}. In
+  \bibinfo{booktitle}{\emph{Proc.\ IEEE/ACM International Conference on
+  Computer-Aided Design (ICCAD)}}.
+\newblock
+\href{https://doi.org/10.1145/3676536.3689908}{doi:\nolinkurl{10.1145/3676536.3689908}}
+
+
+\bibitem[Gong et~al\mbox{.}(2025)]%
+        {gong2025iscas}
+\bibfield{author}{\bibinfo{person}{Tingxuan Gong}, \bibinfo{person}{Wenxu
+  Ruan}, \bibinfo{person}{Dongwei Tan}, \bibinfo{person}{Zhendong He},
+  \bibinfo{person}{Zhifeng Lin}, {and} \bibinfo{person}{Jianli Chen}.}
+  \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Multi-Bit Flip-Flop Based Timing and Power
+  Optimization under Advanced Technology Nodes}. In
+  \bibinfo{booktitle}{\emph{Proc.\ IEEE International Symposium on Circuits and
+  Systems (ISCAS)}}.
+\newblock
+\href{https://doi.org/10.1109/ISCAS56072.2025.11044076}{doi:\nolinkurl{10.1109/ISCAS56072.2025.11044076}}
+
+
+\bibitem[Huang et~al\mbox{.}(2021)]%
+        {huang2021opentimer2}
+\bibfield{author}{\bibinfo{person}{Tsung-Wei Huang}, \bibinfo{person}{Guannan
+  Guo}, \bibinfo{person}{Chun-Xun Lin}, {and} \bibinfo{person}{Martin D.~F.
+  Wong}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{{OpenTimer} v2: A New Parallel Incremental Timing
+  Analysis Engine}.
+\newblock \bibinfo{journal}{\emph{IEEE Transactions on Computer-Aided Design of
+  Integrated Circuits and Systems}} \bibinfo{volume}{40}, \bibinfo{number}{4}
+  (\bibinfo{year}{2021}), \bibinfo{pages}{776--789}.
+\newblock
+\href{https://doi.org/10.1109/TCAD.2020.3007319}{doi:\nolinkurl{10.1109/TCAD.2020.3007319}}
+
+
+\bibitem[Huang and Wong(2015)]%
+        {huang2015opentimer}
+\bibfield{author}{\bibinfo{person}{Tsung-Wei Huang} {and}
+  \bibinfo{person}{Martin D.~F. Wong}.} \bibinfo{year}{2015}\natexlab{}.
+\newblock \showarticletitle{{OpenTimer}: A High-Performance Timing Analysis
+  Tool}. In \bibinfo{booktitle}{\emph{Proc.\ IEEE/ACM International Conference
+  on Computer-Aided Design (ICCAD)}}.
+\newblock
+\href{https://doi.org/10.1109/ICCAD.2015.7372666}{doi:\nolinkurl{10.1109/ICCAD.2015.7372666}}
+
+
+\bibitem[Kahng et~al\mbox{.}(2024)]%
+        {kahng2024scalable}
+\bibfield{author}{\bibinfo{person}{Andrew~B. Kahng},
+  \bibinfo{person}{Bodhisatta Kundu}, {and} \bibinfo{person}{Dooseok
+  Thumathy}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Scalable Flip-Flop Clustering Using Divide and
+  Conquer for Capacitated K-Means}. In \bibinfo{booktitle}{\emph{Proc.\ Great
+  Lakes Symposium on VLSI (GLSVLSI)}}.
+\newblock
+\href{https://doi.org/10.1145/3649476.3658744}{doi:\nolinkurl{10.1145/3649476.3658744}}
+
+
+\bibitem[Kahng et~al\mbox{.}(2016)]%
+        {kahng2016floptray}
+\bibfield{author}{\bibinfo{person}{Andrew~B. Kahng}, \bibinfo{person}{Jiajia
+  Li}, {and} \bibinfo{person}{Lutong Wang}.} \bibinfo{year}{2016}\natexlab{}.
+\newblock \showarticletitle{Improved Flop Tray-Based Design Implementation for
+  Power Reduction}. In \bibinfo{booktitle}{\emph{Proc.\ IEEE/ACM International
+  Conference on Computer-Aided Design (ICCAD)}}.
+\newblock
+\href{https://doi.org/10.1145/2966986.2967047}{doi:\nolinkurl{10.1145/2966986.2967047}}
+
+
+\bibitem[Li et~al\mbox{.}(2025)]%
+        {li2025lbr}
+\bibfield{author}{\bibinfo{person}{Cheng-Yen Li}, \bibinfo{person}{Chuan-Chi
+  Su}, \bibinfo{person}{Zheng-Wei Chen}, \bibinfo{person}{Shao-Hsiang Chen},
+  {and} \bibinfo{person}{Yao-Wen Chang}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Late Breaking Results: Multi-Objective Multi-Bit
+  Flip-Flop Placement Considering Pre-Placed Cells}. In
+  \bibinfo{booktitle}{\emph{Proc.\ Design Automation Conference (DAC)}}.
+\newblock
+\href{https://doi.org/10.1109/DAC63849.2025.11133043}{doi:\nolinkurl{10.1109/DAC63849.2025.11133043}}
+
+
+\bibitem[Liao et~al\mbox{.}(2022)]%
+        {liao2022dreamplace4}
+\bibfield{author}{\bibinfo{person}{Peiyu Liao}, \bibinfo{person}{Siting Liu},
+  \bibinfo{person}{Zhitang Chen}, \bibinfo{person}{Wenlong Lv},
+  \bibinfo{person}{Yibo Lin}, {and} \bibinfo{person}{Bei Yu}.}
+  \bibinfo{year}{2022}\natexlab{}.
+\newblock \showarticletitle{{DREAMPlace} 4.0: Timing-driven Global Placement
+  with Momentum-based Net Weighting}. In \bibinfo{booktitle}{\emph{Proc.\
+  Design, Automation and Test in Europe (DATE)}}.
+\newblock
+\href{https://doi.org/10.23919/DATE54114.2022.9774725}{doi:\nolinkurl{10.23919/DATE54114.2022.9774725}}
+
+
+\bibitem[Lim and Park(2025)]%
+        {date2025tddp}
+\bibfield{author}{\bibinfo{person}{Dhoui Lim} {and} \bibinfo{person}{Heechun
+  Park}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Timing-Driven Detailed Placement with Unsupervised
+  Graph Learning}. In \bibinfo{booktitle}{\emph{Proc.\ Design, Automation and
+  Test in Europe (DATE)}}.
+\newblock
+\href{https://doi.org/10.23919/DATE64628.2025.10992920}{doi:\nolinkurl{10.23919/DATE64628.2025.10992920}}
+
+
+\bibitem[Lin et~al\mbox{.}(2020)]%
+        {lin2020abcdplace}
+\bibfield{author}{\bibinfo{person}{Yibo Lin}, \bibinfo{person}{Wuxi Li},
+  \bibinfo{person}{Jiaqi Gu}, \bibinfo{person}{Haoxing Ren},
+  \bibinfo{person}{Brucek Khailany}, {and} \bibinfo{person}{David~Z. Pan}.}
+  \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{{ABCDPlace}: Accelerated Batch-Based Concurrent
+  Detailed Placement on Multithreaded {CPUs} and {GPUs}}.
+\newblock \bibinfo{journal}{\emph{IEEE Transactions on Computer-Aided Design of
+  Integrated Circuits and Systems}} \bibinfo{volume}{39}, \bibinfo{number}{12}
+  (\bibinfo{year}{2020}), \bibinfo{pages}{5083--5096}.
+\newblock
+\href{https://doi.org/10.1109/TCAD.2020.2971531}{doi:\nolinkurl{10.1109/TCAD.2020.2971531}}
+
+
+\bibitem[Lu et~al\mbox{.}(2015)]%
+        {lu2015eplace}
+\bibfield{author}{\bibinfo{person}{Jingwei Lu}, \bibinfo{person}{Pengwen Chen},
+  \bibinfo{person}{Chin-Chih Chang}, \bibinfo{person}{Lu Sha},
+  \bibinfo{person}{Dennis Jen-Hsin Huang}, \bibinfo{person}{Chin-Chi Teng},
+  {and} \bibinfo{person}{Chung-Kuan Cheng}.} \bibinfo{year}{2015}\natexlab{}.
+\newblock \showarticletitle{{ePlace}: Electrostatics-Based Placement Using Fast
+  Fourier Transform and {Nesterov}'s Method}.
+\newblock \bibinfo{journal}{\emph{ACM Transactions on Design Automation of
+  Electronic Systems}} \bibinfo{volume}{20}, \bibinfo{number}{2}
+  (\bibinfo{year}{2015}).
+\newblock
+\href{https://doi.org/10.1145/2699873}{doi:\nolinkurl{10.1145/2699873}}
+
+
+\bibitem[Pan et~al\mbox{.}(2005)]%
+        {pan2005fastdp}
+\bibfield{author}{\bibinfo{person}{Min Pan}, \bibinfo{person}{Natarajan
+  Viswanathan}, {and} \bibinfo{person}{Chris Chu}.}
+  \bibinfo{year}{2005}\natexlab{}.
+\newblock \showarticletitle{An Efficient and Effective Detailed Placement
+  Algorithm}. In \bibinfo{booktitle}{\emph{Proc.\ IEEE/ACM International
+  Conference on Computer-Aided Design (ICCAD)}}. \bibinfo{pages}{48--55}.
+\newblock
+\href{https://doi.org/10.1109/ICCAD.2005.1560039}{doi:\nolinkurl{10.1109/ICCAD.2005.1560039}}
+
+
+\bibitem[Roman-Vicharra et~al\mbox{.}(2024)]%
+        {romanvicharra2024ffcentric}
+\bibfield{author}{\bibinfo{person}{Cristhian Roman-Vicharra},
+  \bibinfo{person}{Jiang Chen}, {and} \bibinfo{person}{Jiang Hu}.}
+  \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Flip-Flop Centric Incremental Placement for
+  Simultaneous Timing and Clock Network Power Optimization}. In
+  \bibinfo{booktitle}{\emph{Proc.\ ACM/IEEE Workshop on Machine Learning for
+  CAD (MLCAD)}}.
+\newblock
+\href{https://doi.org/10.1145/3670474.3685949}{doi:\nolinkurl{10.1145/3670474.3685949}}
+
+
+\bibitem[Shyu et~al\mbox{.}(2013)]%
+        {shyu2013effective}
+\bibfield{author}{\bibinfo{person}{Yaw-Tzong Shyu}, \bibinfo{person}{Jai-Ming
+  Lin}, \bibinfo{person}{Chun-Po Huang}, \bibinfo{person}{Cheng-Wu Lin},
+  \bibinfo{person}{Ying-Zhih Lin}, {and} \bibinfo{person}{Soon-Jyh Chang}.}
+  \bibinfo{year}{2013}\natexlab{}.
+\newblock \showarticletitle{Effective and Efficient Approach for Power
+  Reduction by Using Multi-Bit Flip-Flops}.
+\newblock \bibinfo{journal}{\emph{IEEE Transactions on Very Large Scale
+  Integration (VLSI) Systems}} \bibinfo{volume}{21}, \bibinfo{number}{4}
+  (\bibinfo{year}{2013}), \bibinfo{pages}{624--635}.
+\newblock
+\href{https://doi.org/10.1109/TVLSI.2012.2190535}{doi:\nolinkurl{10.1109/TVLSI.2012.2190535}}
+
+
+\bibitem[Yang et~al\mbox{.}(2024)]%
+        {yang2024contest}
+\bibfield{author}{\bibinfo{person}{Sheng-Wei Yang}, \bibinfo{person}{Jhih-Wei
+  Hsu}, \bibinfo{person}{Ting-Wei Lee}, \bibinfo{person}{Tzu-Hsuan Chen}, {and}
+  \bibinfo{person}{Cindy Chin-Fang Shen}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{2024 {ICCAD} {CAD} Contest Problem {B}: Power and
+  Timing Optimization Using Multibit Flip-Flop}. In
+  \bibinfo{booktitle}{\emph{Proc.\ IEEE/ACM International Conference on
+  Computer-Aided Design (ICCAD)}}.
+\newblock
+\href{https://doi.org/10.1145/3676536.3689911}{doi:\nolinkurl{10.1145/3676536.3689911}}
+\newblock
+\shownote{Invited contest paper}.
+
+
+\end{thebibliography}

@@ -1,0 +1,6 @@
+% Section 6 — Conclusion (bookend pair with sections/01_intro.tex)
+\section{Conclusion}
+
+We presented a post-placement MBFF refinement framework in which every accept decision is priced by an evaluator-exact, side-effect-free incremental timing oracle. Exact pricing converts structural rebanking from a cascading liability into strictly monotone improvement, raises batch commit throughput by an order of magnitude, and brings the density penalty into the same accept rule as timing. A single configuration beat the best contest top-3 entry on all seven ICCAD 2024 Problem~B benchmarks, reaching a composite ratio of 0.953, against 0.979--0.988 for the best previously published methods~\cite{li2025lbr,chen2026agile}.
+
+Three limitations bound these claims: all evidence comes from one benchmark family and its official cost function; the timing model is the contest's ideal-clock formulation, so clock-network effects lie outside both the scoring and our oracle; and under deadlines tighter than the convergence budgets used here, truncation variance would return. Future work extends the move space, under the same exact-pricing discipline, to debank and eject moves and to richer target bit widths.

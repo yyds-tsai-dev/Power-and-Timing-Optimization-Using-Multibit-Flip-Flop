@@ -1,0 +1,58 @@
+% ASP-DAC 2027 submission — double-blind review version
+% Build: latexmk -pdf main.tex
+\documentclass[sigconf,anonymous,review]{acmart}
+
+% ASP-DAC uses ACM template; page limit 6 pages + 1 page references.
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{booktabs}
+% float pressure relief: dense results section needs 3 floats near page 6
+\setcounter{topnumber}{3}\setcounter{totalnumber}{4}
+\renewcommand\topfraction{.95}\renewcommand\textfraction{.03}\renewcommand\floatpagefraction{.9}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta}
+\usepackage{xcolor}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+% Macros
+\newcommand{\tns}{\mathit{TNS}}
+
+\begin{document}
+
+\title{Exact-Oracle Post-Placement Refinement for Multi-Bit Flip-Flop Banking: Structural Rebanking without Cascades}
+
+% double-blind: no authors in review version (acmart 'anonymous' handles this)
+\author{Anonymous Author(s)}
+\affiliation{\institution{Anonymous Institution}\city{}\country{Anonymous}}
+
+\begin{abstract}
+Multi-bit flip-flop (MBFF) banking trades clock power and area against timing. Most flows drive it with proxy cost models, and the mispricing compounds: each committed merge distorts the cost of every later decision. On the ICCAD 2024 CAD Contest Problem~B benchmark, we show that the root cause is the pricing error rather than the move class. Structural rebanking moves that cascade under a one-hop proxy model (up to $+254\%$ score) become strictly profitable once re-priced exactly under staged, monotone acceptance. We present a post-placement refinement framework built on an evaluator-exact, side-effect-free incremental timing oracle. The oracle prices every candidate move in closed loop with the official cost function: bit re-pairing, structural rebanking of $2{\times}2\mathrm{b}{\to}4\mathrm{b}$ and $4{\times}1\mathrm{b}{\to}4\mathrm{b}$, positional relocation and swaps, and bin-density eviction. Exact pricing enables (i) batch local search that safely commits an order of magnitude more moves per round than conservative conflict-free batching, (ii) monotone-accept structural rebanking with rollback-safe staging, and (iii) refinement-side pricing of the density penalty term. A single configuration beats the contest top-3 best entry on all seven benchmarks; ours is the first published method to do so. It reaches a composite ratio of 0.953, where the strongest previously published methods reach 0.979--0.991, with every solution verified legal by the official evaluator.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+<concept>
+<concept_id>10010583.10010682.10010689</concept_id>
+<concept_desc>Hardware~Physical design (EDA)</concept_desc>
+<concept_significance>500</concept_significance>
+</concept>
+</ccs2012>
+\end{CCSXML}
+\ccsdesc[500]{Hardware~Physical design (EDA)}
+\keywords{multi-bit flip-flop, banking, incremental timing analysis, detailed placement, local search}
+
+\maketitle
+
+\input{sections/01_intro}
+\input{sections/02_background}
+\input{sections/03_oracle}
+\input{sections/04_operators}
+\input{sections/05_experiments}
+\input{sections/06_conclusion}
+
+\label{endofcontent}
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\end{document}

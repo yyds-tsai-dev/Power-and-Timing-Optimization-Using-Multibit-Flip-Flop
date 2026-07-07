@@ -1,0 +1,39 @@
+% DATE 6-page variant — trimmed copy of sections/03_oracle.tex
+\section{An Evaluator-Exact Incremental Timing Oracle}
+\label{sec:oracle}
+
+\subsection{Design Goal}
+\label{sec:oracle:goal}
+
+The oracle prices any candidate move under exactly the timing model the official evaluator applies to the final solution: per-sink displacement delay proportional to the two-point HPWL between driver pin and sink pin, under a single ideal clock~\cite{yang2024contest}. Three properties are required simultaneously: \emph{exactness}---the reported $\Delta\tns$ must equal the difference the evaluator itself would measure between the pre-move and post-move solutions; \emph{side-effect freedom}---evaluating a candidate must not mutate netlist or timing state, so thousands of candidates can be screened against one committed state without apply--revert churn; and \emph{locality}---one evaluation must cost the affected timing cone, not the design size.
+
+General-purpose incremental STA engines meet the last two goals for full industrial timing~\cite{huang2015opentimer,huang2021opentimer2}, but the contest model is far simpler, and that simplicity cuts both ways: it permits closed-form per-sink slack recomputation at cone cost, which we exploit, and it makes cheap proxies tempting---the inherited flow prices moves through a one-hop slack approximation, the DATE~2026 flow estimates timing through a local-critical-path wirelength proxy~\cite{chen2026agile}, and the two-page format of~\cite{li2025lbr} leaves its pricing model unspecified---none closing the loop with the scoring function. The oracle removes the model error entirely rather than tightening the approximation.
+
+\subsection{Timing State Keyed by Logical Objects}
+\label{sec:oracle:keying}
+
+Banking creates and destroys physical cells, so any timing cache keyed by physical instances is invalidated by exactly the moves for which accurate pricing matters most. The oracle instead keys all topology caches by \emph{immutable logical objects}: the single-bit flip-flops of the debanked netlist and the combinational gates. A merge only remaps logical bits to a new (cell, slot) pair, so fanin and fanout cone structure over logical objects is computed once and survives every structural mutation. Mutable leaf attributes---a bit's D/Q pin coordinates and its Q-pin (clock-to-Q) delay---are never cached but read live through the logical$\to$physical indirection: logical bit $\to$ hosting cell and slot $\to$ library pin offset plus the cell's current position. A structural move reduces to updating one indirection entry, and no cache ever needs rebuilding.
+
+\subsection{Three Evaluation Modes}
+\label{sec:oracle:modes}
+
+The oracle exposes three entry points with a shared cone-propagation core. A \emph{full pass} recomputes every sink slack from scratch in one parallel sweep: the validation ground truth, linear in design size. An \emph{incremental cone recompute} runs after a move commits, repropagating only the cones reachable from the touched pins and folding the updates into the committed caches, keeping committed state exact between moves at cone cost. A \emph{side-effect-free delta} prices a hypothetical move without touching committed state:
+\begin{enumerate}
+  \item Build a local \emph{override map} holding, for each moved bit, its hypothetical D/Q pin positions and Q-pin delay.
+  \item Collect the \emph{affected-sink set}: the moved bits, their direct fanout sinks, and the sinks driven through gates in the moved bits' forward combinational cones.
+  \item Walk the forward cones, resolving every pin attribute through the override map first and the committed state otherwise, accumulating recomputed slacks into thread-local scratch.
+  \item Return the weighted delta $\alpha\cdot\Delta\tns$ from the affected sinks; all scratch is discarded.
+\end{enumerate}
+Because committed state is read-only and scratch thread-local, arbitrarily many candidates can be priced concurrently against one committed state; all operators in Section~\ref{sec:operators} screen candidates in parallel with this mode and re-price serially at apply time.
+
+\subsection{Exactness Validation}
+\label{sec:oracle:validation}
+
+Two invariants are checked continuously in validation builds: after every refinement round the incrementally maintained $\tns$ total is compared against a full-pass recomputation (the difference is $0.000000$ on every round of every benchmark), and each side-effect-free delta is compared against the measured delta of actually applying and reverting the same move (maximum observed discrepancy $7.4\times10^{-13}$, attributable to floating-point summation order). The oracle is therefore not a tighter estimate but an implementation of the declared scoring semantics, self-consistent to floating-point precision. Externally, its maintained totals track the official evaluator within $0.05\%$ (median) across stage-boundary checkpoints on all seven cases, with a maximum residual of $1.1\%$ on the most TNS-weighted states; every reported result is in any case scored by the evaluator binary itself (Sec.~\ref{sec:mainresults}), so no claim in this paper rests on the residual.
+
+\subsection{From Bit Swaps to Structural Remaps}
+\label{sec:oracle:remaps}
+
+The delta evaluator was first built for same-cell bit swaps, where two bits exchange slots and only pin positions change. The override map generalizes it at no additional cost: remapping a \emph{group} of bits to a new cell adds exactly one field, the Q-pin delay override taken from the target cell's library entry. One mechanism therefore prices the entire move spectrum---slot swaps, relocations, and group-to-new-cell structural merges---so the rebanking of Section~\ref{sec:operators} screens structural candidates exactly before any netlist mutation occurs.
+
+Nothing in the framework depends on the contest model's simplicity: operators consume the oracle through one interface (a priced $\Delta$ for a hypothetical move), so an incremental signoff-grade engine~\cite{huang2021opentimer2} can substitute under richer delay models; what this paper isolates, by making pricing literally exact, is how much solution quality that fidelity is worth.

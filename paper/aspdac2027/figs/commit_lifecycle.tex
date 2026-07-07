@@ -1,0 +1,45 @@
+% =====================================================================
+% figs/commit_lifecycle.tex — staged commit lifecycle for structural
+% rebanking (conference adaptation of the journal figure; no ejection,
+% no code identifiers).
+% Requires TikZ libraries: positioning, arrows.meta (loaded in main.tex).
+% =====================================================================
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+    font=\footnotesize,
+    >={Stealth[length=1.5mm]},
+    box/.style={draw, rounded corners=1pt, inner sep=2.5pt, align=center},
+    scrn/.style={box, thick, fill=blue!10},
+    wire/.style={->, semithick},
+    note/.style={inner sep=1pt, align=center}
+  ]
+  % ---------------- pipeline (left to right) ----------------
+  \node[scrn, text width=22mm] (scr) at (1.10,3.20)
+    {parallel screening\\ (side-effect-free,\\ frozen state)};
+  \node[box, text width=28mm] (trial) at (4.10,3.20)
+    {best-first exact trial\\ staged mutation,\\ deferred netlist maps};
+  \draw (6.85,3.78) -- (7.55,3.20) -- (6.85,2.62) -- (6.15,3.20) -- cycle;
+  \node[note] at (6.85,3.20) {$\Delta < 0$?};
+  \node[box, text width=13mm] (acc) at (8.75,3.20)
+    {finalize commit + update bins};
+  \draw[wire] (scr.east) -- (trial.west);
+  \draw[wire] (trial.east) -- (6.15,3.20);
+  \draw[wire] (7.55,3.20) -- (acc.west);
+  \node[note, text=green!50!black, anchor=south] at (7.80,3.30) {yes};
+
+  % ---------------- annotations under the trial box ----------------
+  \node[note, gray] at (4.10,2.25) {legal site search};
+
+  % ---------------- reject path: rollback + loop back ------
+  \node[box, text width=26mm] (rev) at (6.95,1.45)
+    {rollback: restore wiring,\\ pin map, placement};
+  \draw[wire] (6.85,2.62) -- ([xshift=-1.2mm]rev.north);
+  \node[note, text=red!70!black, anchor=west] at (6.95,2.30) {no};
+  \draw[wire] (rev.west) -| ([xshift=-11.5mm]trial.south);
+  \node[note, gray, anchor=south] at (3.95,1.52) {next candidate};
+\end{tikzpicture}}
+\caption{Staged commit lifecycle: screen on the frozen state, trial best-first, commit only on a negative exact delta; failed trials roll back completely.}
+\label{fig:commit_lifecycle}
+\end{figure}

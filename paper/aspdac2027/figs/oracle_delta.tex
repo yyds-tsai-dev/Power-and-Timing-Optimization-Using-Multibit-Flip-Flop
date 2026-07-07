@@ -1,0 +1,72 @@
+% =====================================================================
+% figs_ext/oracle_delta.tex — mechanism figure: side-effect-free delta
+% evaluation (journal-only; illustrates Sec. oracle:modes / oracle:remaps).
+% Requires TikZ libraries: positioning, fit, arrows.meta (loaded in main.tex).
+% Single column, ~55 mm tall; font \footnotesize; no pifont/amssymb.
+% Style matched to figs_ext/cascade.tex.
+% =====================================================================
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+    font=\footnotesize,
+    >={Stealth[length=1.5mm]},
+    cell/.style={draw, rounded corners=1pt, minimum height=4.5mm,
+                 minimum width=7mm, inner sep=2pt},
+    box/.style={draw, rounded corners=1pt, inner sep=2.5pt, align=center},
+    ovr/.style={box, thick, fill=blue!10},
+    gate/.style={draw, minimum height=4mm, minimum width=4.5mm, inner sep=1pt},
+    wire/.style={->, semithick},
+    note/.style={inner sep=1pt, align=center}
+  ]
+  % ---------------- left: committed state (read-only) ----------------
+  \node[box, text width=24mm] (caches) at (1.50,4.80)
+    {immutable caches\\ (per logical FF/gate)};
+  \node[box, text width=24mm] (live) at (1.50,3.45)
+    {live positions +\\ cell bindings\\ (logical$\to$physical\\ indirection)};
+  \node[draw, dashed, gray!70, rounded corners=1pt, inner sep=1.5mm,
+        fit=(caches)(live)] (committed) {};
+  \node[note, font=\footnotesize\bfseries, anchor=south, inner sep=2pt]
+    at (committed.north) {committed state (read-only)};
+
+  % ---------------- left, below: candidate move as override map -------
+  \node[ovr, text width=25mm] (ovr) at (1.50,1.55)
+    {candidate structural move:\\ override map\\ bit $\to$ (D, Q, $t_{cq}$)};
+
+  % ---------------- right: forward cone walk --------------------------
+  \node[note, font=\footnotesize\bfseries] at (6.00,5.30) {forward cone walk};
+  \node[note, gray, text width=44mm] at (6.00,4.85)
+    {override-first resolution;\\ thread-local scratch, zero writes};
+  % cone shading (background; covers the moved FF's forward fan)
+  \fill[blue!8] (3.75,3.35) -- (5.20,4.25) -- (7.60,4.25)
+                -- (7.60,2.45) -- (5.20,2.45) -- cycle;
+  \node[cell] (ffm) at (4.15,3.35) {FF$_m$};
+  \node[gate] (g1)  at (5.55,3.95) {g$_1$};
+  \node[gate] (g2)  at (5.55,2.75) {g$_2$};
+  \node[cell] (ffs1) at (7.10,3.95) {FF$_{s1}$};
+  \node[cell] (ffs2) at (7.10,2.75) {FF$_{s2}$};
+  \draw[wire] (ffm.east) -- (g1.west);
+  \draw[wire] (ffm.east) -- (g2.west);
+  \draw[wire] (g1.east)  -- (ffs1.west);
+  \draw[wire] (g2.east)  -- (ffs2.west);
+
+  % ---------------- flow arrows into the walk -------------------------
+  \draw[wire] (committed.east) -- (ffm.west)
+    node[note, gray, pos=0.72, above=1.6mm] {read};
+  \draw[wire] (ovr.east) -- (ffm.south west);
+
+  % ---------------- output: weighted delta + accept/reject fork -------
+  \node[box] (delta) at (4.35,0.65)
+    {$\Delta = \alpha\Delta\tns + \beta\Delta P$\\ $+\;\gamma\Delta A + \lambda\Delta V$};
+  \draw[wire] (6.20,2.45) -- (delta.north);
+  \node[note, gray, anchor=west] at (5.45,1.70) {affected sinks only};
+  \node[note, text=green!50!black, anchor=west] (acc) at (6.30,1.10)
+    {accept $\to$ commit};
+  \node[note, text=red!70!black, anchor=west, align=left] (rej) at (6.30,0.20)
+    {reject $\to$ nothing\\ to undo};
+  \draw[wire] (delta.east) -- (acc.west);
+  \draw[wire] (delta.east) -- (rej.west);
+\end{tikzpicture}}
+\caption{Side-effect-free delta evaluation: an override map plus a forward cone walk in thread-local scratch; a rejected candidate leaves nothing to undo.}
+\label{fig:oracle_delta}
+\end{figure}

@@ -1,0 +1,12 @@
+=== AI 使用揭露(camera-ready 時加入 Acknowledgments;投稿版因 double-blind 不含)===
+
+英文(IEEE 慣例措辭):
+"Portions of the manuscript text were drafted and revised with the assistance of
+a large language model (Anthropic Claude). All research ideas, algorithms,
+implementations, experiments, and results were designed, executed, and verified
+by the authors, who take full responsibility for the entire content of this paper."
+
+注意:
+1. 依 IEEE 政策放 Acknowledgments;若屆時 ASP-DAC 有專用欄位,以會方要求為準。
+2. 碩論同理:依 NYCU 當年度 AI 使用規範揭露(通常在論文前言或聲明頁)。口試前務必通讀全文。
+3. 教授必須知情。

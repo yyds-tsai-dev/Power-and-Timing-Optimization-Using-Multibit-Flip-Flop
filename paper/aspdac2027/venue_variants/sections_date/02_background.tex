@@ -1,0 +1,29 @@
+% DATE 6-page variant — trimmed copy of sections/02_background.tex
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{Problem~B and the Official Evaluator}
+\label{sec:problemb}
+
+The ICCAD 2024 CAD Contest Problem~B provides a legalized design with single- and multi-bit flip-flops, fixed combinational gates, and a library of MBFF variants differing in bit width, power, area, and pin geometry. A solution rebanks and replaces the flip-flops to minimize
+\begin{equation}
+S \;=\; \alpha \cdot \tns \;+\; \beta \cdot \mathit{Power} \;+\; \gamma \cdot \mathit{Area} \;+\; \lambda \cdot V,
+\label{eq:score}
+\end{equation}
+where $V$ counts placement bins whose utilization exceeds a per-testcase threshold, subject to hard legality constraints: no overlaps, and all cells on rows inside the die~\cite{yang2024contest,fang2024overview}. The weights $\alpha,\beta,\gamma,\lambda$ and a \emph{DisplacementDelay} constant vary per testcase, which shifts the dominant cost term between benchmarks.
+
+Scoring is defined operationally by an official evaluator binary whose timing semantics differ from conventional net models: the delay of each timing arc is $\mathit{DisplacementDelay}$ times the two-point half-perimeter wirelength between the driver pin and that individual sink pin---no shared net bounding box, no Steiner topology. Each sink's slack is its parse-time base slack adjusted by the change in the driving flip-flop's Q-pin delay when its cell type changes and by the change in the affected arc wire delays; $\tns$ sums the negative D-pin slacks over all flip-flops. Eq.~\eqref{eq:score} is evaluated on these semantics and on nothing else, so monotone score descent requires reproducing them exactly.
+
+Our flow builds on a top-ranked open-source implementation of the contest reference flow: debank all MBFFs into single-bit registers, spread them with a slack-driven conjugate-gradient global placement, propose spatial groups by mean-shift clustering, bank, legalize onto rows, and run detailed placement. Prior to this work we had strengthened several of its stages, most notably replacing greedy banking with maximum-weight-matching pairing and adding cost-aware detailed-placement repairs. Those enhancements share the baseline's one-hop proxy pricing throughout and are not claimed as contributions here; they only make every refinement delta in Sec.~\ref{sec:experiments} conservative, since the refinement layer is measured on top of the strengthened rather than the stock front end. Everything from the incremental oracle onward (Secs.~\ref{sec:oracle}--\ref{sec:operators}) is the contribution of this paper.
+
+\subsection{Why Proxy Cost Models Diverge}
+\label{sec:proxy}
+
+Refinement explores millions of candidate moves per benchmark, so invoking the evaluator per candidate is infeasible and contest-style flows substitute an internal proxy. The proxy in our inherited baseline is representative: it reads each flip-flop's stored slack and re-prices only one hop of wiring around the moved cell, propagating nothing forward. Each committed move deposits a small pricing error into the design state, subsequent decisions are made against the corrupted state, and the error compounds: on the hardest benchmark the internal one-hop model ends the flow reporting a $\tns$ roughly 34\% below the value implied by the evaluator's final score decomposition.
+
+The practical damage shows up when the move class gets aggressive. Two prior structural rebanking attempts in the same codebase---one matching flip-flops into higher-bit cells, one debanking then rebanking mispriced groups---degraded the final score by $+254\%$ and $+134\%$ on a power-dominated hidden case. Both generated exactly the move class our method later exploits profitably: merging smaller flip-flops into 4-bit cells. The moves were sound; the one-hop prices were not, and a single mispriced merge licensed a chain of further mispriced merges. This cascade catalog predicts that replacing the proxy with an evaluator-exact oracle, while keeping the move class, converts the cascade into strict descent; Sec.~\ref{sec:experiments} confirms the prediction.
+
+\subsection{Related Work}
+\label{sec:related}
+
+MBFF banking has a long post-placement lineage: timing-constrained merging~\cite{chang2010postplacement}, interval-graph formulations~\cite{shyu2013effective}, flop-tray co-design~\cite{kahng2016floptray}, capacitated $k$-means at scale~\cite{kahng2024scalable}, and MBFF timing/power at advanced nodes~\cite{gong2025iscas}. Chen et al.~\cite{chen2024slackredist} redistribute positive slack \emph{before} clustering; we redistribute nothing and re-price every move exactly \emph{after} placement. On Problem~B itself, the contest winner's method appears only as a two-page late-breaking result~\cite{li2025lbr} (self-reported average ratio 0.988 against first place); Chen et al.~\cite{chen2026agile} adopt a banking-then-refinement flow shape close to ours but price moves with proxy models; TIMBER~\cite{dassarma2026timber} reports on the same testcases but is not evaluator-comparable (Sec.~\ref{sec:mainresults}). Timing-driven placement~\cite{liao2022dreamplace4,date2025tddp,romanvicharra2024ffcentric} optimizes proxy timing signals rather than closing the loop with the scoring function; incremental STA engines~\cite{huang2015opentimer,huang2021opentimer2} maintain full-netlist timing under general delay models, whereas our oracle reproduces the evaluator's two-point model exactly with side-effect-free deltas cheap enough for inner-loop pricing. Density is shaped analytically in global placement~\cite{lu2015eplace,chen2008ntuplace3}; no published work priced the bin-violation term $\lambda\cdot V$ on the refinement side jointly with exact timing, as we do per move alongside $\tns$.

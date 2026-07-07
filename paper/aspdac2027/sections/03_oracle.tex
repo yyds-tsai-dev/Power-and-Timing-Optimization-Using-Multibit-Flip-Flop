@@ -1,0 +1,41 @@
+\section{An Evaluator-Exact Incremental Timing Oracle}
+\label{sec:oracle}
+\input{figs/framework}
+\input{figs/oracle_delta}
+
+\subsection{Design Goal}
+\label{sec:oracle:goal}
+
+The oracle prices every candidate move under the evaluator's own timing model: per-sink displacement delay proportional to the two-point HPWL between driver and sink pins, under one ideal clock~\cite{yang2024contest}. It needs three properties at once. \emph{Exactness}: the reported $\Delta\tns$ equals what the evaluator would measure. \emph{Side-effect freedom}: pricing mutates no netlist or timing state, so thousands of candidates can be screened without apply--revert churn. \emph{Locality}: cost scales with the affected timing cone, not the design.
+
+Incremental STA engines meet the last two goals for full industrial timing~\cite{huang2015opentimer,huang2021opentimer2}. The contest model further permits closed-form per-sink recomputation at cone cost, which we exploit. The same simplicity explains why proxies are common. The inherited flow uses a one-hop slack approximation, the DATE~2026 flow a local critical-path wirelength proxy~\cite{chen2026agile}, and~\cite{li2025lbr} leaves pricing unspecified. None closes the loop with the scoring function. On the hardest benchmark, the one-hop proxy underestimates $\tns$ by roughly 34\%; this mispricing makes structural rebanking cascade (Sec.~\ref{sec:background}). The oracle removes the model error entirely instead of tightening the approximation.
+
+\subsection{Timing State Keyed by Logical Objects}
+\label{sec:oracle:keying}
+
+Banking creates and destroys physical cells, so any timing cache keyed by physical instances breaks on exactly the moves that need accurate pricing.
+
+The oracle instead keys all topology caches by \emph{immutable logical objects}: the single-bit flip-flops of the debanked netlist and the combinational gates. Banking never changes either set; a merge only remaps logical bits to a new (cell, slot) pair. Fanin and fanout cones are computed once over these objects and survive every structural mutation. Mutable leaf attributes are never cached. A bit's D/Q pin coordinates and Q-pin (clock-to-Q) delay are read live through a logical$\to$physical indirection: bit $\to$ cell and slot $\to$ library pin offset plus cell position. A structural move updates one indirection entry; no cache is rebuilt.
+
+\subsection{Three Evaluation Modes}
+\label{sec:oracle:modes}
+
+Three entry points share one cone-propagation core.
+
+\emph{Full pass.} Recompute every sink slack from scratch in one parallel sweep. This is the validation ground truth, linear in design size.
+
+\emph{Incremental cone recompute.} After a move commits, repropagate only the cones reachable from the touched pins and fold the updates into the committed caches, keeping committed state exact at cone cost.
+
+\emph{Side-effect-free delta.} Price a hypothetical move without touching committed state (Fig.~\ref{fig:oracle_delta}). The oracle builds a local \emph{override map} holding each moved bit's hypothetical D/Q positions and Q-pin delay, collects the affected sinks, walks their forward cones override-first into thread-local scratch, and returns $\alpha\cdot\Delta\tns$; the scratch is discarded. Nothing writes committed state, so arbitrarily many candidates can be priced concurrently against it. The operators of Section~\ref{sec:operators} screen candidates in parallel through this mode and re-price serially at apply time.
+
+\subsection{Exactness Validation}
+\label{sec:oracle:validation}
+
+Validation builds check two invariants continuously. After every refinement round, the incrementally maintained $\tns$ total is compared against a full-pass recomputation; the difference is $0.000000$ on every round of every benchmark. Each side-effect-free delta is also compared against the measured delta of applying and reverting that move; the maximum discrepancy is $7.4\times10^{-13}$, from floating-point summation order. The oracle is not a tighter estimate; it implements the declared scoring semantics to floating-point precision. Externally, the maintained totals track the official evaluator within $0.05\%$ (median) at stage-boundary checkpoints on all seven cases; the maximum residual is $1.1\%$ on the most TNS-weighted states. Controlled single-cell probes localize this residual to bounded-depth slack-state updates on committed moves, not to the delta semantics, which match the evaluator to $10^{-5}$. Regardless, the evaluator binary itself scores every reported result (Sec.~\ref{sec:mainresults}), so no claim here rests on the residual.
+
+\subsection{From Bit Swaps to Structural Remaps}
+\label{sec:oracle:remaps}
+
+We first built the delta evaluator for same-cell bit swaps, where only pin positions change. The override map generalizes it at no extra cost. Remapping a \emph{group} of bits to a new cell adds one field, the target cell's Q-pin delay override, because a new cell type also changes clock-to-Q delay. One mechanism therefore prices the whole move spectrum: slot swaps, relocations, and group-to-new-cell structural merges. The oracle-priced rebanking of Section~\ref{sec:operators} can thus screen structural candidates exactly before any netlist mutation.
+
+Exactness is defined against the benchmark's declared cost model, but nothing in the framework depends on that model's simplicity. The operators of Section~\ref{sec:operators} see only one interface: a priced $\Delta$ for a hypothetical move. Under richer delay models, an incremental signoff-grade engine~\cite{huang2021opentimer2} can fill that interface, trading some pricing fidelity for generality.

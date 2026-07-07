@@ -1,0 +1,68 @@
+% =====================================================================
+% figs/cascade.tex — mechanism figure: the mispricing cascade under
+% one-hop proxy costing. Parallel-panel design: SAME merge, two cost
+% models; left grays out what the proxy cannot see.
+% Requires TikZ libraries: positioning, arrows.meta (loaded in main.tex).
+% =====================================================================
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+    font=\footnotesize,
+    >={Stealth[length=1.5mm]},
+    cell/.style={draw, rounded corners=1pt, minimum height=4.5mm,
+                 minimum width=7mm, inner sep=2pt},
+    mbff/.style={cell, thick, minimum height=8mm, minimum width=8mm},
+    gate/.style={draw, minimum height=4mm, minimum width=4.5mm, inner sep=1pt},
+    wire/.style={->, semithick},
+    gcell/.style={cell, draw=gray!55, text=gray!55},
+    ggate/.style={gate, draw=gray!55, text=gray!55},
+    gwire/.style={->, semithick, gray!55},
+    note/.style={inner sep=1pt, align=center}
+  ]
+  % ---------------- panel split ----------------
+  \draw[dashed, gray!70] (4.35,0.55) -- (4.35,5.08);
+  \node[note, anchor=west, font=\footnotesize\bfseries] at (0.0,4.90)
+    {Proxy view (one hop)};
+  \node[note, anchor=west, font=\footnotesize\bfseries] at (4.55,4.90)
+    {Evaluator reality};
+
+  % ============ LEFT: what the proxy prices ============
+  \node[cell] (ff1) at (0.65,4.30) {FF$_1$};
+  \node[cell] (ff2) at (0.65,3.14) {FF$_2$};
+  \node[mbff] (mb)  at (2.45,3.72) {4b};
+  \draw[wire] (ff1.east) -- ([yshift=1.7mm]mb.west);
+  \draw[wire] (ff2.east) -- ([yshift=-1.7mm]mb.west);
+  \node[note, gray] at (1.45,4.35) {merge};
+  % the only wiring the proxy prices: the merged cell's local net
+  \fill (3.60,3.72) circle (0.45mm);
+  \draw (mb.east) -- (3.60,3.72);
+  \node[note] at (3.30,4.30) {local net\\ (priced)};
+  % downstream logic, grayed out: outside the one-hop model
+  \node[ggate] (lg1)  at (2.45,2.34) {g$_1$};
+  \node[gcell] (lffs) at (3.60,2.34) {FF$_s$};
+  \draw[gwire] (mb.south) -- (lg1.north);
+  \draw[gwire] (lg1.east) -- (lffs.west);
+  \node[note, gray] at (1.75,1.62) {downstream logic:\\ not priced};
+  \node[note, text=green!50!black] at (2.15,0.90)
+    {est.\ $\Delta$cost $< 0$ $\rightarrow$ accept};
+
+  % ============ RIGHT: what the evaluator charges ============
+  \node[mbff, minimum width=7mm] (mb2) at (5.15,4.08) {4b};
+  \node[gate] (g1)  at (6.35,4.08) {g$_1$};
+  \node[gate] (g2)  at (7.25,4.08) {g$_2$};
+  \node[cell] (ffs) at (8.30,4.08) {FF$_s$};
+  \draw[wire] (mb2.east) -- (g1.west);
+  \draw[wire] (g1.east)  -- (g2.west);
+  \draw[wire] (g2.east)  -- (ffs.west);
+  \node[note, text=red!70!black] at (7.05,3.40)
+    {slack $< 0$ at FF$_s$ $\Rightarrow$ true $\Delta$cost $> 0$};
+  % next decision inherits the corrupted state
+  \node[cell, dashed, minimum width=13mm] (nm) at (5.55,2.00) {next merge};
+  \draw[dashed, ->] (mb2.south) .. controls (5.15,2.95) .. (nm.north);
+  \node[note, text width=26mm, anchor=west] at (6.70,1.92)
+    {priced on the corrupted state; errors compound};
+\end{tikzpicture}}
+\caption{One merge, two prices: the one-hop proxy sees only the local net and accepts (left); the evaluator charges the downstream cone (right), and the next merge is priced on the corrupted state.}
+\label{fig:cascade}
+\end{figure}
