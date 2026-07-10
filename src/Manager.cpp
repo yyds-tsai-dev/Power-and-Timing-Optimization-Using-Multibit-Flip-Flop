@@ -2559,7 +2559,7 @@ double Manager::computeAccurateTNS(){
     }
 
     // Per-gate: running max arrival (orig & cur), and shared input-counter.
-    struct ArrPair { double orig = 0, cur = 0; };
+    struct ArrPair { double orig = 0, cur = 0; double md = -1e300; };
     std::unordered_map<Gate*, ArrPair> gateArr;
     std::unordered_map<Gate*, int>     gateCnt;
     gateArr.reserve(Gate_Map.size());
@@ -2580,6 +2580,7 @@ double Manager::computeAccurateTNS(){
                     Coor gatePin = gate->getCoor() + gate->getPinCoor(pinName);
                     double arr = DisplacementDelay * HPWL(ioInst.getCoor(), gatePin);
                     ArrPair& ap = gateArr[gate];
+                    if(ap.md < 0.0) ap.md = 0.0;
                     if(arr > ap.orig) ap.orig = arr;
                     if(arr > ap.cur)  ap.cur  = arr;
                     int& cnt = gateCnt[gate];
@@ -2614,6 +2615,7 @@ double Manager::computeAccurateTNS(){
                     ArrPair& ap = gateArr[gate];
                     if(oArr > ap.orig) ap.orig = oArr;
                     if(cArr > ap.cur)  ap.cur  = cArr;
+                    if(cArr - oArr > ap.md) ap.md = cArr - oArr;
                     int& cnt = gateCnt[gate];
                     cnt++;
                     if(cnt == gate->getCell()->getInputCount())
@@ -2626,7 +2628,7 @@ double Manager::computeAccurateTNS(){
     // Step 3: BFS (topological order) through gate graph.
     // Gate-to-gate HPWL is identical for orig and cur (gates don't move).
     // When a gate outputs to an inner FF, record both arrivals.
-    struct FFArrPair { double orig = 0, cur = 0; };
+    struct FFArrPair { double orig = 0, cur = 0; double md = -1e300; };
     std::unordered_map<std::string, FFArrPair> ffArr;
     ffArr.reserve(innerFF.size());
 
@@ -2648,6 +2650,7 @@ double Manager::computeAccurateTNS(){
                     Coor nextPin = next->getCoor() + next->getPinCoor(pinName);
                     double hop = DisplacementDelay * HPWL(gateOut, nextPin);
                     ArrPair& nap = gateArr[next];
+                    if(myArr.md > nap.md) nap.md = myArr.md;
                     double oArr = myArr.orig + hop;
                     double cArr = myArr.cur  + hop;
                     if(oArr > nap.orig) nap.orig = oArr;
@@ -2669,6 +2672,8 @@ double Manager::computeAccurateTNS(){
                         FFArrPair& fap = ffArr[instName];
                         if(oArr > fap.orig) fap.orig = oArr;
                         if(cArr > fap.cur)  fap.cur  = cArr;
+                        double mdp = myArr.md + DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, origD));
+                        if(mdp > fap.md) fap.md = mdp;
                     }
                 }
             }
@@ -2677,6 +2682,10 @@ double Manager::computeAccurateTNS(){
 
     // Step 4: Compute per-FF slack using accurate arrival deltas.
     double totalTNS = 0;
+    // EVAL_DIAG=1: bucket coverage diagnostics (which driver class carries the TNS)
+    static const bool evalDiag = std::getenv("EVAL_DIAG") && std::atoi(std::getenv("EVAL_DIAG"));
+    long nBFS=0,nFB=0,nIO=0,nFF=0,nNull=0; double tBFS=0,tFB=0,tIO=0,tFF=0,tNull=0;
+    double totalTNS_M = 0;  // per-path-required semantics (max over paths of delay increase)
     for(auto& inner_pair : innerFF){
         const std::string& name = inner_pair.first;
         FF* cf = inner_pair.second;
@@ -2687,6 +2696,7 @@ double Manager::computeAccurateTNS(){
 
         if(!prev.instance){
             if(origSlack < 0) totalTNS += -origSlack;
+            if(evalDiag){ nNull++; if(origSlack<0) tNull+=-origSlack; }
             continue;
         }
 
@@ -2696,8 +2706,12 @@ double Manager::computeAccurateTNS(){
             auto fit = ffArr.find(name);
             if(fit != ffArr.end()){
                 arrChange = fit->second.cur - fit->second.orig;
+                if(evalDiag){ nBFS++;
+                    double sM = origSlack - fit->second.md;
+                    if(sM < 0) totalTNS_M += -sM; }
             }
             else{
+                if(evalDiag) nFB++;
                 // Gate unreached by BFS — fall back to old delta model.
                 Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
                 arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, aD(cf)));
@@ -2715,8 +2729,10 @@ double Manager::computeAccurateTNS(){
         else if(prev.cellType == CellType::IO){
             Coor ioCoor = prev.instance->getCoor();
             arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, aD(cf)));
+            if(evalDiag) nIO++;
         }
         else{
+            if(evalDiag) nFF++;
             FF* prevFF   = static_cast<FF*>(prev.instance);
             FF* prevPhys = prevFF->getPhysicalFF();
             Coor origQ = aQ(prevFF);
@@ -2730,7 +2746,25 @@ double Manager::computeAccurateTNS(){
 
         double newSlack = origSlack - arrChange;
         if(newSlack < 0) totalTNS += -newSlack;
+        if(evalDiag){
+            bool viaBFS = (prev.cellType==CellType::GATE) && ffArr.count(name);
+            if(!viaBFS && newSlack < 0) totalTNS_M += -newSlack;
+        }
+        if(evalDiag && newSlack < 0){
+            double v=-newSlack;
+            if(prev.cellType==CellType::GATE){ auto fit=ffArr.find(name); if(fit!=ffArr.end()) tBFS+=v; else tFB+=v; }
+            else if(prev.cellType==CellType::IO) tIO+=v;
+            else tFF+=v;
+        }
     }
+    if(evalDiag)
+        std::cerr << "[EVALDIAG] TNS_M(per-path)=" << totalTNS_M << " vs TNS_max=" << totalTNS << "\n";
+    if(evalDiag)
+        std::cerr << "[EVALDIAG] BFS n=" << nBFS << " tns=" << tBFS
+                  << " | FALLBACK n=" << nFB << " tns=" << tFB
+                  << " | IO n=" << nIO << " tns=" << tIO
+                  << " | FF n=" << nFF << " tns=" << tFF
+                  << " | NULL n=" << nNull << " tns=" << tNull << "\n";
 
     return totalTNS;
 }

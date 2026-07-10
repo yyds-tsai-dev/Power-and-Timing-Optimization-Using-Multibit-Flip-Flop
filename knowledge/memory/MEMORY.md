@@ -1,0 +1,41 @@
+- [Thesis Part-A results](project_thesis_partA_results.md) — Ch.5 experiment numbers, evaluator-verified 2026-06-17 single reproducible config; all 7 beat contest top-3 (tc2 745,973 needs extended budget); ablation/greedy/budget data
+- [Thesis Direction](thesis_direction.md) — user's master's thesis targets Method D (slack redistribution + max-weight matching); keeps A/B/C/T1 as alternatives
+- [Method D status](project_method_d_status.md) — Method D shipped env-gated but does NOT fit current architecture; tc2 +1.55% even with Step 5; production switched to Phase B (NTU outer loop, S_space + N3 lookahead)
+- [Thesis Baseline Comparability](thesis_baseline_comparability.md) — P1/P9/P13 SOTA papers use commercial flows + WNS/TNS, NOT ICCAD Problem B cost fn; only B1/B2/B3 are apples-to-apples; LEMON confirmed for Stage B
+- [P7 = ntu-113-2 thesis = SOTA](project_p7_sota.md) — P7 LBR and NTU Master's thesis are the same work (Cheng-Yen Li, ICCAD 2024 winner); thesis avg comp 0.977 is the real ceiling
+- [Always Run Hidden Cases](feedback_always_run_hidden.md) — benchmark sweeps must include hiddencase01-04, not just main 5 testcases; different cost profiles reveal hidden regressions
+- [Verify Legality Manually](feedback_verify_legality.md) — getEvaluatorCost() temp.out mechanism is buggy; always run evaluator binary manually on final output
+- [DP Optimization Findings](feedback_dp_optimization.md) — ChangeCell OMP race, GlobalSwap rtree bug + crude criterion, K-nearest search is biggest win
+- [Always Set BANKING_MODE=matching](feedback_banking_mode_env.md) — benchmarks require `BANKING_MODE=matching PRODUCTION=1`; default falls back to greedy banking with ~3% worse scores
+- [Slack Overshoot Sweep](project_slack_overshoot_sweep.md) — Phase 3C weight sweep: case-dependent optimal, no single value works; deferred for adaptive approach
+- [MATCH_HIGHER_BIT danger](project_match_higher_bit.md) — 4-bit matching default OFF; cascading effect causes +254% hc02 regression, not fixable by per-merge accuracy
+- [Per-pin CostCompare](project_perpin_costcompare.md) — all 7 cases improved -0.02%~-1.41%; uses actual driver/load positions + slack-aware TNS filter
+- [Useful skew N/A](project_useful_skew_not_applicable.md) — ICCAD Problem B ideal clock, no skew term in getSlack(), useful skew cannot help
+- [Pre-place not worth changing](project_preplace_not_worth_changing.md) — CG + log-sum-exp adequate; Banking is higher ROI target than pre-placement rewrite
+- [OptimalPosition doesn't help 2-bit](project_optimal_position_doesnt_help.md) — weighted median of drivers/loads tested; pre-placement already near-optimal, pulling toward drivers hurts
+- [Per-edge Adaptive DIST_BONUS](project_v21_window_optimal.md) — SUPERSEDED by risk-adaptive mode below; kept for historical context
+- [Risk-Adaptive DIST_BONUS](project_risk_adaptive_dist.md) — shipped as default: RS=10 gives tc2 -0.87%, hc02 -1.34%; set RISK_ADAPTIVE=0 to restore old mode
+- [Post-LG Decluster dormant](project_post_lg_decluster.md) — shipped but default off (POST_LG_DECLUSTER=1); ΔC ignores DP ripple, margin is band-aid; prefer Phase 4 prevention over post-LG cure
+- [Adaptive Decluster for low-β](project_adaptive_decluster.md) — V3: β≤500 auto-enables postLGDecluster with margin=55; tc2 -0.138%, strict 5-case win
+- [Quality over engineering cost](feedback_quality_over_engineering.md) — thesis work: rank designs by quality ceiling only; full rewrites OK since revert is available; prefer v2 strong-guarantee over v1-simple
+- [Unbank+Rebank thesis direction](project_unbank_rebank.md) — v1 marginal (hc02 -0.35%, tc2 +0.04%), v2 catastrophic (+47.8%/+133.9%); predictMBFFCost too crude
+- [DP_SLOT_ASSIGN default](project_dp_slot_assign.md) — shipped ASSIGN=2+INTRA_ONLY=1 (strict 7-case win); cross-MBFF mode has hc02 -3.32% on the table but cascades
+- [Adaptive MATCH_K](project_match_k_adaptive.md) — shipped: K=8 when β≤500 else 15; tc2 -0.997%, hc03 +0.019% noise, 5 cases byte-exact; fixed K=8 regresses hc02 +3.21%
+- [Adaptive GS_K](project_gs_k_adaptive.md) — V3: K=5 when β≤500 else 12 (raised from 8); tc1 -0.07%, tc3/hc04 ~-0.01%; GS_K=12 manually for tc2 gives -0.136%
+- [V3 vs NTU gap](project_v3_ntu_gap.md) — STALE: was based on internal cost. See evaluator_vs_internal for true gap
+- [Evaluator slack model](project_evaluator_slack_model.md) — preliminary-evaluator charges per-sink DispDelay·HPWL(driver_pin, sink_pin); no RSMT/bbox. Verify via strings-dump before adding new cost terms
+- [Evaluator vs internal cost](project_evaluator_vs_internal.md) — CRITICAL: internal getOverallCost underestimates TNS; tc2 internal=742K eval=768K; true gap +4.05% not +0.54%; 5/7 wins not 6/7
+- [Stage 1 Steiner dead-end](project_stage1_steiner_deadend.md) — plan archived: hop-2 double-counts; RSMT ΔWL regresses 6/7. FLUTE infra kept dormant at ff0f70f, `make setup_flute` to use
+- [Stage 3 LP dead-end + SEQ200 revival + 7-case reality check](project_stage3_lp_deadend.md) — SEQ200 "86% closed" was n=2 (hc01 tc1 only). Full 7-case 2026-04-22 sweep: LP regresses +4–18% on 5/7 cases (hc02 +17.58%, tc2 +9.40%). Cap tuning won't fix. ALG2_LP_BANK stays default off.
+- [Verify USE_ORTOOLS before LP sweep](feedback_use_ortools_build_gate.md) — `ldd cadb_0015_final | grep libortools` first; without the build flag LPBanking silently falls through to V1 HEAD, masking regressions
+- [No more small changes](feedback_no_small_changes.md) — stop incremental tuning/sweeps; commit to architectural changes only; bold structural moves > cautious tweaks
+- [CG weight experiments dead-end](project_cg_weight_deadend.md) — CG already has timing weights; scaling magnitudes overshoots (fixed step size); mid-CG BFS destabilizes; CG architecture resists change
+- [Approach C dead-end](project_approach_c_deadend.md) — NTU top-down banking + force model all regress; 1-hop timing model is root cause; multi-hop timing required before retrying
+- [tc2 exhaustive analysis](project_tc2_exhaustive_analysis.md) — 14 experiments ALL regress tc2; combinatorial cliff at current weights; only evaluator-oracle helps; model accuracy is root blocker
+- [EGR implemented](project_egr_implemented.md) — EGR shipped env-gated (EGR=1); 3 modes (binary/inline/hybrid); best result -514 on tc2; state corruption limits to ~500 candidates
+- [Net HPWL dead-end](project_net_hpwl_deadend.md) — evaluator uses per-sink two-point HPWL (not net HPWL); real root cause is incremental timing error accumulation via 2-hop getSlack()
+- [Rewrite base decision](project_rewrite_base_decision.md) — 大改 base = V2 (cleaner than V3); already beat 1st on 5/7, only tc1(TNS)/tc2(merge-count) lose for opposite reasons; root blocker = 1-hop timing; lead = incremental timing oracle
+- [tc2 verified diagnosis](project_tc2_verified_diagnosis.md) — VERIFIED 2026-06-14: V3 beats top-3 6/7 per-case (composite 0.977 beats all 3); tc2 sole gap (+1.76%), is 100% TNS-mispricing (internal 5864 vs eval 7850), 27 configs all fail; needs oracle
+- [REFINE_ALLFF discovery + 2026-07-04 stack](project_refine_allff_discovery.md) — isLegalize is a work-queue marker not liveness; BATCH+ALLFF+REBANK+DENSITY gates shipped; hc02 -8.2%, tc2 -0.73%; winning recipe = ALT_ROUNDS=2 interleave
+- [Oracle gap ROOT CAUSED](project_oracle_gap_rootcause.md) — 2026-07-07: delta semantics exact 1e-5; bitRepair commit corrupts stored slack (bounded-depth update); fix=re-anchor; supersedes open issue in evaluator_vs_internal
+- [DAC 2027 pivot](project_dac2027_pivot.md) — 2026-07-08 ASP-DAC dropped, DAC 2027 campaign; plan_dac2027_optimization.md; bitRepair 87-96% wall, tc3/hc04/hc02 time-capped not converged
