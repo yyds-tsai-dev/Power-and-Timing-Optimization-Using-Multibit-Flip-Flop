@@ -38,24 +38,16 @@
   - ICCAD 2026 contest 已轉向,MBFF 賽道到 2025 為止
 - [ ] DAC 2027 CFP 盯梢(每月查一次;姊妹死線 TCAD 不衝突——期刊可後投)
 
-## Phase 1(7/09–7/20)T4 re-anchor 修復 = 最高確定性槓桿
+## Phase 1(7/09–7/20)Exactness 戰役 [2026-07-11 修訂:原 T4 假說已被實測取代]
 
-### P1a 進度(2026-07-11,Fable)— EVAL_ANCHOR 已實作並部分驗收
-- **實作**:`EVAL_ANCHOR=1` env gate(default off)。debank 時捕捉 parse 真錨(FF.h 四欄位 + Preprocess.cpp 一行),oracle 家族(incrFFSlack/incrAccurateBuild/computeAccurateTNS/兩個 slackOv)orig 側 38 個錨點讀取切到 eval 錨(Manager.cpp 檔內 static helpers aSlack/aD/aQ/aQpd,g_evalAnchor 於建構子讀 env)。前端不動。**未 commit——測完再說**
-- **驗收 A:flag off byte-exact PASS**(ea_off.out == t4/pr_ref.out)
-- **驗收 B:oc_rep 缺口 6,063(0.81%)→ 4,503(0.60%)**——錨點理論解釋 ~25%,剩 450 TNS 單位殘差
-- **意外收穫:flag on 最終分數 745,542.65 vs off 746,646.96(好 1,104!)**——truer pricing 已直接改善決策
-- **下一診斷(未跑成,權限流中斷)**:base 配置 + EVAL_ANCHOR=1 + TNS_ORACLE_VALIDATE=1 於 tc2 → 看 accurateTNS(eval 錨版)vs eval-implied TNS **在前端狀態(零 commits)** 的殘差:若 ≠0 → 模型語義仍有缺口(查:max tie、FF 無 prev 的常數 slack、多 driver、CLK 排除);若 =0 → commit 累積路徑還有洞(查 BATCH 重定價、INTRA、affected set 完整性)
-- 工作檔:scratchpad/dac0/(cadb_p1 = 已編譯的 patch 版 binary;accept_p1.sh;diag_base 腳本意圖如上)
-- 源碼改動(未 commit):inc/FF.h、src/Preprocess.cpp、src/Manager.cpp
+**實際根因鏈(全部實測)**:① Preprocess 用 1-hop 模型重錨 → 誤差烤進錨點(P1a:`EVAL_ANCHOR=1` parse 真錨,已 commit 30eef42,tc2 全配置 −2,714);② evaluator 語義黑盒解碼(16 微實驗零誤差:max-max STA、float32 算術、不可達 D-pin 踢除、OUT1-only 死弧);③ 離線參考 STA(`tools/refsta.py`,22 微案逐位重現)per-FF 取證 → 剩餘 404 TNS = **tie-cell 凍結連鎖 −398.7(139 顆零輸入 gate,427 bits 凍在 parse slack)+ OUT2 死弧 −5.7**。
 
-規格已在 `HANDOFF_to_opus_20260707.md` T4 + `reports/v1/2026-07-07_diagnosis_oracle_gap_ROOTCAUSE.md`:
-1. 便宜版:commit batch 後全域 re-anchor(`origDSlack_` 錨點基礎設施已存在,Manager.cpp:80-115 有現成模式)
-2. 驗收:oc_rep 實驗的 6,063 缺口 → ~0;63-checkpoint 殘差 1.12% → <0.1%
-3. 通過後增量版(只重算受影響 cone)拿回速度
-4. 官方 3× 重跑 → **新基線**(margin 上被高報 42% 的假 accepts 會被正確拒絕;軌跡會變,備好舊 config 回退分支)
-
-**為什麼它是 DAC 故事的頭牌**:修完 = 端到端 evaluator-exact(不只 delta 語義,連 committed state 都 exact)——「audit 方法論 + 根因 + 修復 + 收益」是完整的敘事弧,比 ASP-DAC 版強一級。
+1. [x] P1a EVAL_ANCHOR(commit 30eef42;byte-exact off 驗證)
+2. [~] P1b 三規則修復(tie-cell 解凍 / 不可達踢除 / OUT1-only)——workflow 執行中;驗收 = base 態 accurateTNS ≈ 7,850.49(float32 容差 0.01)+ byte-exact off + tc2 全配置分數
+3. [~] P1c 七案 EVAL_ANCHOR sweep(anchor-only 版;hc04 收尾中)
+4. [ ] P1d 新基線儀式:P1b 過關後 7 案 × 3 重跑(EVAL_ANCHOR+語義修復併入 unified config v2)→ 更新 README/bundle/knowledge;確定性重驗;舊 config 為回退分支
+- **tc1 期待值(新情報)**:tc1 有 1,530 顆零輸入 gate(tc2 的 11 倍)——tie-cell 修復對我們最弱的 TNS 案可能是大額紅利
+- 已知限制(記錄、不行動):evaluator 為 float32、我們 double,邊際噪音 ~1e-8 相對,不做模擬
 
 ## Phase 2(7/20–8/31)Score 極限戰
 
@@ -70,6 +62,8 @@
   - R3 前端 oracle 定價可行性:oracle 只需 debank 後邏輯網表 → banking 階段就能用真價(Approach C/LP banking 當年缺的正是這個)
   - 永久死亡確認(黑盒解碼釘棺):Steiner/RSMT、net-HPWL(evaluator 就是兩點 HPWL);EGR 光榮退役
   - 前置條件:refsta 修完殘差 + 7 案 gate 通過(滿血定價器再翻案)
+- **2g Slack-headroom harvesting(新 move class,語義解碼直接催生)**:解碼證實「非臨界路徑加長免費、直到成為新 max」——headroom = max − 該 fanin arrival,現在可精確計算。做「用 headroom 換 power」operator:找 sink 非臨界 fanin 有大 headroom 的 FF 群合併省 power,加長被 headroom 吸收 → evaluator 零 timing 費。hc02 型金礦,與 LNS 正交
+- R3 註記升級:三規則同樣證明前端 1-hop 模型與 Preprocess::DelayPropagation 錯在同處——前端 oracle 化價值上修
 - Gate:7 案嚴格不回歸;任一案 >0.5% 回歸就停下分析
 
 ## Phase 3(8/15–9/30,與 Phase 2 重疊)Runtime 攻擊
@@ -86,6 +80,7 @@
 
 - **ICCAD'25 Problem B benchmark 移植(升級為核心,成本下修)**:使用者親自比過 2025——**只改了 input format,內容高度相似**;當年因 bug 中止。移植 = 格式轉接層 + 修掉那隻舊 bug。使用者可能還留有 2025 測資/當時的 parser 改動(屆時先問位置,免重下載)。**現階段先專注 2024 suite(使用者指示)**,2025 排 Phase 4。
 - DAC 稿:新頭牌 = 端到端 exact(audit→根因→修復)+ LNS + runtime Pareto;沿用 ASP-DAC 圖文資產;模擬審稿 ×2 輪
+- 黑盒解碼 16 實驗 + refsta + per-FF 取證 = 完整新章素材;**預備答辯**「逆向 evaluator 算不算 overfit?」:(a) contest evaluator 就是宣告的目標函數;(b) decode-your-signoff 方法論可遷移(黑盒微測資→參考實作→per-sink 取證);(c) ICCAD'25 雙 suite 泛化佐證
 - **TCAD 關係決策**:DAC(會議)與 TCAD(期刊)重疊政策確認;預設 TCAD 延後至 DAC 投稿後改寫為其延伸版
 
 ## Phase 5(10/15–死線)凍結與投稿
