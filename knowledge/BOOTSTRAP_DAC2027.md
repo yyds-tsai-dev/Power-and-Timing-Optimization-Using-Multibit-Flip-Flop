@@ -37,6 +37,14 @@ make boost && make release        # g++≥9;LEMON vendored;OR-Tools 不需要
 
 離線參考 STA(Python):讀 input+.out,照黑盒解碼語義(max-max、兩點 HPWL、gate 零延遲、Qpd 進 max、parse 錨)算完整分數,**必須逐位重現 evaluator Final score**;然後 per-logical-bit slack 與 C++ `computeAccurateTNS`(EVAL_ANCHOR=1)對比,分類發散 bit 的結構 → 找出實作偏差。C++ 側已有 EVAL_DIAG 鉤子(src/Manager.cpp,computeAccurateTNS 內)。
 
+## Phase 2f 墳場翻案的上下文(計畫裡的 R1–R3)
+
+翻案所需的歷史全在包內:
+- **postmortem 摘要**:`knowledge/memory/` 裡的 project_match_higher_bit、project_dp_slot_assign、project_tc2_exhaustive_analysis、project_unbank_rebank、project_approach_c_deadend、project_stage3_lp_deadend、project_egr_implemented(每份含當年數據與死因)
+- **詳細報告**:`knowledge/graveyard/`——tc2 十四連敗的完整研究(2026-04-26)、tc2 驗證診斷(2026-06-14)、深度機會研究(2026-05-03)、Approach C 原計畫、phase 逐日誌
+- **env gates 全在程式碼**:MATCH_HIGHER_BIT、DP_SLOT_ASSIGN(+INTRA_ONLY)、ALG2_LP_BANK、POST_LG_DECLUSTER、EGR——翻案=舊 gate + `EVAL_ANCHOR=1` 重測,不用重寫
+- **鐵律**:翻案前先確認 refsta 殘差已修(滿血定價)+ 逐案跑 7 案 gate;Steiner/net-HPWL 永久死亡(語義解碼釘棺),別碰
+
 ## 與 server A 的同步協議
 
 server A 的新結果會以「更新 knowledge/ + push」的形式送上來;開工前先 `git pull`。你產出的報告也寫進 `knowledge/reports/` 並 commit push(私有 repo,可放心)。

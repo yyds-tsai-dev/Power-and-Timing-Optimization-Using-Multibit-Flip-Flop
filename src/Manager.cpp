@@ -2684,6 +2684,10 @@ double Manager::computeAccurateTNS(){
     double totalTNS = 0;
     // EVAL_DIAG=1: bucket coverage diagnostics (which driver class carries the TNS)
     static const bool evalDiag = std::getenv("EVAL_DIAG") && std::atoi(std::getenv("EVAL_DIAG"));
+    // EVAL_DIAG_DUMP=<path>: dump per-logical-FF slack keyed by ORIGINAL inst/pin
+    static const char* diagDumpPath = std::getenv("EVAL_DIAG_DUMP");
+    std::vector<std::pair<const std::string*, double>> diagRows;
+    if(diagDumpPath) diagRows.reserve(innerFF.size());
     long nBFS=0,nFB=0,nIO=0,nFF=0,nNull=0; double tBFS=0,tFB=0,tIO=0,tFF=0,tNull=0;
     double totalTNS_M = 0;  // per-path-required semantics (max over paths of delay increase)
     for(auto& inner_pair : innerFF){
@@ -2697,6 +2701,7 @@ double Manager::computeAccurateTNS(){
         if(!prev.instance){
             if(origSlack < 0) totalTNS += -origSlack;
             if(evalDiag){ nNull++; if(origSlack<0) tNull+=-origSlack; }
+            if(diagDumpPath) diagRows.emplace_back(&name, origSlack);
             continue;
         }
 
@@ -2745,6 +2750,7 @@ double Manager::computeAccurateTNS(){
         }
 
         double newSlack = origSlack - arrChange;
+        if(diagDumpPath) diagRows.emplace_back(&name, newSlack);
         if(newSlack < 0) totalTNS += -newSlack;
         if(evalDiag){
             bool viaBFS = (prev.cellType==CellType::GATE) && ffArr.count(name);
@@ -2765,6 +2771,22 @@ double Manager::computeAccurateTNS(){
                   << " | IO n=" << nIO << " tns=" << tIO
                   << " | FF n=" << nFF << " tns=" << tFF
                   << " | NULL n=" << nNull << " tns=" << tNull << "\n";
+
+    if(diagDumpPath){
+        // reverse FF_list_Map: internal logical FF name -> original "inst/pin"
+        static std::unordered_map<std::string, std::string> revMap;
+        if(revMap.empty()){
+            auto& flm = preprocessor->getFFListMap(); // orig "inst/Dpin" -> FF_list key
+            revMap.reserve(flm.size());
+            for(auto& kv : flm) revMap[kv.second] = kv.first;
+        }
+        std::ofstream df(diagDumpPath);
+        df << std::setprecision(17);
+        for(auto& e : diagRows){
+            auto it = revMap.find(*e.first);
+            df << (it != revMap.end() ? it->second : *e.first) << "\t" << e.second << "\n";
+        }
+    }
 
     return totalTNS;
 }
