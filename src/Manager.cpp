@@ -5,6 +5,16 @@
 #include <boost/geometry/index/rtree.hpp>
 #include <lemon/smart_graph.h>
 #include <lemon/matching.h>
+
+// EVAL_ANCHOR=1: the oracle family's orig side anchors at parse-time (debank) truth
+// instead of the Preprocess-rebased anchors (whose 1-hop rebasing bakes model error
+// into the baseline). Front-end consumers are untouched; byte-exact when off.
+static bool g_evalAnchor = false;
+static inline double aSlack(FF* cf){ return g_evalAnchor ? cf->getEvalSlack() : cf->getTimingSlack("D"); }
+static inline Coor   aD(FF* cf){ return g_evalAnchor ? cf->getEvalD() : cf->getOriginalD(); }
+static inline Coor   aQ(FF* cf){ return g_evalAnchor ? cf->getEvalQ() : cf->getOriginalQ(); }
+static inline double aQpd(FF* cf){ return g_evalAnchor ? cf->getEvalQpd() : cf->getOriginalQpinDelay(); }
+
 Manager::Manager():
     alpha(0),
     beta(0),
@@ -18,7 +28,8 @@ Manager::Manager():
     NumNets(0),
     preprocessor(nullptr),
     legalizer(nullptr)
-    {}
+    {
+    g_evalAnchor = std::getenv("EVAL_ANCHOR") && std::atoi(std::getenv("EVAL_ANCHOR"));}
 
 Manager::~Manager(){
     for(auto &pair : FF_Map){
@@ -2341,7 +2352,7 @@ double Manager::computeNetHPWL(Net* net, FF* overrideFF, bool overrideIsQ,
 // against computeAccurateTNS. Topology is move-invariant; only positions change.
 
 double Manager::incrFFSlack(FF* cf){
-    double origSlack = cf->getTimingSlack("D");
+    double origSlack = aSlack(cf);
     PrevInstance prev = cf->getPrevInstance();
     // NOTE: deliberately omit arrCorrection_ so incrFFSlack matches its ground truth
     // computeAccurateTNS exactly (diff=0) in ALL configs, including stacked RELOC (which
@@ -2362,26 +2373,26 @@ double Manager::incrFFSlack(FF* cf){
             arrChange = cur - incrFFArrOrig_[cf];
         } else {
             Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
-            arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, cf->getOriginalD()));
+            arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, aD(cf)));
             const PrevStage& ps = cf->getPrevStage();
             if(ps.ff){
                 FF* srcPhys = ps.ff->getPhysicalFF();
-                Coor origQ = ps.ff->getOriginalQ();
+                Coor origQ = aQ(ps.ff);
                 Coor newQ  = srcPhys->getNewCoor() + srcPhys->getPinCoor("Q" + ps.ff->getPhysicalPinName());
-                double dqpd = srcPhys->getCell()->getQpinDelay() - ps.ff->getOriginalQpinDelay();
+                double dqpd = srcPhys->getCell()->getQpinDelay() - aQpd(ps.ff);
                 Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
                 arrChange += dqpd + DisplacementDelay * (HPWL(firstGatePin, newQ) - HPWL(firstGatePin, origQ));
             }
         }
     } else if(prev.cellType == CellType::IO){
         Coor ioCoor = prev.instance->getCoor();
-        arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, cf->getOriginalD()));
+        arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, aD(cf)));
     } else {
         FF* prevFF   = static_cast<FF*>(prev.instance);
         FF* prevPhys = prevFF->getPhysicalFF();
-        Coor origQ = prevFF->getOriginalQ();
+        Coor origQ = aQ(prevFF);
         Coor newQ  = prevPhys->getNewCoor() + prevPhys->getPinCoor("Q" + prevFF->getPhysicalPinName());
-        double origArr = prevFF->getOriginalQpinDelay() + DisplacementDelay * HPWL(origQ, cf->getOriginalD());
+        double origArr = aQpd(prevFF) + DisplacementDelay * HPWL(origQ, aD(cf));
         double newArr  = prevPhys->getCell()->getQpinDelay() + DisplacementDelay * HPWL(newQ, curD);
         arrChange = newArr - origArr;
     }
@@ -2469,7 +2480,7 @@ void Manager::incrAccurateBuild(){
                 FF* cf=f.cf; FF* ph=cf->getPhysicalFF();
                 Coor cq = ph->getNewCoor()+ph->getPinCoor("Q"+cf->getPhysicalPinName());
                 vc = ph->getCell()->getQpinDelay() + DisplacementDelay*HPWL(cq, f.pin);
-                vo = cf->getOriginalQpinDelay() + DisplacementDelay*HPWL(cf->getOriginalQ(), f.pin);
+                vo = aQpd(cf) + DisplacementDelay*HPWL(aQ(cf), f.pin);
             } else { vc = incrGateCur_[f.g] + f.cnst; vo = origArr[f.g] + f.cnst; }
             if(vc>mc) mc=vc; if(vo>mo) mo=vo;
         }
@@ -2479,7 +2490,7 @@ void Manager::incrAccurateBuild(){
     // Original arrival at each gate-driven FF's D.
     for(auto& kv : incrFFDrivers_){
         FF* cf = kv.first; double mo=-1e300;
-        for(auto& gp : kv.second){ double v = origArr[gp.first] + DisplacementDelay*HPWL(gp.second, cf->getOriginalD()); if(v>mo) mo=v; }
+        for(auto& gp : kv.second){ double v = origArr[gp.first] + DisplacementDelay*HPWL(gp.second, aD(cf)); if(v>mo) mo=v; }
         incrFFArrOrig_[cf] = (mo==-1e300)?0:mo;
     }
     // Initial TNS.
@@ -2584,8 +2595,8 @@ double Manager::computeAccurateTNS(){
     for(auto& inner_pair : innerFF){
         FF* cf   = inner_pair.second;
         FF* phys = cf->getPhysicalFF();
-        Coor origQ  = cf->getOriginalQ();
-        double origQpd = cf->getOriginalQpinDelay();
+        Coor origQ  = aQ(cf);
+        double origQpd = aQpd(cf);
         Coor curQ    = phys->getNewCoor() + phys->getPinCoor("Q" + cf->getPhysicalPinName());
         double curQpd  = phys->getCell()->getQpinDelay();
 
@@ -2651,7 +2662,7 @@ double Manager::computeAccurateTNS(){
                     if(fit != innerFF.end()){
                         FF* cf   = fit->second;
                         FF* phys = cf->getPhysicalFF();
-                        Coor origD = cf->getOriginalD();
+                        Coor origD = aD(cf);
                         Coor curD  = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
                         double oArr = myArr.orig + DisplacementDelay * HPWL(gateOut, origD);
                         double cArr = myArr.cur  + DisplacementDelay * HPWL(gateOut, curD);
@@ -2669,7 +2680,7 @@ double Manager::computeAccurateTNS(){
     for(auto& inner_pair : innerFF){
         const std::string& name = inner_pair.first;
         FF* cf = inner_pair.second;
-        double origSlack = cf->getTimingSlack("D");
+        double origSlack = aSlack(cf);
         PrevInstance prev = cf->getPrevInstance();
         FF* phys = cf->getPhysicalFF();
         Coor curD = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
@@ -2689,13 +2700,13 @@ double Manager::computeAccurateTNS(){
             else{
                 // Gate unreached by BFS — fall back to old delta model.
                 Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
-                arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, cf->getOriginalD()));
+                arrChange = DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, aD(cf)));
                 const PrevStage& ps = cf->getPrevStage();
                 if(ps.ff){
                     FF* srcPhys = ps.ff->getPhysicalFF();
-                    Coor origQ = ps.ff->getOriginalQ();
+                    Coor origQ = aQ(ps.ff);
                     Coor newQ  = srcPhys->getNewCoor() + srcPhys->getPinCoor("Q" + ps.ff->getPhysicalPinName());
-                    double dqpd = srcPhys->getCell()->getQpinDelay() - ps.ff->getOriginalQpinDelay();
+                    double dqpd = srcPhys->getCell()->getQpinDelay() - aQpd(ps.ff);
                     Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
                     arrChange += dqpd + DisplacementDelay * (HPWL(firstGatePin, newQ) - HPWL(firstGatePin, origQ));
                 }
@@ -2703,16 +2714,16 @@ double Manager::computeAccurateTNS(){
         }
         else if(prev.cellType == CellType::IO){
             Coor ioCoor = prev.instance->getCoor();
-            arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, cf->getOriginalD()));
+            arrChange = DisplacementDelay * (HPWL(ioCoor, curD) - HPWL(ioCoor, aD(cf)));
         }
         else{
             FF* prevFF   = static_cast<FF*>(prev.instance);
             FF* prevPhys = prevFF->getPhysicalFF();
-            Coor origQ = prevFF->getOriginalQ();
+            Coor origQ = aQ(prevFF);
             Coor newQ  = prevPhys->getNewCoor() + prevPhys->getPinCoor("Q" + prevFF->getPhysicalPinName());
-            double origQpd = prevFF->getOriginalQpinDelay();
+            double origQpd = aQpd(prevFF);
             double newQpd  = prevPhys->getCell()->getQpinDelay();
-            double origArr = origQpd + DisplacementDelay * HPWL(origQ, cf->getOriginalD());
+            double origArr = origQpd + DisplacementDelay * HPWL(origQ, aD(cf));
             double newArr  = newQpd  + DisplacementDelay * HPWL(newQ,  curD);
             arrChange = newArr - origArr;
         }
@@ -3372,7 +3383,7 @@ double Manager::evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
 
     // override-aware slack (mirrors incrFFSlack; overrides curD, source-FF Q, cone gate arrivals)
     auto slackOv = [&](FF* cf)->double{
-        double origSlack = cf->getTimingSlack("D");
+        double origSlack = aSlack(cf);
         PrevInstance prev = cf->getPrevInstance();
         if(!prev.instance) return origSlack;
         Coor curD;
@@ -3393,24 +3404,24 @@ double Manager::evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
                 arrChange = cur - (ao!=incrFFArrOrig_.end()?ao->second:0.0);
             } else {
                 Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
-                arrChange = DisplacementDelay*(HPWL(gateOut,curD) - HPWL(gateOut, cf->getOriginalD()));
+                arrChange = DisplacementDelay*(HPWL(gateOut,curD) - HPWL(gateOut, aD(cf)));
                 const PrevStage& ps = cf->getPrevStage();
                 if(ps.ff){
                     Coor newQ = qpos(ps.ff);
-                    Coor origQ = ps.ff->getOriginalQ();
-                    double dqpd = ps.ff->getPhysicalFF()->getCell()->getQpinDelay() - ps.ff->getOriginalQpinDelay();
+                    Coor origQ = aQ(ps.ff);
+                    double dqpd = ps.ff->getPhysicalFF()->getCell()->getQpinDelay() - aQpd(ps.ff);
                     Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
                     arrChange += dqpd + DisplacementDelay*(HPWL(firstGatePin,newQ) - HPWL(firstGatePin,origQ));
                 }
             }
         } else if(prev.cellType==CellType::IO){
             Coor ioCoor = prev.instance->getCoor();
-            arrChange = DisplacementDelay*(HPWL(ioCoor,curD) - HPWL(ioCoor, cf->getOriginalD()));
+            arrChange = DisplacementDelay*(HPWL(ioCoor,curD) - HPWL(ioCoor, aD(cf)));
         } else {
             FF* prevFF = static_cast<FF*>(prev.instance);
             Coor newQ = qpos(prevFF);
-            Coor origQ = prevFF->getOriginalQ();
-            double origArr = prevFF->getOriginalQpinDelay() + DisplacementDelay*HPWL(origQ, cf->getOriginalD());
+            Coor origQ = aQ(prevFF);
+            double origArr = aQpd(prevFF) + DisplacementDelay*HPWL(origQ, aD(cf));
             double newArr  = prevFF->getPhysicalFF()->getCell()->getQpinDelay() + DisplacementDelay*HPWL(newQ, curD);
             arrChange = newArr - origArr;
         }
@@ -3489,7 +3500,7 @@ double Manager::evalRemapDelta(const std::vector<FF*>& bits,
     }
 
     auto slackOv = [&](FF* cf)->double{
-        double origSlack = cf->getTimingSlack("D");
+        double origSlack = aSlack(cf);
         PrevInstance prev = cf->getPrevInstance();
         if(!prev.instance) return origSlack;
         Coor curD;
@@ -3511,24 +3522,24 @@ double Manager::evalRemapDelta(const std::vector<FF*>& bits,
                 arrChange = cur - (ao!=incrFFArrOrig_.end()?ao->second:0.0);
             } else {
                 Coor gateOut = prev.instance->getCoor() + prev.instance->getPinCoor(prev.pinName);
-                arrChange = DisplacementDelay*(HPWL(gateOut,curD) - HPWL(gateOut, cf->getOriginalD()));
+                arrChange = DisplacementDelay*(HPWL(gateOut,curD) - HPWL(gateOut, aD(cf)));
                 const PrevStage& ps = cf->getPrevStage();
                 if(ps.ff){
                     Coor newQ = qpos(ps.ff);
-                    Coor origQ = ps.ff->getOriginalQ();
-                    double dqpd = qpd(ps.ff) - ps.ff->getOriginalQpinDelay();
+                    Coor origQ = aQ(ps.ff);
+                    double dqpd = qpd(ps.ff) - aQpd(ps.ff);
                     Coor firstGatePin = ps.outputGate->getCoor() + ps.outputGate->getPinCoor(ps.pinName);
                     arrChange += dqpd + DisplacementDelay*(HPWL(firstGatePin,newQ) - HPWL(firstGatePin,origQ));
                 }
             }
         } else if(prev.cellType==CellType::IO){
             Coor ioCoor = prev.instance->getCoor();
-            arrChange = DisplacementDelay*(HPWL(ioCoor,curD) - HPWL(ioCoor, cf->getOriginalD()));
+            arrChange = DisplacementDelay*(HPWL(ioCoor,curD) - HPWL(ioCoor, aD(cf)));
         } else {
             FF* prevFF = static_cast<FF*>(prev.instance);
             Coor newQ = qpos(prevFF);
-            Coor origQ = prevFF->getOriginalQ();
-            double origArr = prevFF->getOriginalQpinDelay() + DisplacementDelay*HPWL(origQ, cf->getOriginalD());
+            Coor origQ = aQ(prevFF);
+            double origArr = aQpd(prevFF) + DisplacementDelay*HPWL(origQ, aD(cf));
             double newArr  = qpd(prevFF) + DisplacementDelay*HPWL(newQ, curD);
             arrChange = newArr - origArr;
         }

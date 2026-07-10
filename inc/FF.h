@@ -84,6 +84,12 @@ private:
     // single-path model (prevStage). Position-independent: D-pin terms cancel.
     // Set by Manager::refreshArrivalCorrections(), consumed by getSlack().
     double arrCorrection_;
+    // parse-time (debank) anchors for the evaluator-exact oracle (EVAL_ANCHOR=1).
+    // Captured in Preprocess before the CG loop rebases TimingSlack/originalCoor
+    // with the 1-hop updateSlack model; these stay at input-file truth forever.
+    double evalSlack_ = 0;
+    Coor evalD_, evalQ_;
+    double evalQpd_ = 0;
 
     // Net HPWL infrastructure (set by Manager::buildNetHPWLInfra).
     // dNet_: the net connected to this inner FF's D pin in the original netlist.
@@ -122,6 +128,12 @@ public:
     void clearBankingReleasedSlackD();
     void setArrCorrection(double c);
     double getArrCorrection()const;
+
+    void setEvalAnchor(double s, const Coor& d, const Coor& q, double qpd){ evalSlack_=s; evalD_=d; evalQ_=q; evalQpd_=qpd; }
+    double getEvalSlack() const { return evalSlack_; }
+    const Coor& getEvalD() const { return evalD_; }
+    const Coor& getEvalQ() const { return evalQ_; }
+    double getEvalQpd() const { return evalQpd_; }
     void setDNet(Net* n);
     void setQNet(Net* n);
     Net* getDNet()const;

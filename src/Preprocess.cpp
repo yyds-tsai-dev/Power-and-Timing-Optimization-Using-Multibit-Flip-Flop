@@ -74,6 +74,7 @@ void Preprocess::Debank(){
                 temp->setTimingSlack("D", slack);
                 temp->setOriginalCoor(d_coor, q_coor);
                 temp->setOriginalQpinDelay(cur_cell->getQpinDelay());
+                temp->setEvalAnchor(slack, d_coor, q_coor, cur_cell->getQpinDelay());
                 temp->setClkIdx(ff_clk);
                 temp->setCell(ff_cell);
 
