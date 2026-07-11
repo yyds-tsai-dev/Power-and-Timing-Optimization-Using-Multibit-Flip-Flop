@@ -3,3 +3,12 @@ drawDie/drawDie
 # Route A: OR-tools prebuilt tree (download via `make setup_ortools`)
 third_party/
 tools/toy_set_partition
+obj/
+cadb_0015_final
+*.out
+*.log
+*.evaluator
+*.sanity
+*.placement_checker
+baseline_layer0/
+sweep_out/
