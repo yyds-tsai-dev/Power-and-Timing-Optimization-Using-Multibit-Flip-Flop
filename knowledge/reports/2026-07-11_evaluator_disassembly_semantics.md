@@ -140,6 +140,9 @@ NULL 428→295 且 tns 歸零;`.out` 與修復前 binary 逐位相同(純定價�
 **兩台機器、兩條軌跡、同一組語義規則全部收斂到 f32 噪音級——P1b 語義正確性
 已具跨機可重現證據**(DAC 敘事:audit 方法論的可移植性)。
 
+第二案追加:hc02 base 態(TNS 質量 261,791,tc2 的 22 倍)殘差 **+0.0070**——
+P1b 在重 TNS 案同樣 exact。
+
 ## 8. Server B 環境筆記
 
 - boost 1.84:jfrog 死鏈 → `https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz`
