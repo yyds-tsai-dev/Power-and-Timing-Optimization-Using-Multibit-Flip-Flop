@@ -131,6 +131,15 @@ TNS 迭代順序 = pin id = 實例建立順序 × 庫 pin 宣告順序(f64 累�
   refsta Python 骨架(parser/圖/引擎)在 `~/scratch/refsta/refsta.py`,
   數值策略已按本報告語義參數化,尚未跑通 byte-exact 驗證(工作因分工調整移交 server A)。
 
+## 7.5 P1b 跨機驗證(server B,968c2b3 落地後追加)
+
+server B 獨立軌跡(base 態 implied TNS = 11,660.6238)上重編 968c2b3 後:
+accurateTNS = **11,660.6143**,殘差 +352.59 → **+0.0095**(f32 容差 0.01 內)。
+bucket 遷移:BFS 17,524→17,657(+133 ≈ 救回的 reachable 凍結 bit)、
+NULL 428→295 且 tns 歸零;`.out` 與修復前 binary 逐位相同(純定價修正,不動軌跡)。
+**兩台機器、兩條軌跡、同一組語義規則全部收斂到 f32 噪音級——P1b 語義正確性
+已具跨機可重現證據**(DAC 敘事:audit 方法論的可移植性)。
+
 ## 8. Server B 環境筆記
 
 - boost 1.84:jfrog 死鏈 → `https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz`
