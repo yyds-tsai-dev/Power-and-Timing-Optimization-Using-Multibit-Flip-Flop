@@ -42,6 +42,31 @@ cascade——**系統層面對 mispriced move 的魯棒性**,而非單點修復�
 **per-case 開關組合是必要的**(目前最佳配方:tc2 = 兩者同開;hc02 = 只開 cross)。
 hc02 base 三次獨立量測散佈 0.007% → 撞牆案噪音下限很小,上表全為真訊號。
 
+## hc02 負交互機制(per-bit 取證,DAC 素材)
+
+分量拆解(六份 .out;三份 base 的 banking 結構逐位相同,β·P 分毫不差):
+
+| 配置 | α·TNS | β·P | banking 1b/2b/4b | 贏法 |
+|---|---|---|---|---|
+| base | 1,572.8k | 7,982k | 30/1719/4424 | — |
+| cross | **1,406.6k(−167k)** | 8,015k(+33k) | 32/1736/4415 | 花 power 買 TNS |
+| ccdown | 1,532.2k(−41k) | **7,922k(−60k)** | 30/1679/4444 | 花 headroom 買 power |
+| stack | **1,885.7k(+313k)** | 7,940k | 30/1691/4438 | 透支 |
+
+per-bit 取證(refsta dump 三向 join;與分量拆解交叉核對一致):
+- ccdown 單獨即重組 **90.5%** 的 bit 分組(整個 matching 解改變,非局部)。
+- stack 的 +31,286 slack 損失是**重尾**:top-100 bit 扛 2/3。
+- **受害 bit 的 headroom 簽名**:top-500 惡化 bit 的鄰域 headroom p50 =
+  15.2(vs 未受害 47.8),ccdown 重組後再被抽到 **6.7**;未受害群幾乎不動
+  (47.8→44.9)。
+- 機制:cross 的 slot 移動仍用 1-hop 定價,其安全性靠 headroom 緩衝;
+  ccdown 恰好抽乾邊際 headroom 鄰域 → cross 在貧困區的錯價移動被接受 → 爆。
+- 這同時解釋 tc1/hc01 的 cross 單獨就炸:網表 A 的 slot 時序代價大
+  (dQpd +4.49),等效於「天生貧 headroom」,無需 ccdown 助攻。
+- **根治方向 = cross 移動改 oracle 定價**(evalBitSwapDelta 已支援 intra/
+  cross-slot 語義,呼叫面契約 §入口)——修好後疊加禁令可望解除,
+  且 tc1/hc01 的 cross 也可能翻身。列為 R2c。
+
 ## 系統性結論
 
 1. **「死於定價」假說量化證實**:8 個屍體裡 3 個翻身(1 大 2 小)、3 個從
