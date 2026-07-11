@@ -45,13 +45,13 @@
 1. [x] P1a EVAL_ANCHOR(commit 30eef42;byte-exact off 驗證)
 2. [~] P1b 三規則修復(tie-cell 解凍 / 不可達踢除 / OUT1-only)——workflow 執行中;驗收 = base 態 accurateTNS ≈ 7,850.49(float32 容差 0.01)+ byte-exact off + tc2 全配置分數
 3. [x] P1c 七案 sweep 完成:**composite 0.9518 → 0.9500**(表:reports/2026-07-11_p1_sweep_results.md;tc2 −0.80%、hc02 −0.61%;6 勝 1 微負過 gate)
-4. [~] P1d 新基線儀式(repeat#2/3 跑動中):P1b 過關後 7 案 × 3 重跑(EVAL_ANCHOR+語義修復併入 unified config v2)→ 更新 README/bundle/knowledge;確定性重驗;舊 config 為回退分支
+4. [~] P1d → **降級為 v2-interim**(8T 三重跑進行中;決策:reports/2026-07-11_p1d_timing_decision.md——B 證明執行緒數在撞牆案是計分參數,治本=收斂終止提前,v3 正式儀式待 3a-0/3c + 翻案 adaptive 化後雙機互驗):P1b 過關後 7 案 × 3 重跑(EVAL_ANCHOR+語義修復併入 unified config v2)→ 更新 README/bundle/knowledge;確定性重驗;舊 config 為回退分支
 - **tc1 期待值(新情報)**:tc1 有 1,530 顆零輸入 gate(tc2 的 11 倍)——tie-cell 修復對我們最弱的 TNS 案可能是大額紅利
 - 已知限制(記錄、不行動):evaluator 為 float32、我們 double,邊際噪音 ~1e-8 相對,不做模擬
 
 ## Phase 2(7/20–8/31)Score 極限戰
 
-- **2a 預算解放**:T4 修復後「無改善 move」的判斷可信 → 用收斂偵測取代時間上限;先跑 run-to-convergence 量化三個被切斷案的真定點
+- **2a 預算解放 [提前+擴編]**:3a-0 early exit + 3c 收斂偵測**拉進本窗口優先**(P1d 決策)——消滅「wall-clock 是計分參數」;落地後執行緒數=純速度參數,鋪平 v3 雙機互驗
 - **2b LNS / destroy-and-repair(新 move class,DAC novelty)**:現在是純下降、卡 local optimum。有 exact oracle 就能安全做 kick:選一個區域(k 顆 cell)整批 debank → 用 exact-priced rebank 重建 → 淨改善才收。目標:tc1 這種「其他 operator 全收斂還剩 TNS」的案子
 - **2c Higher-bit 重試**:MATCH_HIGHER_BIT 的 +254% 災難是 **proxy 時代的結論**——oracle + staged commit 下重新評估 4b 之上/3-bit 組合(先查 lib 有什麼)
 - **2d EGR 退役確認**:T4 後 internal==eval,evaluator-in-loop 不再必要,砍掉包袱
@@ -64,6 +64,7 @@
   - 前置條件:refsta 修完殘差 + 7 案 gate 通過(滿血定價器再翻案)
 - **2g Slack-headroom harvesting(新 move class,語義解碼直接催生)**:解碼證實「非臨界路徑加長免費、直到成為新 max」——headroom = max − 該 fanin arrival,現在可精確計算。做「用 headroom 換 power」operator:找 sink 非臨界 fanin 有大 headroom 的 FF 群合併省 power,加長被 headroom 吸收 → evaluator 零 timing 費。hc02 型金礦,與 LNS 正交
 - R3 註記升級:三規則同樣證明前端 1-hop 模型與 Preprocess::DelayPropagation 錯在同處——前端 oracle 化價值上修
+- **2f 疊加交互(B 實測)**:tc2 超相加(−3.85%)、hc02 負交互(+2.68%)→ **不開 per-case 開關**(保住 unified 賣點),走 β-adaptive 前例(MATCH_K/GS_K):B 出特徵表 → 設計 adaptive 規則
 - Gate:7 案嚴格不回歸;任一案 >0.5% 回歸就停下分析
 
 ## Phase 3(8/15–9/30,與 Phase 2 重疊)Runtime 攻擊
