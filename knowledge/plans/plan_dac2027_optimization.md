@@ -64,7 +64,7 @@
   - 前置條件:refsta 修完殘差 + 7 案 gate 通過(滿血定價器再翻案)
 - **2g Slack-headroom harvesting(新 move class,語義解碼直接催生)**:解碼證實「非臨界路徑加長免費、直到成為新 max」——headroom = max − 該 fanin arrival,現在可精確計算。做「用 headroom 換 power」operator:找 sink 非臨界 fanin 有大 headroom 的 FF 群合併省 power,加長被 headroom 吸收 → evaluator 零 timing 費。hc02 型金礦,與 LNS 正交
 - R3 註記升級:三規則同樣證明前端 1-hop 模型與 Preprocess::DelayPropagation 錯在同處——前端 oracle 化價值上修
-- **2f 疊加交互(B 實測)**:tc2 超相加(−3.85%)、hc02 負交互(+2.68%)→ **不開 per-case 開關**(保住 unified 賣點),走 β-adaptive 前例(MATCH_K/GS_K):B 出特徵表 → 設計 adaptive 規則
+- **2f 疊加交互 → 裁決已出**(reports/2026-07-11_adaptive_gates_ruling.md):CCDOWN always-on(無軸);cross-MBFF 走靜態庫 dQpd 軸 θ=0.01(四數量級分離=免調參);**R2c' 新工單:cross slot move 切 oracle 定價(歸 B),落地即殺軸**;疊加不進 unified;adaptive gates 與 conv-term 同批進 v3 候選
 - Gate:7 案嚴格不回歸;任一案 >0.5% 回歸就停下分析
 
 ## Phase 3(8/15–9/30,與 Phase 2 重疊)Runtime 攻擊
