@@ -51,6 +51,17 @@ P1b 在 tc2/hc02 exact,在 tc1/hc01(同一張網表)系統性**低估**。
 - **驗收建議**:修復後 server B 可即刻重跑四案 base 態殘差(工件與腳本都在,
   幾分鐘內完成);tc1 目標 |殘差| < ~1(f32 噪音在 tc1 尺度會比 tc2 大)。
 
+## Rule 1bis 跨機驗收(e7df424 落地後,server B 獨立軌跡)
+
+| Case | 1bis 前 | 1bis 後 | 相對 TNS 質量 |
+|---|---|---|---|
+| tc1 | −23,875.40 | **−3.78** | 4.2e-6(f32 噪音,tc1 arrival 尺度大)|
+| hc01 | −1,280.93 | **−0.09** | 7e-7 |
+| tc2 | −0.009 | −0.009(bit-identical .out)| — |
+| hc02 | +0.007 | +0.007(同)| — |
+
+**PASS——oracle == evaluator-implied 不變量四案成立,雙機雙軌跡收斂。**
+
 ## 工件(server B)
 
 - base 態:`~/scratch/run_tc1base/`、`~/scratch/run_hc01base/`(.out/.log/per-bit dump)
