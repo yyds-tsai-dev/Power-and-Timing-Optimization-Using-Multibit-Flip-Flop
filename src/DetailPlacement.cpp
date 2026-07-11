@@ -1,4 +1,5 @@
 #include "DetailPlacement.h"
+#include <unordered_set>
 
 DetailPlacement::DetailPlacement(Manager &mgr) : mgr(mgr){
     this->legalizer = mgr.legalizer;
@@ -295,6 +296,26 @@ void DetailPlacement::DetailAssignmentMBFF(){
     // Cross-MBFF branch (DP_SLOT_INTRA_ONLY=0): original rtree-window sampling.
     // Kept for thesis ablation; default off because the per-window accept test
     // cascades on cross-MBFF moves (tc2 +3.56%, hc01 +1.73%).
+    //
+    // R2c' (DP_SLOT_ORACLE=1, default off, byte-exact when off): the cascade
+    // pathology is 1-hop mispricing — netlist-A libraries carry real slot
+    // timing cost (2b dQpd +4.49) so unpriced windows blow up (tc1 +0.69%,
+    // hc01 +1.21% under the exact-pricer baseline). The Hungarian stays as the
+    // proposal generator; each window's reassignment is priced exactly with
+    // evalRemapDelta (slot permutations leave power/area untouched => pure
+    // alpha*dTNS) and committed only on strict improvement, folding caches
+    // with incrAccurateRecomputeFF per touched physical FF (call-surface
+    // contract screening->commit pattern). Requires EVAL_ANCHOR=1 for
+    // evaluator-true anchors.
+    const bool slotOracle = []{ const char* e = std::getenv("DP_SLOT_ORACLE"); return e && std::atoi(e) != 0; }();
+    if(slotOracle){
+        if(!(std::getenv("EVAL_ANCHOR") && std::atoi(std::getenv("EVAL_ANCHOR"))))
+            std::cerr << "[DP_SLOT_ORACLE] WARNING: EVAL_ANCHOR is off — oracle anchors are Preprocess-rebased, not evaluator-true\n";
+        if(!mgr.incrBuilt_) mgr.incrAccurateBuild();
+    }
+    size_t oracleWindows = 0, oracleAccepts = 0;
+    double oracleGain = 0.0;
+    std::unordered_set<FF*> oracleTouched;
     srand(2001);
     size_t max_clk_idx = 0;
     for(const auto &pair : mgr.FF_Map){
@@ -413,6 +434,32 @@ void DetailPlacement::DetailAssignmentMBFF(){
             std::vector<int> assignment;
             HungAlgo.Solve(cost, assignment);
 
+            if(slotOracle){
+                // Exact accept gate: price the whole window's proposed remap.
+                std::vector<FF*> bits(querySize);
+                std::vector<Coor> nD(querySize), nQ(querySize);
+                std::vector<double> nQpd(querySize);
+                for(size_t i=0;i<FFs.size();i++){
+                    FF* newFF = MBFFs[slotMap[FFsMap[assignment[i]]].first];
+                    size_t curSlot = slotMap[FFsMap[assignment[i]]].second;
+                    string pinName = newFF->getCell()->getBits() == 1 ? "" : std::to_string(curSlot);
+                    bits[i] = FFs[i];
+                    nD[i] = newFF->getNewCoor() + newFF->getPinCoor("D" + pinName);
+                    nQ[i] = newFF->getNewCoor() + newFF->getPinCoor("Q" + pinName);
+                    nQpd[i] = newFF->getCell()->getQpinDelay();
+                }
+                double dT = mgr.evalRemapDelta(bits, nD, nQ, nQpd);
+                oracleWindows++;
+                if(!(dT < 0.0)) continue;          // reject window: no strict TNS win
+                oracleAccepts++;
+                oracleGain += -dT;
+                oracleTouched.clear();
+                for(size_t i=0;i<FFs.size();i++){
+                    oracleTouched.insert(FFs[i]->getPhysicalFF());
+                    oracleTouched.insert(MBFFs[slotMap[FFsMap[assignment[i]]].first]);
+                }
+            }
+
             std::vector<std::pair<size_t, size_t>> newSlotMap(querySize);
             for(size_t i=0;i<FFs.size();i++){ // write back assignment result
                 FF* newFF = MBFFs[slotMap[FFsMap[assignment[i]]].first];
@@ -436,9 +483,17 @@ void DetailPlacement::DetailAssignmentMBFF(){
             // update slotMap
             for(size_t slotI=0;slotI<querySize;slotI++)
                 slotMap[FFsMap[slotI]] = newSlotMap[slotI];
+
+            // fold the committed window into the oracle caches (contract:
+            // recompute per touched physical FF after every accept)
+            if(slotOracle)
+                for(FF* phys : oracleTouched) mgr.incrAccurateRecomputeFF(phys);
         }
     }
-
+    if(slotOracle)
+        std::cerr << "[DP_SLOT_ORACLE] windows=" << oracleWindows
+                  << " accept=" << oracleAccepts
+                  << " tnsGain=" << oracleGain << "\n";
 }
 
 size_t DetailPlacement::ChangeCell(){
