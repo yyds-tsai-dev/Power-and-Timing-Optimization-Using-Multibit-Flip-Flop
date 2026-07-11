@@ -1,5 +1,6 @@
 #include "Manager.h"
 #include <unordered_set>
+#include <limits>
 #include <boost/geometry.hpp>
 #include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -10,6 +11,19 @@
 // instead of the Preprocess-rebased anchors (whose 1-hop rebasing bakes model error
 // into the baseline). Front-end consumers are untouched; byte-exact when off.
 static bool g_evalAnchor = false;
+// Evaluator-semantics constants (active ONLY under EVAL_ANCHOR; byte-exact otherwise).
+// Rule 1 (tie unfreeze): zero-input gates fire with a -inf arrival sentinel so their
+//   transitive fanout gets timed via live paths; -inf arcs never win any max.
+// Rule 2 (unreachable drop): a D pin with no live launch path contributes ZERO to TNS
+//   (the evaluator drops it) — no fallback to the parse origSlack. Null prevInstance
+//   pins must consult the BFS/caches FIRST (Preprocess froze them; the netlist may
+//   still reach them through live paths).
+// Rule 3 (OUT1-only): only a gate's "OUT1" pin carries its arrival; arcs from other
+//   output pins are dead (refsta.py: `dp != 'OUT1'` => dead). Dead arcs still count
+//   as topology events (Kahn/BFS input counting) but deliver no arrival.
+static constexpr double kEvalNegInf  = -1e300;   // untimed-arrival sentinel
+static constexpr double kEvalUnreach = -1e200;   // arrival below this = unreachable
+static inline double evalDropSlack(){ return std::numeric_limits<double>::infinity(); }
 static inline double aSlack(FF* cf){ return g_evalAnchor ? cf->getEvalSlack() : cf->getTimingSlack("D"); }
 static inline Coor   aD(FF* cf){ return g_evalAnchor ? cf->getEvalD() : cf->getOriginalD(); }
 static inline Coor   aQ(FF* cf){ return g_evalAnchor ? cf->getEvalQ() : cf->getOriginalQ(); }
@@ -2358,9 +2372,27 @@ double Manager::incrFFSlack(FF* cf){
     // computeAccurateTNS exactly (diff=0) in ALL configs, including stacked RELOC (which
     // sets arrCorrection_ via refreshArrivalCorrections). The faithful metric IS
     // computeAccurateTNS, which also omits arrCorrection_.
-    if(!prev.instance) return origSlack;
+    if(!prev.instance && !g_evalAnchor) return origSlack;
     FF* phys = cf->getPhysicalFF();
     Coor curD = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
+    if(g_evalAnchor){
+        // Rule 2: consult the graph caches FIRST (null prevInstance can still be
+        // reachable), and DROP unreachable pins instead of returning origSlack.
+        auto dit = incrFFDrivers_.find(cf);
+        if(dit != incrFFDrivers_.end() && !dit->second.empty()){
+            double cur = -1e300;
+            for(auto& gp : dit->second){
+                double v = incrGateCur_[gp.first] + DisplacementDelay * HPWL(gp.second, curD);
+                if(v > cur) cur = v;
+            }
+            double orig = incrFFArrOrig_[cf];
+            if(cur < kEvalUnreach || orig < kEvalUnreach) return evalDropSlack();
+            return origSlack - (cur - orig);
+        }
+        // no live gate driver arcs recorded: gate-driven or frozen pins are unreachable
+        if(!prev.instance || prev.cellType == CellType::GATE) return evalDropSlack();
+        // IO- / FF-direct-driven pins: the shared model below is evaluator-exact
+    }
     double arrChange = 0;
     if(prev.cellType == CellType::GATE){
         auto it = incrFFDrivers_.find(cf);
@@ -2447,18 +2479,30 @@ void Manager::incrAccurateBuild(){
     for(auto& kv : Gate_Map){
         Gate* g = kv.second;
         for(auto& outPair : g->getOutputInstances()){
+            // Rule 3 (EVAL_ANCHOR): arcs from non-OUT1 gate output pins are dead —
+            // excluded from the arrival caches, but kept in incrFanoutG_ so Kahn
+            // event counting (and downstream unfreeze) still sees the edge.
+            const bool dead = g_evalAnchor && outPair.first != "OUT1";
             Coor gout = g->getCoor() + g->getPinCoor(outPair.first);
             for(auto& tgt : outPair.second){
                 auto git = Gate_Map.find(tgt.first);
                 if(git!=Gate_Map.end()){
                     Gate* n = git->second; Coor npin = n->getCoor() + n->getPinCoor(tgt.second);
-                    incrFanin_[n].push_back({2,g,nullptr, DisplacementDelay*HPWL(gout,npin), npin});
+                    if(!dead) incrFanin_[n].push_back({2,g,nullptr, DisplacementDelay*HPWL(gout,npin), npin});
                     incrFanoutG_[g].push_back(n);
                 } else {
                     auto fit = innerFF.find(tgt.first);
-                    if(fit!=innerFF.end()){ incrSinkFF_[g].push_back(fit->second); incrFFDrivers_[fit->second].push_back({g, gout}); }
+                    if(fit!=innerFF.end() && !dead){ incrSinkFF_[g].push_back(fit->second); incrFFDrivers_[fit->second].push_back({g, gout}); }
                 }
             }
+        }
+    }
+    // Rule 1 (EVAL_ANCHOR): zero-input (tie/constant) gates never receive events, so
+    // seed them into the Kahn queue; they carry the -inf sentinel and unfreeze fanout.
+    if(g_evalAnchor){
+        for(auto& kv : Gate_Map){
+            Gate* g = kv.second;
+            if(g->getCell()->getInputCount() == 0) q.push(g);
         }
     }
     // Kahn topo order (gate->gate edges; gates already seeded when all inputs counted)
@@ -2471,6 +2515,12 @@ void Manager::incrAccurateBuild(){
 
     // Compute current + original gate arrivals in topo order.
     std::unordered_map<Gate*,double> origArr;
+    if(g_evalAnchor){
+        // Pre-init every gate to the -inf sentinel: gates that never pop (event
+        // deadlock) must read as unreachable, not as operator[]-inserted 0.
+        incrGateCur_.reserve(Gate_Map.size()); origArr.reserve(Gate_Map.size());
+        for(auto& kv : Gate_Map){ incrGateCur_[kv.second] = kEvalNegInf; origArr[kv.second] = kEvalNegInf; }
+    }
     for(Gate* g : incrTopo_){
         double mc=-1e300, mo=-1e300;
         for(auto& f : incrFanin_[g]){
@@ -2484,14 +2534,15 @@ void Manager::incrAccurateBuild(){
             } else { vc = incrGateCur_[f.g] + f.cnst; vo = origArr[f.g] + f.cnst; }
             if(vc>mc) mc=vc; if(vo>mo) mo=vo;
         }
-        incrGateCur_[g] = (mc==-1e300)?0:mc;
-        origArr[g]      = (mo==-1e300)?0:mo;
+        // Rule 1 (EVAL_ANCHOR): keep the -inf sentinel flowing instead of clamping to 0.
+        incrGateCur_[g] = (mc==-1e300 && !g_evalAnchor)?0:mc;
+        origArr[g]      = (mo==-1e300 && !g_evalAnchor)?0:mo;
     }
     // Original arrival at each gate-driven FF's D.
     for(auto& kv : incrFFDrivers_){
         FF* cf = kv.first; double mo=-1e300;
         for(auto& gp : kv.second){ double v = origArr[gp.first] + DisplacementDelay*HPWL(gp.second, aD(cf)); if(v>mo) mo=v; }
-        incrFFArrOrig_[cf] = (mo==-1e300)?0:mo;
+        incrFFArrOrig_[cf] = (mo==-1e300 && !g_evalAnchor)?0:mo;
     }
     // Initial TNS.
     incrTNS_ = 0;
@@ -2523,7 +2574,7 @@ double Manager::incrAccurateRecomputeFF(FF* movedPhys){
             else vc = incrGateCur_[f.g] + f.cnst;
             if(vc>mc) mc=vc;
         }
-        incrGateCur_[g] = (mc==-1e300)?0:mc;
+        incrGateCur_[g] = (mc==-1e300 && !g_evalAnchor)?0:mc;
     }
     // Affected sinks: moved FF's bits + their FF-direct sinks + cone gates' sink FFs.
     std::unordered_set<FF*> affected;
@@ -2565,6 +2616,19 @@ double Manager::computeAccurateTNS(){
     gateArr.reserve(Gate_Map.size());
     gateCnt.reserve(Gate_Map.size());
     std::queue<Gate*> q;
+
+    // EVAL_ANCHOR Rules 1+2 setup: every gate starts at the -inf sentinel (instead of
+    // the implicit 0 default), and zero-input (tie/constant) gates fire immediately —
+    // they are NOT launch points, so they carry -inf, but their firing unfreezes the
+    // event-count BFS for their transitive fanout.
+    if(g_evalAnchor){
+        for(auto& kv : Gate_Map){
+            Gate* g = kv.second;
+            ArrPair& ap = gateArr[g];
+            ap.orig = ap.cur = kEvalNegInf;
+            if(g->getCell()->getInputCount() == 0) q.push(g);
+        }
+    }
 
     // Step 1: IO → Gate arrivals (IOs don't move; same for orig and cur).
     for(auto& io_m : Input_Map){
@@ -2639,6 +2703,10 @@ double Manager::computeAccurateTNS(){
         auto& outs = gate->getOutputInstances();
         for(auto& outPair : outs){
             const std::string& outPin = outPair.first;
+            // Rule 3 (EVAL_ANCHOR): only OUT1 carries the gate's arrival; arcs from
+            // other output pins are dead — they still count as BFS events (so fanout
+            // gates don't deadlock) but deliver no arrival.
+            const bool dead = g_evalAnchor && outPin != "OUT1";
             Coor gateOut = gate->getCoor() + gate->getPinCoor(outPin);
             for(auto& tgt : outPair.second){
                 const std::string& instName = tgt.first;
@@ -2647,6 +2715,13 @@ double Manager::computeAccurateTNS(){
                 auto git = Gate_Map.find(instName);
                 if(git != Gate_Map.end()){
                     Gate* next = git->second;
+                    if(dead){
+                        int& cnt = gateCnt[next];
+                        cnt++;
+                        if(cnt == next->getCell()->getInputCount())
+                            q.push(next);
+                        continue;
+                    }
                     Coor nextPin = next->getCoor() + next->getPinCoor(pinName);
                     double hop = DisplacementDelay * HPWL(gateOut, nextPin);
                     ArrPair& nap = gateArr[next];
@@ -2661,6 +2736,7 @@ double Manager::computeAccurateTNS(){
                         q.push(next);
                 }
                 else{
+                    if(dead) continue;   // OUT2+ → FF.D: unreachable via this arc
                     auto fit = innerFF.find(instName);
                     if(fit != innerFF.end()){
                         FF* cf   = fit->second;
@@ -2669,7 +2745,9 @@ double Manager::computeAccurateTNS(){
                         Coor curD  = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
                         double oArr = myArr.orig + DisplacementDelay * HPWL(gateOut, origD);
                         double cArr = myArr.cur  + DisplacementDelay * HPWL(gateOut, curD);
-                        FFArrPair& fap = ffArr[instName];
+                        auto fres = ffArr.emplace(instName, FFArrPair());
+                        FFArrPair& fap = fres.first->second;
+                        if(g_evalAnchor && fres.second) fap.orig = fap.cur = kEvalNegInf;
                         if(oArr > fap.orig) fap.orig = oArr;
                         if(cArr > fap.cur)  fap.cur  = cArr;
                         double mdp = myArr.md + DisplacementDelay * (HPWL(gateOut, curD) - HPWL(gateOut, origD));
@@ -2697,6 +2775,31 @@ double Manager::computeAccurateTNS(){
         PrevInstance prev = cf->getPrevInstance();
         FF* phys = cf->getPhysicalFF();
         Coor curD = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
+
+        if(g_evalAnchor){
+            // Rule 2: consult the BFS result FIRST — a null prevInstance can still be
+            // reachable through live paths (Preprocess froze it, not the netlist).
+            // Pins with no live launch path are DROPPED from TNS (evaluator behavior),
+            // never charged at the parse origSlack.
+            auto fit = ffArr.find(name);
+            bool legacyIOFF = (fit == ffArr.end()) && prev.instance && prev.cellType != CellType::GATE;
+            if(!legacyIOFF){
+                if(fit != ffArr.end() && fit->second.orig > kEvalUnreach && fit->second.cur > kEvalUnreach){
+                    double newSlack = origSlack - (fit->second.cur - fit->second.orig);
+                    if(diagDumpPath) diagRows.emplace_back(&name, newSlack);
+                    if(newSlack < 0) totalTNS += -newSlack;
+                    if(evalDiag){ nBFS++; if(newSlack < 0) tBFS += -newSlack;
+                        double sM = origSlack - fit->second.md;
+                        if(sM < 0) totalTNS_M += -sM; }
+                } else {
+                    // unreachable / dropped
+                    if(diagDumpPath) diagRows.emplace_back(&name, evalDropSlack());
+                    if(evalDiag) nNull++;
+                }
+                continue;
+            }
+            // IO- / FF-direct-driven pin: legacy branches below are evaluator-exact
+        }
 
         if(!prev.instance){
             if(origSlack < 0) totalTNS += -origSlack;
@@ -2817,6 +2920,16 @@ void Manager::refreshArrivalCorrections(){
     gateCnt.reserve(Gate_Map.size());
     std::queue<Gate*> q;
 
+    // EVAL_ANCHOR Rules 1+2 setup (mirrors computeAccurateTNS): -inf init + tie seeding.
+    if(g_evalAnchor){
+        for(auto& kv : Gate_Map){
+            Gate* g = kv.second;
+            ArrPair& ap = gateArr[g];
+            ap.orig = ap.cur = kEvalNegInf;
+            if(g->getCell()->getInputCount() == 0) q.push(g);
+        }
+    }
+
     // Step 1: IO → Gate (same for orig and cur).
     for(auto& io_m : Input_Map){
         Instance& ioInst = IO_Map[io_m.first];
@@ -2876,11 +2989,18 @@ void Manager::refreshArrivalCorrections(){
         const ArrPair& my = gateArr[gate];
         auto& outs = gate->getOutputInstances();
         for(auto& outPair : outs){
+            // Rule 3 (EVAL_ANCHOR): non-OUT1 arcs are dead (events only, no arrival).
+            const bool dead = g_evalAnchor && outPair.first != "OUT1";
             Coor go = gate->getCoor() + gate->getPinCoor(outPair.first);
             for(auto& tgt : outPair.second){
                 auto git = Gate_Map.find(tgt.first);
                 if(git != Gate_Map.end()){
                     Gate* nxt = git->second;
+                    if(dead){
+                        if(++gateCnt[nxt] == nxt->getCell()->getInputCount())
+                            q.push(nxt);
+                        continue;
+                    }
                     Coor np = nxt->getCoor() + nxt->getPinCoor(tgt.second);
                     double hop = DisplacementDelay * HPWL(go, np);
                     ArrPair& nap = gateArr[nxt];
@@ -2891,6 +3011,7 @@ void Manager::refreshArrivalCorrections(){
                         q.push(nxt);
                 }
                 else{
+                    if(dead) continue;
                     auto fit = innerFF.find(tgt.first);
                     if(fit != innerFF.end()){
                         FF* cf   = fit->second;
@@ -2899,7 +3020,9 @@ void Manager::refreshArrivalCorrections(){
                         Coor curD  = phys->getNewCoor() + phys->getPinCoor("D" + cf->getPhysicalPinName());
                         double oA = my.orig + DisplacementDelay * HPWL(go, origD);
                         double cA = my.cur  + DisplacementDelay * HPWL(go, curD);
-                        FFArrPair& fap = ffArr[tgt.first];
+                        auto fres = ffArr.emplace(tgt.first, FFArrPair());
+                        FFArrPair& fap = fres.first->second;
+                        if(g_evalAnchor && fres.second) fap.orig = fap.cur = kEvalNegInf;
                         if(oA > fap.orig) fap.orig = oA;
                         if(cA > fap.cur)  fap.cur  = cA;
                     }
@@ -2917,6 +3040,9 @@ void Manager::refreshArrivalCorrections(){
 
         PrevInstance prev = cf->getPrevInstance();
         if(prev.cellType != CellType::GATE) continue;
+        // EVAL_ANCHOR Rule 2: unreachable pins keep correction 0 (the faithful oracle
+        // family drops them from TNS; getSlack() consumers keep the old model here).
+        if(g_evalAnchor && (fit->second.orig < kEvalUnreach || fit->second.cur < kEvalUnreach)) continue;
 
         double origSlack = cf->getTimingSlack("D");
         double accurateSlack = origSlack - (fit->second.cur - fit->second.orig);
@@ -3401,7 +3527,7 @@ double Manager::evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
     Coor cfb_Q = A->getNewCoor() + A->getPinCoor("Q"+std::to_string(sa));
 
     auto topoIdx = [&](Gate* g)->int{ auto it=incrTopoIdx_.find(g); return it!=incrTopoIdx_.end()?it->second:0; };
-    auto gateCur = [&](Gate* g)->double{ auto it=incrGateCur_.find(g); return it!=incrGateCur_.end()?it->second:0.0; };
+    auto gateCur = [&](Gate* g)->double{ auto it=incrGateCur_.find(g); return it!=incrGateCur_.end()?it->second:(g_evalAnchor?kEvalNegInf:0.0); };
     auto qpos = [&](FF* cf)->Coor{
         if(cf==cfa) return cfa_Q;
         if(cf==cfb) return cfb_Q;
@@ -3434,17 +3560,36 @@ double Manager::evalBitSwapDelta(FF* A, int sa, FF* B, int sb,
             else { auto ov=gateOv.find(f.g); vc = (ov!=gateOv.end()?ov->second:gateCur(f.g)) + f.cnst; }
             if(vc>mc) mc=vc;
         }
-        gateOv[g] = (mc==-1e300)?0:mc;
+        gateOv[g] = (mc==-1e300 && !g_evalAnchor)?0:mc;
     }
 
     // override-aware slack (mirrors incrFFSlack; overrides curD, source-FF Q, cone gate arrivals)
     auto slackOv = [&](FF* cf)->double{
         double origSlack = aSlack(cf);
         PrevInstance prev = cf->getPrevInstance();
-        if(!prev.instance) return origSlack;
+        if(!prev.instance && !g_evalAnchor) return origSlack;
         Coor curD;
         if(cf==cfa) curD=cfa_D; else if(cf==cfb) curD=cfb_D;
         else { FF* phys=cf->getPhysicalFF(); curD = phys->getNewCoor()+phys->getPinCoor("D"+cf->getPhysicalPinName()); }
+        if(g_evalAnchor){
+            // Rule 2: caches first (null prevInstance can still be reachable); drop
+            // unreachable pins instead of charging origSlack. Mirrors incrFFSlack.
+            auto it=incrFFDrivers_.find(cf);
+            if(it!=incrFFDrivers_.end() && !it->second.empty()){
+                double cur=-1e300;
+                for(auto& gp : it->second){
+                    auto ov=gateOv.find(gp.first);
+                    double gArr = (ov!=gateOv.end()?ov->second:gateCur(gp.first));
+                    double v = gArr + DisplacementDelay*HPWL(gp.second, curD);
+                    if(v>cur) cur=v;
+                }
+                auto ao=incrFFArrOrig_.find(cf);
+                double orig = (ao!=incrFFArrOrig_.end()?ao->second:kEvalNegInf);
+                if(cur < kEvalUnreach || orig < kEvalUnreach) return evalDropSlack();
+                return origSlack - (cur - orig);
+            }
+            if(!prev.instance || prev.cellType==CellType::GATE) return evalDropSlack();
+        }
         double arrChange=0;
         if(prev.cellType==CellType::GATE){
             auto it=incrFFDrivers_.find(cf);
@@ -3517,7 +3662,7 @@ double Manager::evalRemapDelta(const std::vector<FF*>& bits,
     for(int g=0; g<nb; g++) ovIdx[bits[g]] = g;
 
     auto topoIdx = [&](Gate* g)->int{ auto it=incrTopoIdx_.find(g); return it!=incrTopoIdx_.end()?it->second:0; };
-    auto gateCur = [&](Gate* g)->double{ auto it=incrGateCur_.find(g); return it!=incrGateCur_.end()?it->second:0.0; };
+    auto gateCur = [&](Gate* g)->double{ auto it=incrGateCur_.find(g); return it!=incrGateCur_.end()?it->second:(g_evalAnchor?kEvalNegInf:0.0); };
     auto qpos = [&](FF* cf)->Coor{
         auto it=ovIdx.find(cf); if(it!=ovIdx.end()) return nQ[it->second];
         FF* ph=cf->getPhysicalFF(); return ph->getNewCoor()+ph->getPinCoor("Q"+cf->getPhysicalPinName());
@@ -3552,17 +3697,36 @@ double Manager::evalRemapDelta(const std::vector<FF*>& bits,
             else { auto ov=gateOv.find(f.g); vc = (ov!=gateOv.end()?ov->second:gateCur(f.g)) + f.cnst; }
             if(vc>mc) mc=vc;
         }
-        gateOv[g] = (mc==-1e300)?0:mc;
+        gateOv[g] = (mc==-1e300 && !g_evalAnchor)?0:mc;
     }
 
     auto slackOv = [&](FF* cf)->double{
         double origSlack = aSlack(cf);
         PrevInstance prev = cf->getPrevInstance();
-        if(!prev.instance) return origSlack;
+        if(!prev.instance && !g_evalAnchor) return origSlack;
         Coor curD;
         auto oit=ovIdx.find(cf);
         if(oit!=ovIdx.end()) curD=nD[oit->second];
         else { FF* phys=cf->getPhysicalFF(); curD = phys->getNewCoor()+phys->getPinCoor("D"+cf->getPhysicalPinName()); }
+        if(g_evalAnchor){
+            // Rule 2: caches first (null prevInstance can still be reachable); drop
+            // unreachable pins instead of charging origSlack. Mirrors incrFFSlack.
+            auto it=incrFFDrivers_.find(cf);
+            if(it!=incrFFDrivers_.end() && !it->second.empty()){
+                double cur=-1e300;
+                for(auto& gp : it->second){
+                    auto ov=gateOv.find(gp.first);
+                    double gArr = (ov!=gateOv.end()?ov->second:gateCur(gp.first));
+                    double v = gArr + DisplacementDelay*HPWL(gp.second, curD);
+                    if(v>cur) cur=v;
+                }
+                auto ao=incrFFArrOrig_.find(cf);
+                double orig = (ao!=incrFFArrOrig_.end()?ao->second:kEvalNegInf);
+                if(cur < kEvalUnreach || orig < kEvalUnreach) return evalDropSlack();
+                return origSlack - (cur - orig);
+            }
+            if(!prev.instance || prev.cellType==CellType::GATE) return evalDropSlack();
+        }
         double arrChange=0;
         if(prev.cellType==CellType::GATE){
             auto it=incrFFDrivers_.find(cf);
