@@ -2,7 +2,7 @@
 
 **建立**: 2026-07-08(Fable)| **狀態**: ACTIVE — Phase 0 進行中
 **前提**: ASP-DAC 2027 放棄投稿;目標改為 DAC 2027。paper 資產全數沿用(6pp ACM 格式相同)。
-**死線(依 DAC 2026 模式推估,CFP 公布後校準)**: abstract ~2026-11-19、manuscript 隨後(DAC'26 為 abstract 11/19/2025);**技術凍結目標 = 10 月底**。
+**死線(2026-07-11 校準)**: DAC 2027 = 64th,2027-07-10~16 San Jose(官方 placeholder 已確認);CFP 預計 2026 年 8–9 月出(DAC 2026 是 7/26–29 還沒開)。模板推估:abstract ~11 月上中旬、manuscript 一週後、通知 ~2027 年 3 月上旬;6 頁+refs、雙盲、ACM 模板。**技術凍結目標 = 10 月底(不變)**。
 
 ## 現況基線(2026-07-06 官方紀錄)
 
@@ -68,6 +68,8 @@
 
 ## Phase 3(8/15–9/30,與 Phase 2 重疊)Runtime 攻擊
 
+- **3a-2 false-sharing 修復(survey 途中抓到的現行 bug)**:dyna2 rescore 迴圈的 `dirty` vector<char> 在 schedule(dynamic,8) 下跨執行緒共享 cache line——打包成 per-i 32B POD 陣列即修
+- 設計文件就緒:`reports/v1/2026-07-11_dehashing_design_survey.md`(CSR 化快取、topo-index ID、per-thread SoA scratch、單 socket pinning、dynamic,1;**FP 累加順序已是決定性 → 驗證標準升級為 byte-exact .out**)
 - **3a-1 scratch de-hashing(profiling 實證最大餅)**:oracle 報價 scratch 從 per-call unordered_map 改為稠密邏輯 ID + per-thread epoch-stamped 平坦陣列(hash+malloc 佔 55% 取樣!)。預期 bitRepair 2–3×;驗收 = 7 案分數中性(容 1e-13 FP 漂移)
 - **3a-0 rate-based early exit(預算探測直接證據)**:bitRepair 輪內改善率 < ε/min 即退場,後續階段自癒——預期 capped 案再 1.5–2×、零分數代價;一個下午可驗證
 - **3a bitRepair 增量化**(最大餅):dirty-set 重篩(只重篩被上輪 commit 弄髒的鄰域,而非每輪全量)、候選清單快取、鄰域剪枝
@@ -78,7 +80,8 @@
 
 ## Phase 4(9/15–10/15)泛化 + 論文
 
-- **ICCAD'25 Problem B benchmark 移植(升級為核心,成本下修)**:使用者親自比過 2025——**只改了 input format,內容高度相似**;當年因 bug 中止。移植 = 格式轉接層 + 修掉那隻舊 bug。使用者可能還留有 2025 測資/當時的 parser 改動(屆時先問位置,免重下載)。**現階段先專注 2024 suite(使用者指示)**,2025 排 Phase 4。
+- **ICCAD'25 Problem B 移植 [2026-07-11 重新定價:比想像貴]**:偵察發現 2025 版不只換輸入格式——**評分改用 ICC2 `update_timing -full`(商用 STA),無 density 項,I/O 是 Verilog+DEF+SDC+Liberty**(intel 報告有完整對照表與測資 GitHub 鏡像)。「evaluator-exact」不能字面遷移;精確本地評分需要 ICC2 license(**問使用者:NYCU 實驗室有 Synopsys ICC2 嗎?**)。無 license 的退路:僅定性移植(operator 層 + 自建近似 STA)或放棄雙 suite、把泛化論述改為方法論可遷移性。NTU 冠軍系 DAC'26 LBR 已宣稱制霸 2025 全部隊伍——2025 suite 的敘事權在他們手上,我們的主場是 2024 suite 深度 + 方法論
+- **TIMBER 反駁素材(已備好)**:其「13× 勝 2024 冠軍」實為 bin-violation 罰金套利(他們的 checker 設定下冠軍 binary 出現 1–14 個 BDV;官方計分為零),PPA 幾何平均僅「comparable」且 case2 輸冠軍一倍——DAC 稿引用+反駁一段即可
 - DAC 稿:新頭牌 = 端到端 exact(audit→根因→修復)+ LNS + runtime Pareto;沿用 ASP-DAC 圖文資產;模擬審稿 ×2 輪
 - 黑盒解碼 16 實驗 + refsta + per-FF 取證 = 完整新章素材;**預備答辯**「逆向 evaluator 算不算 overfit?」:(a) contest evaluator 就是宣告的目標函數;(b) decode-your-signoff 方法論可遷移(黑盒微測資→參考實作→per-sink 取證);(c) ICCAD'25 雙 suite 泛化佐證
 - **TCAD 關係決策**:DAC(會議)與 TCAD(期刊)重疊政策確認;預設 TCAD 延後至 DAC 投稿後改寫為其延伸版
