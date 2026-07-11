@@ -214,6 +214,9 @@ public:
     double incrTNS_ = 0;
     bool incrBuilt_ = false;
     void incrAccurateBuild();                       // build caches + full initial compute
+    // Rule 1bis (EVAL_ANCHOR only): per-gate count of fanin events the oracle walkers
+    // actually deliver (IO->gate, FF.Q->gate, gate->gate incl. Rule-3 dead arcs).
+    void evalConnFaninCounts(std::unordered_map<Gate*,int>& cnt);
     double incrFFSlack(FF* cf);                     // current slack of logical FF using caches
     double incrAccurateRecomputeFF(FF* movedPhys);  // after a move, cone-recompute; returns total TNS
     // Side-effect-free ΔTNS of swapping bit (A,sa)<->(B,sb): reads global caches read-only,

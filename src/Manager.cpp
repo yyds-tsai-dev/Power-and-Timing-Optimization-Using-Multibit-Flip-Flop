@@ -2431,6 +2431,50 @@ double Manager::incrFFSlack(FF* cf){
     return origSlack - arrChange;
 }
 
+// Rule 1bis (EVAL_ANCHOR): per-gate count of fanin events that will ACTUALLY be
+// delivered by the oracle walkers — IO->gate arcs, FF.Q->gate arcs, and gate->gate
+// arcs (including Rule-3 dead OUT2+ arcs, which P1b kept as topology-events).
+// Partially-connected gates (lib IN pins > netlist arcs; 4,230 on tc1/hc01) must fire
+// at THIS count, not cell->getInputCount(): the evaluator treats dangling IN pins as
+// contributing 0.0f to its max fold (= the seed, i.e. absent) and times the gate from
+// its remaining connected inputs. Our -inf sentinel + max yields the same ordering as
+// long as the gate fires. Gates with zero connected fanin merge into Rule 1's -inf
+// seeding path (covers tie cells too).
+void Manager::evalConnFaninCounts(std::unordered_map<Gate*,int>& cnt){
+    cnt.clear();
+    cnt.reserve(Gate_Map.size());
+    for(auto& kv : Gate_Map) cnt[kv.second] = 0;
+    // IO -> gate arcs
+    for(auto& io_m : Input_Map){
+        Instance& ioInst = IO_Map[io_m.first];
+        for(auto& outPair : ioInst.getOutputInstances())
+            for(auto& tgt : outPair.second){
+                auto it = Gate_Map.find(tgt.first);
+                if(it != Gate_Map.end()) cnt[it->second]++;
+            }
+    }
+    // FF.Q -> gate arcs (same innerFF de-dup as the walkers: unique by instance name)
+    std::unordered_map<std::string, FF*> innerFF;
+    innerFF.reserve(FF_Map.size() * 2);
+    for(auto& kv : FF_Map)
+        for(FF* cf : kv.second->getClusterFF()) innerFF[cf->getInstanceName()] = cf;
+    for(auto& kv : innerFF){
+        for(auto& outPair : kv.second->getOutputInstances())
+            for(auto& tgt : outPair.second){
+                auto it = Gate_Map.find(tgt.first);
+                if(it != Gate_Map.end()) cnt[it->second]++;
+            }
+    }
+    // gate -> gate arcs (dead OUT2+ arcs included: they still deliver BFS events)
+    for(auto& kv : Gate_Map){
+        for(auto& outPair : kv.second->getOutputInstances())
+            for(auto& tgt : outPair.second){
+                auto it = Gate_Map.find(tgt.first);
+                if(it != Gate_Map.end()) cnt[it->second]++;
+            }
+    }
+}
+
 void Manager::incrAccurateBuild(){
     // build-once: topology caches are move/re-pair-invariant (keyed by logical FF;
     // positions read live). Sharing one build + the running incrTNS_ across alternating
@@ -2446,7 +2490,14 @@ void Manager::incrAccurateBuild(){
 
     std::unordered_map<Gate*,int> cnt;
     std::queue<Gate*> q;
-    auto bump = [&](Gate* g){ if(++cnt[g] == g->getCell()->getInputCount()) q.push(g); };
+    // Rule 1bis (EVAL_ANCHOR): fire on the ACTUAL delivered-event count, not the lib
+    // pin count — partially-connected gates would otherwise freeze forever.
+    std::unordered_map<Gate*,int> connCnt;
+    if(g_evalAnchor) evalConnFaninCounts(connCnt);
+    auto bump = [&](Gate* g){
+        int need = g_evalAnchor ? connCnt[g] : g->getCell()->getInputCount();
+        if(++cnt[g] == need) q.push(g);
+    };
 
     // IO -> gate
     for(auto& io_m : Input_Map){
@@ -2497,12 +2548,13 @@ void Manager::incrAccurateBuild(){
             }
         }
     }
-    // Rule 1 (EVAL_ANCHOR): zero-input (tie/constant) gates never receive events, so
-    // seed them into the Kahn queue; they carry the -inf sentinel and unfreeze fanout.
+    // Rule 1 + 1bis (EVAL_ANCHOR): gates with ZERO connected fanin (tie/constant cells
+    // AND fully-dangling-input gates) never receive events, so seed them into the Kahn
+    // queue; they carry the -inf sentinel and unfreeze their fanout.
     if(g_evalAnchor){
         for(auto& kv : Gate_Map){
             Gate* g = kv.second;
-            if(g->getCell()->getInputCount() == 0) q.push(g);
+            if(connCnt[g] == 0) q.push(g);
         }
     }
     // Kahn topo order (gate->gate edges; gates already seeded when all inputs counted)
@@ -2617,18 +2669,25 @@ double Manager::computeAccurateTNS(){
     gateCnt.reserve(Gate_Map.size());
     std::queue<Gate*> q;
 
-    // EVAL_ANCHOR Rules 1+2 setup: every gate starts at the -inf sentinel (instead of
-    // the implicit 0 default), and zero-input (tie/constant) gates fire immediately —
-    // they are NOT launch points, so they carry -inf, but their firing unfreezes the
-    // event-count BFS for their transitive fanout.
+    // EVAL_ANCHOR Rules 1+1bis+2 setup: every gate starts at the -inf sentinel
+    // (instead of the implicit 0 default), and gates with ZERO connected fanin
+    // (tie/constant cells AND fully-dangling-input gates) fire immediately — they are
+    // NOT launch points, so they carry -inf, but their firing unfreezes the
+    // event-count BFS for their transitive fanout. Rule 1bis: all other gates fire at
+    // the ACTUAL delivered-event count, not the lib pin count.
+    std::unordered_map<Gate*,int> connCnt;
     if(g_evalAnchor){
+        evalConnFaninCounts(connCnt);
         for(auto& kv : Gate_Map){
             Gate* g = kv.second;
             ArrPair& ap = gateArr[g];
             ap.orig = ap.cur = kEvalNegInf;
-            if(g->getCell()->getInputCount() == 0) q.push(g);
+            if(connCnt[g] == 0) q.push(g);
         }
     }
+    auto fireCnt = [&](Gate* g)->int{
+        return g_evalAnchor ? connCnt[g] : g->getCell()->getInputCount();
+    };
 
     // Step 1: IO → Gate arrivals (IOs don't move; same for orig and cur).
     for(auto& io_m : Input_Map){
@@ -2649,7 +2708,7 @@ double Manager::computeAccurateTNS(){
                     if(arr > ap.cur)  ap.cur  = arr;
                     int& cnt = gateCnt[gate];
                     cnt++;
-                    if(cnt == gate->getCell()->getInputCount())
+                    if(cnt == fireCnt(gate))
                         q.push(gate);
                 }
             }
@@ -2682,7 +2741,7 @@ double Manager::computeAccurateTNS(){
                     if(cArr - oArr > ap.md) ap.md = cArr - oArr;
                     int& cnt = gateCnt[gate];
                     cnt++;
-                    if(cnt == gate->getCell()->getInputCount())
+                    if(cnt == fireCnt(gate))
                         q.push(gate);
                 }
             }
@@ -2718,7 +2777,7 @@ double Manager::computeAccurateTNS(){
                     if(dead){
                         int& cnt = gateCnt[next];
                         cnt++;
-                        if(cnt == next->getCell()->getInputCount())
+                        if(cnt == fireCnt(next))
                             q.push(next);
                         continue;
                     }
@@ -2732,7 +2791,7 @@ double Manager::computeAccurateTNS(){
                     if(cArr > nap.cur)  nap.cur  = cArr;
                     int& cnt = gateCnt[next];
                     cnt++;
-                    if(cnt == next->getCell()->getInputCount())
+                    if(cnt == fireCnt(next))
                         q.push(next);
                 }
                 else{
@@ -2920,15 +2979,21 @@ void Manager::refreshArrivalCorrections(){
     gateCnt.reserve(Gate_Map.size());
     std::queue<Gate*> q;
 
-    // EVAL_ANCHOR Rules 1+2 setup (mirrors computeAccurateTNS): -inf init + tie seeding.
+    // EVAL_ANCHOR Rules 1+1bis+2 setup (mirrors computeAccurateTNS): -inf init +
+    // zero-connected-fanin seeding + fire on actual delivered-event count.
+    std::unordered_map<Gate*,int> connCnt;
     if(g_evalAnchor){
+        evalConnFaninCounts(connCnt);
         for(auto& kv : Gate_Map){
             Gate* g = kv.second;
             ArrPair& ap = gateArr[g];
             ap.orig = ap.cur = kEvalNegInf;
-            if(g->getCell()->getInputCount() == 0) q.push(g);
+            if(connCnt[g] == 0) q.push(g);
         }
     }
+    auto fireCnt = [&](Gate* g)->int{
+        return g_evalAnchor ? connCnt[g] : g->getCell()->getInputCount();
+    };
 
     // Step 1: IO → Gate (same for orig and cur).
     for(auto& io_m : Input_Map){
@@ -2944,7 +3009,7 @@ void Manager::refreshArrivalCorrections(){
                     ArrPair& ap = gateArr[gate];
                     if(arr > ap.orig) ap.orig = arr;
                     if(arr > ap.cur)  ap.cur  = arr;
-                    if(++gateCnt[gate] == gate->getCell()->getInputCount())
+                    if(++gateCnt[gate] == fireCnt(gate))
                         q.push(gate);
                 }
             }
@@ -2972,7 +3037,7 @@ void Manager::refreshArrivalCorrections(){
                     ArrPair& ap = gateArr[gate];
                     if(oA > ap.orig) ap.orig = oA;
                     if(cA > ap.cur)  ap.cur  = cA;
-                    if(++gateCnt[gate] == gate->getCell()->getInputCount())
+                    if(++gateCnt[gate] == fireCnt(gate))
                         q.push(gate);
                 }
             }
@@ -2997,7 +3062,7 @@ void Manager::refreshArrivalCorrections(){
                 if(git != Gate_Map.end()){
                     Gate* nxt = git->second;
                     if(dead){
-                        if(++gateCnt[nxt] == nxt->getCell()->getInputCount())
+                        if(++gateCnt[nxt] == fireCnt(nxt))
                             q.push(nxt);
                         continue;
                     }
@@ -3007,7 +3072,7 @@ void Manager::refreshArrivalCorrections(){
                     double oA = my.orig + hop, cA = my.cur + hop;
                     if(oA > nap.orig) nap.orig = oA;
                     if(cA > nap.cur)  nap.cur  = cA;
-                    if(++gateCnt[nxt] == nxt->getCell()->getInputCount())
+                    if(++gateCnt[nxt] == fireCnt(nxt))
                         q.push(nxt);
                 }
                 else{
