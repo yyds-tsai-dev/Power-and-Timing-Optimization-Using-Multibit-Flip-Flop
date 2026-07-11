@@ -1336,6 +1336,38 @@ void Manager::unbankRebankGlobal(){
 // Thesis novelty: cost-attribution-driven post-LG MBFF re-synthesis with
 // validated per-pair cost (vs predict) on a targeted worst-cost subset
 // (vs global).
+// R2b item 4 (PLR_ORACLE=1): exact pair-merge gain for postLGResynth — replaces
+// Banking::CostCompare edge/commit pricing (1-hop; the stage's recorded death
+// cause: tc2 +1.04% even on the P1b baseline). alpha*(-dTNS) via evalRemapDelta
+// (pair banks onto `cell` at `at`, slots 0/1 in pair order = bankFF order) plus
+// the static beta/gamma delta vs the bits' current physical cells. Positive =
+// good; same weighted-score scale as CostCompare, so PLR_MARGIN is comparable.
+static double plrExactPairGain(Manager& mgr, const Coor& at, Cell* cell,
+                               const std::vector<FF*>& physPair){
+    // physPair holds the debanked 1-bit PHYSICAL FFs (pool members, same as
+    // CostCompare's argument); evalRemapDelta wants their LOGICAL bits, in
+    // slot order = bankFF's order (pair order).
+    std::vector<FF*> bits;
+    bits.reserve(physPair.size());
+    double curP = 0, curA = 0;
+    for(FF* phys : physPair){
+        for(FF* cf : phys->getClusterFF()) bits.push_back(cf);
+        curP += phys->getCell()->getGatePower();
+        curA += phys->getCell()->getArea();
+    }
+    std::vector<Coor> nD(bits.size()), nQ(bits.size());
+    std::vector<double> nQpd(bits.size(), cell->getQpinDelay());
+    for(size_t g = 0; g < bits.size(); ++g){
+        std::string pin = std::to_string(g);
+        nD[g] = at + cell->getPinCoor("D" + pin);
+        nQ[g] = at + cell->getPinCoor("Q" + pin);
+    }
+    double dT = mgr.evalRemapDelta(bits, nD, nQ, nQpd);
+    double gainPA = mgr.beta * (curP - cell->getGatePower())
+                  + mgr.gamma * (curA - cell->getArea());
+    return mgr.alpha * (-dT) + gainPA;
+}
+
 void Manager::postLGResynth(){
     const char* envOn = std::getenv("POST_LG_RESYNTH");
     if(!envOn || std::atoi(envOn) == 0) return;
@@ -1349,6 +1381,10 @@ void Manager::postLGResynth(){
     if(const char* e = std::getenv("PLR_RADIUS_MUL")) radiusMul = std::atof(e);
     int kmax = 10;
     if(const char* e = std::getenv("PLR_KMAX")) kmax = std::atoi(e);
+    // PLR_ORACLE=1: exact pricing (evalRemapDelta + static lib delta) for victim
+    // selection, edge weights and commit re-verify. Default off; byte-exact off.
+    const bool plrOracle = []{ const char* e = std::getenv("PLR_ORACLE"); return e && std::atoi(e) != 0; }();
+    if(plrOracle && !incrBuilt_) incrAccurateBuild();
 
     Cell* oneBitCell = Bit_FF_Map[1][0];
     auto itTwo = Bit_FF_Map.find(2);
@@ -1369,7 +1405,7 @@ void Manager::postLGResynth(){
         for(FF* cf : m->getClusterFF()){
             if(!cf) continue;
             double s;
-            try { s = cf->getSlack(); }
+            try { s = plrOracle ? incrFFSlack(cf) : cf->getSlack(); }
             catch(...) { continue; }
             if(s < 0) badness += -s;
         }
@@ -1394,12 +1430,31 @@ void Manager::postLGResynth(){
         legalizer->RemoveNodeByFFPtr(m);
     }
     std::vector<FF*> pool;
+    std::vector<int> plrPartner;     // pool idx -> original partner idx (-1 none)
+    std::vector<Coor> plrOrigAt;     // pool idx -> original MBFF coor
+    std::vector<Cell*> plrOrigCell;  // pool idx -> original MBFF cell
     pool.reserve(mbffs.size() * 2);
     for(FF* m : mbffs){
+        Coor mAt = m->getNewCoor();
+        Cell* mCell = m->getCell();
         auto ones = debankFF(m, oneBitCell);
+        size_t base = pool.size();
         for(FF* w : ones) pool.push_back(w);
+        if(ones.size() == 2){
+            plrPartner.push_back((int)base + 1);
+            plrPartner.push_back((int)base);
+        } else {
+            for(size_t k = 0; k < ones.size(); ++k) plrPartner.push_back(-1);
+        }
+        for(size_t k = 0; k < ones.size(); ++k){
+            plrOrigAt.push_back(mAt);
+            plrOrigCell.push_back(mCell);
+        }
     }
     std::cout << "[P7] pool=" << pool.size() << std::endl;
+    // fold the debank into the oracle caches before any pricing
+    if(plrOracle)
+        for(FF* w : pool) incrAccurateRecomputeFF(w);
 
     // Step 3: rtree over the debanked pool.
     namespace bgi = boost::geometry::index;
@@ -1440,7 +1495,8 @@ void Manager::postLGResynth(){
 
             Coor tgt((ci.x + cj.x) / 2.0, (ci.y + cj.y) / 2.0);
             std::vector<FF*> pair = {wi, wj};
-            double gain = banker.CostCompare(tgt, twoBitCell, pair);
+            double gain = plrOracle ? plrExactPairGain(*this, tgt, twoBitCell, pair)
+                                    : banker.CostCompare(tgt, twoBitCell, pair);
             if(gain <= margin) continue;
 
             auto e = g.addEdge(gnodes[i], gnodes[j]);
@@ -1487,7 +1543,8 @@ void Manager::postLGResynth(){
             continue;
         }
         std::vector<FF*> pair = {wi, wj};
-        double realGain = banker.CostCompare(placed, twoBitCell, pair);
+        double realGain = plrOracle ? plrExactPairGain(*this, placed, twoBitCell, pair)
+                                    : banker.CostCompare(placed, twoBitCell, pair);
         if(realGain <= margin){
             costFail++;
             claimed[p.i] = claimed[p.j] = false;
@@ -1496,8 +1553,41 @@ void Manager::postLGResynth(){
         FF* newMBFF = bankFF(placed, twoBitCell, pair);
         newMBFF->setIsLegalize(true);
         legalizer->UpdateRows(newMBFF);
+        if(plrOracle) incrAccurateRecomputeFF(newMBFF);
         committed++;
         totalGain += realGain;
+    }
+
+    // Step 8-pre (PLR_ORACLE): restore original pairs whose bits both went
+    // unmatched — the unpriced debank of leftovers is the stage's recorded
+    // net-loss channel (tc2: 176 leftover pairs ~ +11k raw vs totalGain 12.8k).
+    // Rebank each such pair onto its ORIGINAL cell near its original coor iff
+    // the exact gain vs staying two 1-bits is positive.
+    int restored = 0;
+    if(plrOracle){
+        for(size_t i = 0; i < pool.size(); ++i){
+            int j = plrPartner[i];
+            if(j < 0 || (size_t)j < i) continue;          // one visit per pair
+            if(claimed[i] || claimed[(size_t)j]) continue;
+            FF* wi = pool[i];
+            FF* wj = pool[(size_t)j];
+            if(FF_Map.count(wi->getInstanceName()) == 0 ||
+               FF_Map.count(wj->getInstanceName()) == 0) continue;
+            Cell* oc = plrOrigCell[i];
+            Coor placed = legalizer->FindPlace(plrOrigAt[i], oc);
+            if(placed.x == DBL_MAX)
+                placed = legalizer->FindNearestLegalSpace(plrOrigAt[i], oc, 4 * oc->getW());
+            if(placed.x == DBL_MAX) continue;
+            std::vector<FF*> pr = {wi, wj};
+            if(plrExactPairGain(*this, placed, oc, pr) <= 0) continue;
+            FF* back = bankFF(placed, oc, pr);
+            back->setIsLegalize(true);
+            legalizer->UpdateRows(back);
+            incrAccurateRecomputeFF(back);
+            claimed[i] = claimed[(size_t)j] = true;
+            restored++;
+        }
+        std::cout << "[P7] restored=" << restored << std::endl;
     }
 
     // Step 8: place unmatched 1-bits back into the freed rows.
@@ -1520,6 +1610,7 @@ void Manager::postLGResynth(){
         w->setNewCoor(placed);
         w->setIsLegalize(true);
         legalizer->UpdateRows(w);
+        if(plrOracle) incrAccurateRecomputeFF(w);
     }
 
     std::cout << "[P7] committed=" << committed
@@ -4434,17 +4525,48 @@ Manager::EGRUndoEntry Manager::debankWithUndo(FF* mbff){
 // into one 4-bit (mode 1) and consolidate four 1-bit FFs into one 4-bit (mode 2).
 // Historical rebanking attempts (MATCH_HIGHER_BIT, unbankRebank) cascaded because the
 // crude 1-hop model committed mispriced merges. Here every move is TRIAL-APPLIED via
+// R1 (REBANK_HR_FLOOR): min Q-side branch headroom of a logical bit, from the
+// committed oracle caches — for each gate its Q drives, distance between the
+// gate's current max arrival and the arrival contributed via this bit's arc.
+// The hc02 slack-wallet forensics showed interaction victims live in headroom-
+// poor neighborhoods; a floor keeps headroom-consuming merges out of them.
+static double rbBitHeadroom(Manager& mgr, FF* cf){
+    auto qit = mgr.incrFFQGates_.find(cf);
+    if(qit == mgr.incrFFQGates_.end() || qit->second.empty()) return 1e30;
+    FF* ph = cf->getPhysicalFF();
+    Coor cq = ph->getNewCoor() + ph->getPinCoor("Q" + cf->getPhysicalPinName());
+    double qpd = ph->getCell()->getQpinDelay();
+    double hmin = 1e30;
+    for(Gate* g : qit->second){
+        auto git = mgr.incrGateCur_.find(g);
+        auto fit = mgr.incrFanin_.find(g);
+        if(git == mgr.incrGateCur_.end() || fit == mgr.incrFanin_.end()) continue;
+        for(auto& f : fit->second){
+            if(f.kind != 1 || f.cf != cf) continue;
+            double via = qpd + mgr.DisplacementDelay * HPWL(cq, f.pin);
+            double h = git->second - via;
+            if(h < hmin) hmin = h;
+        }
+    }
+    return hmin;
+}
+
 // bankFF_deferred (FF_Map untouched until finalize), priced exactly — dTNS by the
 // incremental-STA oracle, dPower/dArea from the lib, dViolations by BinDensityTable —
 // and committed only if alpha*dTNS + beta*dP + gamma*dA + lambda*dViol < 0, strictly
 // monotone, else rolled back exactly. FindPlace failure = reject (never overlap).
 // Gate: ORACLE_REBANK=1 (requires INCR_RELOC=1). Default off, byte-exact.
+// R1 extension: REBANK_MODES bit 4 = 2b+1b+1b->4b, bit 8 = 1b+1b->2b (both
+// default OFF: MODES default 3 keeps shipped behavior byte-exact). Optional
+// REBANK_HR_FLOOR (default 0 = off) rejects candidates whose bits' minimum
+// branch headroom is below the floor (four-rulings item 4 requirement).
 void Manager::oracleRebankRefine(){
     double timeBudget = []{ const char* e=std::getenv("REBANK_TIME");   return e?std::atof(e):120.0; }();
     int    K          = []{ const char* e=std::getenv("REBANK_K");      return e?std::atoi(e):8;     }();
     int    maxRounds  = []{ const char* e=std::getenv("REBANK_ROUNDS"); return e?std::atoi(e):10;    }();
     int    modes      = []{ const char* e=std::getenv("REBANK_MODES");  return e?std::atoi(e):3;     }();
     double margin     = []{ const char* e=std::getenv("REBANK_MARGIN"); return e?std::atof(e):0.0;   }();
+    double hrFloor    = []{ const char* e=std::getenv("REBANK_HR_FLOOR"); return e?std::atof(e):0.0; }();
     bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
     if(!incr){ std::cerr << "[REBANK] skipped (needs INCR_RELOC=1)\n"; return; }
     // REBANK_PROXY=1: controlled counterfactual for the paper — identical operator,
@@ -4468,6 +4590,7 @@ void Manager::oracleRebankRefine(){
         return it->second[0];      // sorted by libScoring score
     };
     Cell* best4 = bestCellOf(4);
+    Cell* best2 = bestCellOf(2);
     auto wcost = [&](Cell* c){ return beta*c->getGatePower() + gamma*c->getArea(); };
 
     long accTotal=0, triedTotal=0;
@@ -4591,6 +4714,40 @@ void Manager::oracleRebankRefine(){
                 if(qn==3) cands.push_back({0.0, 2, (int)i, q[0], q[1], q[2]});
             }
         }
+        // R1 mode 4: mixed 2b + 1b + 1b -> 4b. For each 2-bit MBFF, its two
+        // nearest same-clk singles.
+        if((modes&4) && best4 && !src2.empty() && src1.size()>=2){
+            std::unordered_map<int, CSRTree> trees1;
+            for(size_t i=0;i<src1.size();i++){ Coor c=src1[i]->getNewCoor(); trees1[src1[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
+            for(size_t i=0;i<src2.size();i++){
+                FF* A=src2[i]; Coor pA=A->getNewCoor();
+                auto tit = trees1.find(A->getClkIdx());
+                if(tit==trees1.end()) continue;
+                std::vector<CSPointID> nr; tit->second.query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+2), std::back_inserter(nr));
+                std::sort(nr.begin(), nr.end(), [&](const CSPointID&a, const CSPointID&b){
+                    double da=std::abs(a.first.get<0>()-pA.x)+std::abs(a.first.get<1>()-pA.y);
+                    double db=std::abs(b.first.get<0>()-pA.x)+std::abs(b.first.get<1>()-pA.y);
+                    if(da!=db) return da<db; return a.second<b.second; });
+                int q[2]; int qn=0;
+                for(auto& nb : nr){ int j=nb.second; q[qn++]=j; if(qn==2) break; }
+                if(qn==2) cands.push_back({0.0, 4, (int)i, q[0], q[1], -1});
+            }
+        }
+        // R1 mode 8: 1b + 1b -> 2b. Each single with its nearest same-clk single.
+        if((modes&8) && best2 && src1.size()>=2){
+            std::unordered_map<int, CSRTree> trees1;
+            for(size_t i=0;i<src1.size();i++){ Coor c=src1[i]->getNewCoor(); trees1[src1[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
+            std::vector<std::pair<int,int>> pairs1;
+            for(size_t i=0;i<src1.size();i++){
+                FF* A=src1[i]; Coor pA=A->getNewCoor();
+                std::vector<CSPointID> nr; trees1[A->getClkIdx()].query(bgi_cs::nearest(CSPoint(pA.x,pA.y),K+1), std::back_inserter(nr));
+                for(auto& nb : nr){ int j=nb.second; if(j==(int)i) continue;
+                    pairs1.push_back({std::min((int)i,j), std::max((int)i,j)}); }
+            }
+            std::sort(pairs1.begin(), pairs1.end());
+            pairs1.erase(std::unique(pairs1.begin(), pairs1.end()), pairs1.end());
+            for(auto& pr : pairs1) cands.push_back({0.0, 8, pr.first, pr.second, -1, -1});
+        }
 
         // ---- parallel screening: side-effect-free full-cost estimate per candidate ----
         // (oracle caches, binTable and positions are read-only here => thread-safe;
@@ -4599,17 +4756,25 @@ void Manager::oracleRebankRefine(){
         #pragma omp parallel for schedule(dynamic,32)
         for(int ci=0; ci<M; ci++){
             RbCand& c=cands[ci];
+            Cell* tgt = (c.mode==8) ? best2 : best4;
             std::vector<FF*> group; std::vector<FF*> gbits;
-            double cx=0, cy=0, dPA=wcost(best4);
+            double cx=0, cy=0, dPA=wcost(tgt);
             auto add=[&](FF* f){ group.push_back(f); Coor p=f->getNewCoor(); cx+=p.x; cy+=p.y;
                                  dPA-=wcost(f->getCell());
                                  for(FF* cf : f->getClusterFF()) gbits.push_back(cf); };
             if(c.mode==1){ add(src2[c.a]); add(src2[c.b]); }
-            else { add(src1[c.a]); add(src1[c.b]); add(src1[c.c]); add(src1[c.d]); }
+            else if(c.mode==2){ add(src1[c.a]); add(src1[c.b]); add(src1[c.c]); add(src1[c.d]); }
+            else if(c.mode==4){ add(src2[c.a]); add(src1[c.b]); add(src1[c.c]); }
+            else { add(src1[c.a]); add(src1[c.b]); }
             if(dPA>=0){ c.est=1e18; continue; }
+            if(hrFloor > 0){
+                bool poor=false;
+                for(FF* cf : gbits) if(rbBitHeadroom(*this, cf) < hrFloor){ poor=true; break; }
+                if(poor){ c.est=1e18; continue; }
+            }
             Coor cen(cx/group.size(), cy/group.size());
-            int dv = binTable.estimateViolationDelta(group, cen, best4);
-            double dt = evalGroupMoveDelta(gbits, cen, best4);
+            int dv = binTable.estimateViolationDelta(group, cen, tgt);
+            double dt = evalGroupMoveDelta(gbits, cen, tgt);
             c.est = alpha*dt + dPA + lambda*dv;
         }
 
@@ -4632,10 +4797,18 @@ void Manager::oracleRebankRefine(){
                 if(used2[c.a]||used2[c.b]) continue;
                 std::vector<FF*> group = {src2[c.a], src2[c.b]};
                 if((ok=tryMerge(group, best4))){ used2[c.a]=1; used2[c.b]=1; accepted++; }
-            } else {
+            } else if(c.mode==2){
                 if(used1[c.a]||used1[c.b]||used1[c.c]||used1[c.d]) continue;
                 std::vector<FF*> group = {src1[c.a], src1[c.b], src1[c.c], src1[c.d]};
                 if((ok=tryMerge(group, best4))){ used1[c.a]=1; used1[c.b]=1; used1[c.c]=1; used1[c.d]=1; accepted++; }
+            } else if(c.mode==4){
+                if(used2[c.a]||used1[c.b]||used1[c.c]) continue;
+                std::vector<FF*> group = {src2[c.a], src1[c.b], src1[c.c]};
+                if((ok=tryMerge(group, best4))){ used2[c.a]=1; used1[c.b]=1; used1[c.c]=1; accepted++; }
+            } else {
+                if(used1[c.a]||used1[c.b]) continue;
+                std::vector<FF*> group = {src1[c.a], src1[c.b]};
+                if((ok=tryMerge(group, best2))){ used1[c.a]=1; used1[c.b]=1; accepted++; }
             }
             if(ok) dryRun=0; else dryRun++;
         }
