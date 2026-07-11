@@ -89,6 +89,26 @@
   R1 先行探明各案 4b 兌現率,R3 依結果決定投入(hc01/hc02 訊號最強)。
 - **排程**: P1d 新基線後,與 2b LNS 並行評估(同為 Phase 2 大票)。
 
+## 2g 前置 sizing(server B,tc2 base 態實測,2026-07-11)
+
+headroom 探測(scratch `refsta/headroom_probe.py`;每個 FF Q pin 對其全部 fanout 弧取
+min(該分支到所屬 gate max 的距離);直連 D 弧取 max(0, slack);OUT1-only 與 tie-cell
+未計時 launch 均按 evaluator 語義處理;21,164 Q pins、132,293 gates 全覆蓋):
+
+| 門檻(TNS 單位) | FF Q pins | 佔比 | 等效自由距離 |
+|---|---|---|---|
+| ≥ 0.5 | 11,483 | 54.3% | 5,000 units |
+| ≥ 2.0 | 10,438 | 49.3% | 20,000 units |
+| ≥ 10.0 | **8,843** | **41.8%** | **100,000 units(~4% 晶片寬)** |
+
+分佈:p50 = 1.73、p75 = 44.4、p90 = 84.8;p25 = 0(四分之一的 FF 在臨界分支上,動不得)。
+
+**解讀**:tc2 有四成 FF 的 Q 側弧可以「免費」長 10 萬單位——2g(用 headroom 換 power
+的合併)與 R1(4-bit rebank 挑群)共用同一個候選過濾器:`Q 側 headroom 大 + 自身 D
+slack 正`。tc2/hc02 同網表,此表直接適用 hc02(權重不同、佈局會不同,落地後重測)。
+注意本表是 LOCAL 下界(沒把「越過 max 之後吃 endpoint slack」的第二層預算算進去),
+實際可行域只會更大。per-FF 明細:server B `~/scratch/refsta/tc2_headroom.tsv`。
+
 ## 永久死亡確認(反組譯釘棺,不再翻案)
 
 - Steiner/RSMT、net-HPWL:evaluator 逐指令確認為兩點 HPWL(int 曼哈頓 × f32 dd)。
