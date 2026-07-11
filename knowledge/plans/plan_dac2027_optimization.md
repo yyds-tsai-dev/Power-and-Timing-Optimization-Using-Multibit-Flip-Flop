@@ -44,8 +44,8 @@
 
 1. [x] P1a EVAL_ANCHOR(commit 30eef42;byte-exact off 驗證)
 2. [~] P1b 三規則修復(tie-cell 解凍 / 不可達踢除 / OUT1-only)——workflow 執行中;驗收 = base 態 accurateTNS ≈ 7,850.49(float32 容差 0.01)+ byte-exact off + tc2 全配置分數
-3. [~] P1c 七案 EVAL_ANCHOR sweep(anchor-only 版;hc04 收尾中)
-4. [ ] P1d 新基線儀式:P1b 過關後 7 案 × 3 重跑(EVAL_ANCHOR+語義修復併入 unified config v2)→ 更新 README/bundle/knowledge;確定性重驗;舊 config 為回退分支
+3. [x] P1c 七案 sweep 完成:**composite 0.9518 → 0.9500**(表:reports/2026-07-11_p1_sweep_results.md;tc2 −0.80%、hc02 −0.61%;6 勝 1 微負過 gate)
+4. [~] P1d 新基線儀式(repeat#2/3 跑動中):P1b 過關後 7 案 × 3 重跑(EVAL_ANCHOR+語義修復併入 unified config v2)→ 更新 README/bundle/knowledge;確定性重驗;舊 config 為回退分支
 - **tc1 期待值(新情報)**:tc1 有 1,530 顆零輸入 gate(tc2 的 11 倍)——tie-cell 修復對我們最弱的 TNS 案可能是大額紅利
 - 已知限制(記錄、不行動):evaluator 為 float32、我們 double,邊際噪音 ~1e-8 相對,不做模擬
 
