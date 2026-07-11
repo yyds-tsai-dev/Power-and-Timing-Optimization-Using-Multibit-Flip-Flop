@@ -4822,6 +4822,163 @@ void Manager::oracleRebankRefine(){
     }
     std::cerr << "[REBANK] total accepted=" << accTotal << " tried=" << triedTotal
               << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << elapsed() << "s\n";
+
+    // ==================== LNS kick (plan_lns_destroy_repair.md, v1) ====================
+    // v1 transaction = whole-FF regional rebundle: free a TNS-hotspot region,
+    // greedily re-merge its member FFs (bit-sum 4 -> best4, bit-sum 2 -> best2)
+    // with relocation freedom inside the freed space, price the BUNDLE via the
+    // committed oracle (fold per deferred bank, LIFO-rollback on reject), keep
+    // only on strict net improvement. Bit-splitting destroy (debankWithUndo
+    // composition) is v1.5 — see the plan. Default off; byte-exact when off.
+    const bool lnsKick = []{ const char* e=std::getenv("LNS_KICK"); return e && std::atoi(e)!=0; }();
+    if(!lnsKick) return;
+    double lnsTime   = []{ const char* e=std::getenv("LNS_TIME");     return e?std::atof(e):120.0; }();
+    int    regionK   = []{ const char* e=std::getenv("LNS_REGION_K"); return e?std::atoi(e):10;    }();
+    int    lnsRounds = []{ const char* e=std::getenv("LNS_ROUNDS");   return e?std::atoi(e):4;     }();
+    long   lnsPat    = []{ const char* e=std::getenv("LNS_PATIENCE"); return e?std::atol(e):50L;   }();
+    double lnsMargin = []{ const char* e=std::getenv("LNS_MARGIN");   return e?std::atof(e):0.0;   }();
+    auto l0 = std::chrono::high_resolution_clock::now();
+    auto lElapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-l0).count(); };
+    long lnsRegions=0, lnsAccepted=0;
+
+    for(int lr=0; lr<lnsRounds && lElapsed()<lnsTime; lr++){
+        // seeds: physical FFs carrying committed negative slack, worst first
+        std::unordered_map<FF*, double> physBad;
+        for(auto& kv : incrFFNeg_){
+            if(kv.second <= 0) continue;
+            FF* ph = kv.first->getPhysicalFF();
+            if(ph && !ph->getFixed()) physBad[ph] += kv.second;
+        }
+        std::vector<std::pair<double,FF*>> seeds;
+        seeds.reserve(physBad.size());
+        for(auto& kv : physBad) seeds.push_back({kv.second, kv.first});
+        std::sort(seeds.begin(), seeds.end(), [](const std::pair<double,FF*>& a, const std::pair<double,FF*>& b){
+            if(a.first!=b.first) return a.first>b.first;
+            return a.second->getInstanceName() < b.second->getInstanceName(); });
+
+        std::vector<FF*> all;
+        for(auto& kv : FF_Map){ FF* f=kv.second; if(f && !f->getFixed()) all.push_back(f); }
+        std::sort(all.begin(), all.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+        std::unordered_map<int, CSRTree> trees;
+        for(size_t i=0;i<all.size();i++){ Coor c=all[i]->getNewCoor(); trees[all[i]->getClkIdx()].insert({CSPoint(c.x,c.y),(int)i}); }
+
+        std::unordered_set<FF*> consumed;   // pointer-value checks only (may hold recycled ptrs)
+        long dry=0, roundAcc=0;
+        for(auto& sd : seeds){
+            if(lElapsed()>lnsTime || (lnsPat>0 && dry>=lnsPat)) break;
+            FF* seed = sd.second;
+            if(consumed.count(seed)) continue;
+            lnsRegions++;
+            // gather region: nearest same-clk movable FFs around the seed
+            Coor sp = seed->getNewCoor();
+            std::vector<CSPointID> nr;
+            trees[seed->getClkIdx()].query(bgi_cs::nearest(CSPoint(sp.x,sp.y), regionK*2), std::back_inserter(nr));
+            std::sort(nr.begin(), nr.end(), [&](const CSPointID&a, const CSPointID&b){
+                double da=std::abs(a.first.get<0>()-sp.x)+std::abs(a.first.get<1>()-sp.y);
+                double db=std::abs(b.first.get<0>()-sp.x)+std::abs(b.first.get<1>()-sp.y);
+                if(da!=db) return da<db; return a.second<b.second; });
+            std::vector<FF*> members;
+            for(auto& q : nr){
+                FF* f = all[q.second];
+                if(consumed.count(f)) continue;
+                members.push_back(f);
+                if((int)members.size()>=regionK) break;
+            }
+            if((int)members.size()<2){ dry++; continue; }
+            // HR floor (four-rulings): keep headroom-poor neighborhoods out
+            if(hrFloor > 0){
+                bool poor=false;
+                for(FF* m : members){ for(FF* cf : m->getClusterFF())
+                    if(rbBitHeadroom(*this, cf) < hrFloor){ poor=true; break; } if(poor) break; }
+                if(poor){ dry++; continue; }
+            }
+            // ---- probe: free the whole region ----
+            std::vector<BinDensityTable::Rect> oldRects;
+            for(FF* m : members){
+                Coor p=m->getNewCoor();
+                legalizer->FreeRect(p, m->getCell()->getW(), m->getCell()->getH());
+                legalizer->RemoveNodeByFFPtr(m);
+            }
+            // ---- plan: greedy bit-sum grouping (4 then 2), nearest-first ----
+            std::vector<char> inGroup(members.size(), 0);
+            struct LnsGroup { std::vector<int> idx; Cell* tgt; Coor place; BankUndo undo; FF* nf; int dv; };
+            std::vector<LnsGroup> groups;
+            double dPA = 0; int dvSum = 0; bool planOk = true;
+            auto tryForm = [&](int bitsWanted, Cell* tgt)->void{
+                if(!tgt) return;
+                for(size_t i=0;i<members.size() && planOk;i++){
+                    if(inGroup[i]) continue;
+                    int need = bitsWanted - members[i]->getCell()->getBits();
+                    if(need < 0) continue;
+                    std::vector<int> pick = {(int)i};
+                    for(size_t j=i+1;j<members.size() && need>0;j++){
+                        if(inGroup[j]) continue;
+                        int b = members[j]->getCell()->getBits();
+                        if(b<=need){ pick.push_back((int)j); need-=b; }
+                    }
+                    if(need!=0 || pick.size()<2) continue;
+                    double cx=0, cy=0, pa=wcost(tgt);
+                    std::vector<FF*> grp;
+                    for(int gi : pick){ FF* f=members[gi]; grp.push_back(f);
+                        Coor p=f->getNewCoor(); cx+=p.x; cy+=p.y; pa-=wcost(f->getCell()); }
+                    if(pa >= 0) continue;                       // no structural saving
+                    Coor place = legalizer->FindPlace(Coor(cx/grp.size(), cy/grp.size()), tgt);
+                    if(place.x==DBL_MAX) continue;              // couldn't place: leave ungrouped
+                    int dv = binTable.estimateViolationDelta(grp, place, tgt);
+                    LnsGroup g; g.idx=pick; g.tgt=tgt; g.place=place; g.dv=dv;
+                    g.nf = bankFF_deferred(place, tgt, grp, g.undo);
+                    legalizer->UpdateRows(g.nf);                // occupy: later FindPlace must see it
+                    for(int gi : pick) inGroup[gi]=1;
+                    dPA += pa; dvSum += dv;
+                    groups.push_back(std::move(g));
+                }
+            };
+            Cell* best2L = bestCellOf(2);
+            tryForm(4, best4);
+            tryForm(2, best2L);
+            if(groups.empty()){
+                for(FF* m : members) legalizer->UpdateRows(m);  // restore region
+                dry++; continue;
+            }
+            // ---- price the bundle on the folded oracle ----
+            double newTNS = curTNS;
+            for(auto& g : groups) newTNS = incrAccurateRecomputeFF(g.nf);
+            double delta = alpha*(newTNS - curTNS) + dPA + lambda*dvSum;
+            if(delta < -lnsMargin){
+                // commit LIFO-safe: finalize all, occupy rows already done
+                std::vector<BinDensityTable::Rect> newRects;
+                for(auto& g : groups){
+                    for(int gi : g.idx){ FF* m=members[gi]; Coor p=m->getNewCoor();
+                        oldRects.push_back({p.x, p.y, (double)m->getCell()->getW(), (double)m->getCell()->getH()}); }
+                    newRects.push_back({g.place.x, g.place.y, (double)g.tgt->getW(), (double)g.tgt->getH()});
+                    for(int gi : g.idx) consumed.insert(members[gi]);
+                    commitFinalizeBank(g.undo);
+                    g.nf->setIsLegalize(true);
+                }
+                binTable.applyMutation(oldRects, newRects);
+                for(size_t i=0;i<members.size();i++)            // ungrouped members return as-is
+                    if(!inGroup[i]) legalizer->UpdateRows(members[i]);
+                curTNS = newTNS;
+                roundAcc++; lnsAccepted++; dry=0;
+            } else {
+                // reject: LIFO rollback — de-occupy nf, rollback bank, restore members
+                for(auto it2 = groups.rbegin(); it2 != groups.rend(); ++it2){
+                    legalizer->FreeRect(it2->place, it2->tgt->getW(), it2->tgt->getH());
+                    legalizer->RemoveNodeByFFPtr(it2->nf);
+                    rollbackBank(it2->undo);
+                }
+                for(FF* m : members){ incrAccurateRecomputeFF(m); legalizer->UpdateRows(m); }
+                incrTNS_ = curTNS;                              // pin (determinism)
+                dry++;
+            }
+        }
+        std::cerr << "[LNS] round=" << lr << " accepted=" << roundAcc
+                  << " regions=" << lnsRegions << " TNS=" << std::fixed << curTNS
+                  << " elapsed=" << lElapsed() << "s\n";
+        if(roundAcc==0) break;
+    }
+    std::cerr << "[LNS] total accepted=" << lnsAccepted << " regions=" << lnsRegions
+              << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << lElapsed() << "s\n";
 }
 
 // Oracle-maintained official-cost snapshot (for EVAL_CHECKPOINT): alpha*incrTNS_

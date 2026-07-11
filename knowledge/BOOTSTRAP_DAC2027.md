@@ -1,50 +1,79 @@
 # BOOTSTRAP — DAC 2027 極限優化(給接手的 Claude session)
 
-**你是誰、在做什麼**:接續 DAC 2027 優化戰役(score + runtime 雙軸)。主計畫:`knowledge/plans/plan_dac2027_optimization.md`(先讀它,再讀本檔的「當前狀態」)。使用者授權「照計畫走」。
+**你是誰、在做什麼**:接續 DAC 2027 優化戰役(score + runtime 雙軸)。
+主計畫:`knowledge/plans/plan_dac2027_optimization.md`。使用者授權「照計畫走」。
+**雙機分工(2026-07-12 現行)**:server A 擁有 Manager.cpp 主幹(conv-term/
+ParamMgr/oracle 家族);server B(NVL4 msedalab)擁有翻案實驗/分析 + 圍欄內實作
+(oracleRebankRefine、postLGResynth、DetailPlacement)。圍欄協議見 four_rulings。
 
-## 讀取順序
+## 讀取順序(2026-07-12 刷新)
 
-1. `knowledge/plans/plan_dac2027_optimization.md` — 作戰計畫(Phase 0 已完成,Phase 1 進行中)
-2. `knowledge/reports/2026-07-11_evaluator_semantics_blackbox.md` — **evaluator 語義已被完整解碼**(16 實驗零誤差),這是全案地基
-3. `knowledge/reports/2026-07-11_dac_phase0_analysis.md` — Phase 0 分析(時間解剖/預算探測/profiling)
-4. `knowledge/memory/MEMORY.md` — 專案長期記憶索引(42 個記憶檔在同目錄,按需讀)
+1. `knowledge/reports/2026-07-12_revival_finale.md` — **當前狀態總表**(墳場 8/8
+   終審、v3 頭牌配置、四實作驗收、待辦交接清單)
+2. `knowledge/reports/2026-07-12_four_rulings.md` — 現行裁決(單軸疊加規則、
+   分工圍欄、conv-term 綁定與 24h 解綁閘)
+3. `knowledge/plans/plan_lns_destroy_repair.md` — LNS 施工圖(implementation-ready)
+4. `knowledge/reports/2026-07-11_evaluator_disassembly_semantics.md` +
+   `2026-07-11_refsta_perff_diff.md` — evaluator 語義權威紀錄(反組譯+黑盒雙證)
+5. `knowledge/memory/MEMORY.md` — 長期記憶索引(42+ 記憶檔同目錄,按需讀)
 
-## 當前狀態(2026-07-11,server A)
+## 當前狀態(2026-07-12,server B session 收官)
 
-- **P1a 已 commit**(30eef42 + 後續診斷 commit):`EVAL_ANCHOR=1` 讓 oracle 家族錨定 parse 真值(Preprocess 的 1-hop 重錨誤差被繞開)。byte-exact off 已驗證。**tc2 全配置 723,165 → 720,451(−0.375%)**
-- **殘差 404 TNS(base 態、靜態)**:已排除 fallback 覆蓋(n=0)與 per-path 語義(爆到 107k);黑盒解碼證實 evaluator = max-max STA = 我們的模型形狀 → 殘差是**實作偏差**,server A 上有 refsta workflow(離線 Python 參考 STA,逐位重現 evaluator 再 per-FF diff)在跑——**結果報告若不在 knowledge/reports/,表示還沒完成,先重建 refsta**(spec 在計畫與本檔末尾)
-- **6 案 EVAL_ANCHOR sweep** 在 server A 跑動中——結果同上處理
-- 下一步佇列:refsta 修完殘差 → 7 案 gate → Phase 2f 墳場翻案(計畫裡有清單)→ Phase 3 runtime(de-hashing/early-exit,profiling 證據在 phase0 報告)
+- **定價器 evaluator-exact 已達成**:P1a 錨(30eef42)+ P1b 三規則(968c2b3)+
+  Rule 1bis(e7df424)。四案 base 殘差 = f32 噪音級(tc1 −3.78、hc01 −0.09、
+  tc2/hc02 ±0.009),雙機雙軌跡驗證。
+- **unified v2** = v1 + `EVAL_ANCHOR=1`(composite 0.9518→0.9500,A 的 P1c 七案表)。
+- **v3 候選配方已定**:v2 + 單軸疊加規則——`tns_share ≥ 0.05` 時
+  `COSTCOMPARE_DOWNSTREAM=1 DP_SLOT_INTRA_ONLY=0 DP_SLOT_ORACLE=1` 全開。
+  實測 tc2 −4.23% / hc02 −4.29%(七案矩陣見 finale §3),**composite 預估 ~0.941**。
+  θ 窗口 (4.13%, 14.55%)(`2026-07-12_tns_share_axis.md`)。ParamMgr 收口歸 A,
+  與 conv-term 同批;**24h 解綁閘 2026-07-13**(未全綠則 v3-knobs 先行)。
+- **3b 執行緒結論**:分數對執行緒數/環境負載雙重不變(不撞牆案逐位驗證);
+  撞牆案 T64 = 分數更好且 wall 1/3(tc3 −81k、hc04 −200k)。conv-term 後
+  執行緒 = 純速度參數。runtime 現況 T64 全套 ~1h10m;+conv-term+de-hashing
+  (A,設計圖就緒)預估 ~30-40 分。
+- **實作齊備**(全部 default-off byte-exact,cmp 驗證):R2c'
+  `DP_SLOT_ORACLE`(七案 gate 全過)、R1 `REBANK_MODES` 4/8 + `REBANK_HR_FLOOR`、
+  PLR `PLR_ORACLE`(判決:設計死,存檔為 LNS 負對照)、LNS v1 `LNS_KICK`
+  (冒煙結果補記於 finale §4)。
+- **DAC 素材線**:audit→根因→修復→跨機重現;墳場 8/8 終審;斷崖=定價 artifact;
+  slack-wallet double-spend(已定名)+ oracle gate 根治;單軸 adaptive(θ 窗口
+  robustness);Pareto 曲線(待 conv-term)。
 
 ## 環境開機
 
 ```bash
-git clone <this repo> && cd 2024-ICCAD-Problem-B && git checkout v3_experimental
-make boost && make release        # g++≥9;LEMON vendored;OR-Tools 不需要
-# 標準跑法(unified config)見 README.md;EVAL_ANCHOR=1 疊加即為 P1a 配置
+git clone git@github.com:Coffeeturtle7/2024-ICCAD-Problem-B.git && git checkout v3_experimental
+# boost:jfrog 已死 → https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz
+#        header-only 即可(不用 b2);g++12 需 Legalizer.h 的 <list>(已 commit)
+make release -j24 CXXFLAGS="-I ./inc -I ./lib -I ./boost_1_84_0 -std=c++14 -fopenmp -pipe" WARNINGS="-g -Wall"
+# 標準跑法見 README;EVAL_ANCHOR=1 = v2;v3 候選 env 見上
 ```
 
-## 環境陷阱(server A 的血淚,新環境自行對應)
+## 環境陷阱(雙機血淚合集)
 
-- **長跑一律把 binary cp 到暫存目錄再跑**(rebuild 換 inode 會弄死跑到一半的 run)
-- 背景 shell cwd 會重置——腳本第一行永遠明確 `cd`
-- 測資在 repo `testcase/`(53 檔含全部 7 contest 案);server A 的專案根另有分居目錄,repo 內不受影響
-- gprof+OpenMP 出不了 gmon.out——profiling 用 gdb 取樣法(`gdb -p PID -batch -ex "thread apply all bt 4"` 每 3s)
-- 評分永遠跑 `evaluator/preliminary-evaluator` 本尊 + 兩個 checker;`BANKING_MODE=matching PRODUCTION=1` 必掛
-- 數字凍結紀律:任何文字改動用 numeric-token 多重集前後比對自驗
+- 長跑一律 cp binary 到暫存目錄再跑(rebuild 換 inode 殺 run)
+- 背景 shell cwd 會重置——腳本第一行明確 `cd`,一切絕對路徑
+- server B:`/`(含 /tmp)100% 滿 → 全走 NAS `~/scratch/`;gcc `-pipe`+`TMPDIR`
+- 共用機 benchmark 紀律:每輪記 loadavg;撞牆案(tc3/hc04/hc02-r1)A/B
+  必成對同窗口;不撞牆案分數決定性,窗口無關
+- `grep -c` 零匹配 exit 1 會斷 `&&` 鏈;tcsh 登入殼(script 用 bash)
+- 評分永遠 evaluator 本尊 + 兩 checker;`BANKING_MODE=matching PRODUCTION=1` 必掛
+- **邏輯 vs 物理 FF**:oracle API(evalRemapDelta 等)吃邏輯 bits(clusterFF
+  元素);pool/FF_Map 是物理——混用 = segv(R2c' 首版血淚)
+- 數字凍結紀律:文字改動用 numeric-token 多重集前後比對自驗
 
-## refsta 規格(若需重建)
+## 下一步佇列(接力點,細節在 finale §6)
 
-離線參考 STA(Python):讀 input+.out,照黑盒解碼語義(max-max、兩點 HPWL、gate 零延遲、Qpd 進 max、parse 錨)算完整分數,**必須逐位重現 evaluator Final score**;然後 per-logical-bit slack 與 C++ `computeAccurateTNS`(EVAL_ANCHOR=1)對比,分類發散 bit 的結構 → 找出實作偏差。C++ 側已有 EVAL_DIAG 鉤子(src/Manager.cpp,computeAccurateTNS 內)。
+1. LNS 冒煙判讀 → 參數掃 → 七案 gate(施工圖 §5/§8;v1.5 bit 拆分規格 §2)
+2. R1 modes 4/8 於 1b 豐富案 gate
+3. v3 儀式:等 A conv-term → 雙機各 3× 互驗
+4. 2g 實作(A 規格含 headroom floor;過濾器與 R1 共用 `rbBitHeadroom`)
+5. Phase 4:ICCAD'25 移植(先問使用者 2025 測資位置)、DAC 稿
 
-## Phase 2f 墳場翻案的上下文(計畫裡的 R1–R3)
+## 與 server A/B 的同步協議
 
-翻案所需的歷史全在包內:
-- **postmortem 摘要**:`knowledge/memory/` 裡的 project_match_higher_bit、project_dp_slot_assign、project_tc2_exhaustive_analysis、project_unbank_rebank、project_approach_c_deadend、project_stage3_lp_deadend、project_egr_implemented(每份含當年數據與死因)
-- **詳細報告**:`knowledge/graveyard/`——tc2 十四連敗的完整研究(2026-04-26)、tc2 驗證診斷(2026-06-14)、深度機會研究(2026-05-03)、Approach C 原計畫、phase 逐日誌
-- **env gates 全在程式碼**:MATCH_HIGHER_BIT、DP_SLOT_ASSIGN(+INTRA_ONLY)、ALG2_LP_BANK、POST_LG_DECLUSTER、EGR——翻案=舊 gate + `EVAL_ANCHOR=1` 重測,不用重寫
-- **鐵律**:翻案前先確認 refsta 殘差已修(滿血定價)+ 逐案跑 7 案 gate;Steiner/net-HPWL 永久死亡(語義解碼釘棺),別碰
-
-## 與 server A 的同步協議
-
-server A 的新結果會以「更新 knowledge/ + push」的形式送上來;開工前先 `git pull`。你產出的報告也寫進 `knowledge/reports/` 並 commit push(私有 repo,可放心)。
+新結果以「更新 knowledge/ + push」送出;開工前先 `git pull`。報告寫進
+`knowledge/reports/` 並 commit push(私有 repo)。墳場歷史上下文
+(memory postmortem + graveyard/ 詳報)完整在包內,翻案類工作先讀
+`plan_phase2f_graveyard_revival.md` 與 finale。
