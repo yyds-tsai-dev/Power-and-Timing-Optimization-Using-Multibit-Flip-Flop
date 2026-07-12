@@ -4028,9 +4028,67 @@ void Manager::bitRepairRefine(){
     // rescan folds dyna1's exhaustive-rescan advantage into the incremental engine,
     // removing the per-case dyna1-vs-dyna2 choice. 0 = off (byte-exact).
     int rescanEvery = []{ const char* e=std::getenv("BIT_REPAIR_RESCAN"); return e?std::atoi(e):0; }();
+    // ============ Convergence-termination scheduler (CONV_TERM / CONV_RATE) ============
+    // CONV_TERM=1 (default off, byte-exact): BIT_REPAIR_TIME stops being the SCHEDULER.
+    // Rounds run until a FULL pass commits no improving move (natural fixpoint) or the
+    // CONV_RATE rule fires. The time budget is demoted to a safety FUSE at 3x its value
+    // (unified config 1200s -> fuse 3600s; the 2026-07-11 budget probe shows the capped
+    // cases converge by ~3080s, so a healthy run never hits the fuse — if it does we log
+    // '[CONV] done exit=fuse'). Design choice: 3x-fuse (not verbatim) because honoring
+    // 1200s verbatim would still truncate tc3/hc04 below their fixpoints, i.e. the wall
+    // clock would remain a scoring parameter — exactly what CONV_TERM exists to kill.
+    // BIT_REPAIR_ROUNDS, when unset, is lifted (fixpoint governs); an explicit value is
+    // honored as a deliberate override. Under dyna2 the fixpoint is only declared after
+    // a FULL rescan pass (dirty propagation is conservative-but-not-complete): a quiet
+    // incremental pass forces one full rescan before termination.
+    // CONV_RATE=<eps> (needs CONV_TERM=1): rate-based early exit — when the summed TNS
+    // improvement over the last max(1,BIT_REPAIR_RESCAN) rounds (window always spans a
+    // full rescan block) satisfies alpha*windowImp < eps*costScale, exit the loop; the
+    // remaining tail is self-healed downstream (budget probe: hc02 tail = +-0 at 3x time).
+    // costScale ~ |total cost| = alpha*TNS + beta*Power + gamma*Area (bin term omitted;
+    // it is a scale reference, not a score). Unset CONV_RATE => pure fixpoint.
+    bool   convTerm = std::getenv("CONV_TERM") && std::atoi(std::getenv("CONV_TERM"));
+    double convRate = []{ const char* e=std::getenv("CONV_RATE"); return e?std::atof(e):0.0; }();
+    int    convWinN = std::max(1, rescanEvery);
+    std::vector<double> convHist;      // per-round TNS improvements (rate window)
+    double costScale   = 0.0;
+    double convPrevTNS = baseAcc;
+    const char* convExit = nullptr;
+    bool forceFull = false;            // dyna2: force a full rescan to verify a fixpoint
+    if(convTerm){
+        timeBudget *= 3.0;             // demoted: safety fuse only
+        if(!std::getenv("BIT_REPAIR_ROUNDS")) maxRounds = 1<<30;
+        if(convRate > 0){
+            double pw=0, ar=0;
+            for(auto& kv : FF_Map){ pw += kv.second->getCell()->getGatePower(); ar += kv.second->getCell()->getArea(); }
+            costScale = alpha*baseAcc + beta*pw + gamma*ar;
+        }
+        std::cerr << "[CONV] on fuse=" << std::fixed << timeBudget << "s rate=" << std::scientific << convRate
+                  << std::fixed << " win=" << convWinN << " costScale=" << costScale << "\n";
+    }
+    // Per-round bookkeeping. Returns 0=continue, 1=stop(fixpoint), 2=stop(rate).
+    // fixEligible: only a FULL pass may declare the fixpoint.
+    auto convRound = [&](int round, long moves, bool fixEligible)->int{
+        double imp = convPrevTNS - incrTNS_; convPrevTNS = incrTNS_;
+        int rc = 0; const char* ex = "-";
+        if(moves==0 && fixEligible){ ex="fixpoint"; rc=1; }
+        else if(convRate>0){
+            convHist.push_back(imp);
+            if((int)convHist.size() >= convWinN){
+                double w=0; for(int k=0;k<convWinN;k++) w += convHist[convHist.size()-1-k];
+                if(alpha*w < convRate*costScale){ ex="rate"; rc=2; }
+            }
+        }
+        std::cerr << "[CONV] round=" << round << " improved=" << std::fixed << imp
+                  << " wall=" << elapsed() << "s exit=" << ex << "\n";
+        if(rc) convExit = (rc==1) ? "fixpoint" : "rate";
+        return rc;
+    };
     for(int round = 0; round < maxRounds && elapsed() < timeBudget; round++){
         if(dyna==2){
-            if(rescanEvery>0 && round>0 && (round % rescanEvery)==0) std::fill(dirty.begin(), dirty.end(), (char)1);
+            bool fullPass = (round==0) || (rescanEvery>0 && round>0 && (round % rescanEvery)==0);
+            if(convTerm && forceFull){ fullPass = true; forceFull = false; }
+            if(fullPass && round>0) std::fill(dirty.begin(), dirty.end(), (char)1);
             // ---------- Incremental dynasearch round (rescore only dirty MBFFs) ----------
             struct Cand { double delta; int ia, ib, sa, sb; };
             int N=(int)mb.size(); long rescored=0;
@@ -4155,6 +4213,18 @@ void Manager::bitRepairRefine(){
             baseAcc = incrTNS_; total += applied;
             std::cerr << "[BIT_REPAIR] dyna2 round=" << round << " rescored=" << rescored << " applied=" << applied << " cands=" << cands.size() << " TNS=" << std::fixed << baseAcc << " elapsed=" << elapsed() << "s\n";
             if(validateEvery){ double full=computeAccurateTNS(); std::cerr << "[BIT_CHK] dyna2 round=" << round << " incr=" << std::fixed << incrTNS_ << " full=" << full << " diff=" << (incrTNS_-full) << "\n"; }
+            if(convTerm){
+                if(applied==0 && !fullPass){
+                    // quiet INCREMENTAL pass: dirty propagation is not complete, so verify
+                    // against a forced full rescan before declaring the fixpoint.
+                    forceFull = true;
+                    if(convRound(round, applied, false)==2) break;
+                    continue;
+                }
+                if(applied==0 && chainDepth>=2){ dyna=0; std::cerr << "[BIT_REPAIR] dyna2 plateau -> chain escalation\n"; if(convRound(round, applied, false)==2) break; continue; }
+                if(convRound(round, applied, true)) break;
+                continue;
+            }
             if(applied==0){ if(chainDepth>=2){ dyna=0; std::cerr << "[BIT_REPAIR] dyna2 plateau -> chain escalation\n"; continue; } break; }
             continue;
         }
@@ -4300,6 +4370,12 @@ void Manager::bitRepairRefine(){
             std::cerr << "[BIT_REPAIR] dyna round=" << round << " applied=" << applied << " cands=" << cands.size()
                       << " TNS=" << std::fixed << baseAcc << " elapsed=" << elapsed() << "s\n";
             if(validateEvery){ double full=computeAccurateTNS(); std::cerr << "[BIT_CHK] dyna round=" << round << " incr=" << std::fixed << incrTNS_ << " full=" << full << " diff=" << (incrTNS_-full) << "\n"; }
+            if(convTerm){
+                // every dyna1 round is a full rescan of the (negative-slack) order => fix-eligible
+                if(applied==0 && chainDepth>=2){ dyna=0; std::cerr << "[BIT_REPAIR] dyna plateau -> chain escalation (depth=" << chainDepth << ")\n"; if(convRound(round, applied, false)==2) break; continue; }
+                if(convRound(round, applied, true)) break;
+                continue;
+            }
             if(applied==0){
                 // dyna reached a single-swap local optimum. If an ejection-chain escalation is
                 // armed (chainDepth>=2), hand off to it to escape the basin (compound moves dyna's
@@ -4432,7 +4508,12 @@ void Manager::bitRepairRefine(){
         }
         total += roundSwaps;
         std::cerr << "[BIT_REPAIR] round=" << round << " swaps=" << roundSwaps << " TNS=" << std::fixed << baseAcc << " elapsed=" << elapsed() << "s\n";
-        if(roundSwaps==0) break;
+        if(convTerm){ if(convRound(round, roundSwaps, true)) break; }
+        else if(roundSwaps==0) break;
+    }
+    if(convTerm){
+        if(!convExit) convExit = (elapsed() >= timeBudget) ? "fuse" : "rounds";
+        std::cerr << "[CONV] done exit=" << convExit << " wall=" << std::fixed << elapsed() << "s\n";
     }
     std::cerr << "[BIT_REPAIR] totalSwaps=" << total << " finalTNS=" << std::fixed << baseAcc << "\n";
 }
