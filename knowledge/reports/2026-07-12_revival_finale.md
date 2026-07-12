@@ -46,7 +46,7 @@ tc1 −0.039%(從 +0.69% 翻贏)|hc01 +0.31%(過門檻)。
 | R2c' `DP_SLOT_ORACLE`(slot 移動 oracle 定價) | dc423ef | 7/7 gate ✓(§2) |
 | R1 `REBANK_MODES` 4/8 + `REBANK_HR_FLOOR` | c2e2490 | byte-exact ✓;hc02 冒煙 −0.05%;1b 豐富案 gate 待排 |
 | PLR `PLR_ORACLE` + 遺孤還原 | c2e2490 | byte-exact ✓;判決:設計死,存檔為 LNS 負對照 |
-| LNS v1 `LNS_KICK`(區域 rebundle 交易) | (本 commit) | byte-exact + hc02 冒煙進行中,結果補記 |
+| LNS v1 `LNS_KICK`(區域 rebundle 交易) | cf7675f + 修復 | byte-exact ✓;hc02 冒煙 **−0.034% 且 checker 過**(v1 move space 多被 rebank 收割,如預期);首版探測序重疊 bug 已修(只 free 被分組成員);**價值主體在 v1.5 bit 拆分** |
 
 ## 5. hc02 負交互機制(DAC 素材,已具 per-bit 取證)
 

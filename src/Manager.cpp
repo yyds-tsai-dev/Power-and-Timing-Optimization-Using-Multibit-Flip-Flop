@@ -4973,21 +4973,16 @@ void Manager::oracleRebankRefine(){
                     if(rbBitHeadroom(*this, cf) < hrFloor){ poor=true; break; } if(poor) break; }
                 if(poor){ dry++; continue; }
             }
-            // ---- probe: free the whole region ----
-            std::vector<BinDensityTable::Rect> oldRects;
-            for(FF* m : members){
-                Coor p=m->getNewCoor();
-                legalizer->FreeRect(p, m->getCell()->getW(), m->getCell()->getH());
-                legalizer->RemoveNodeByFFPtr(m);
-            }
-            // ---- plan: greedy bit-sum grouping (4 then 2), nearest-first ----
+            // ---- plan FIRST (pure arithmetic), then free ONLY grouped members ----
+            // (v1 bug fixed: freeing the whole region let group FindPlace claim an
+            //  ungrouped member's spot, and its blind restore overlapped => illegal
+            //  output. Ungrouped members are now never touched.)
             std::vector<char> inGroup(members.size(), 0);
             struct LnsGroup { std::vector<int> idx; Cell* tgt; Coor place; BankUndo undo; FF* nf; int dv; };
-            std::vector<LnsGroup> groups;
-            double dPA = 0; int dvSum = 0; bool planOk = true;
-            auto tryForm = [&](int bitsWanted, Cell* tgt)->void{
+            std::vector<LnsGroup> plans;
+            auto planForm = [&](int bitsWanted, Cell* tgt)->void{
                 if(!tgt) return;
-                for(size_t i=0;i<members.size() && planOk;i++){
+                for(size_t i=0;i<members.size();i++){
                     if(inGroup[i]) continue;
                     int need = bitsWanted - members[i]->getCell()->getBits();
                     if(need < 0) continue;
@@ -4998,29 +4993,47 @@ void Manager::oracleRebankRefine(){
                         if(b<=need){ pick.push_back((int)j); need-=b; }
                     }
                     if(need!=0 || pick.size()<2) continue;
-                    double cx=0, cy=0, pa=wcost(tgt);
-                    std::vector<FF*> grp;
-                    for(int gi : pick){ FF* f=members[gi]; grp.push_back(f);
-                        Coor p=f->getNewCoor(); cx+=p.x; cy+=p.y; pa-=wcost(f->getCell()); }
+                    double pa=wcost(tgt);
+                    for(int gi : pick) pa -= wcost(members[gi]->getCell());
                     if(pa >= 0) continue;                       // no structural saving
-                    Coor place = legalizer->FindPlace(Coor(cx/grp.size(), cy/grp.size()), tgt);
-                    if(place.x==DBL_MAX) continue;              // couldn't place: leave ungrouped
-                    int dv = binTable.estimateViolationDelta(grp, place, tgt);
-                    LnsGroup g; g.idx=pick; g.tgt=tgt; g.place=place; g.dv=dv;
-                    g.nf = bankFF_deferred(place, tgt, grp, g.undo);
-                    legalizer->UpdateRows(g.nf);                // occupy: later FindPlace must see it
                     for(int gi : pick) inGroup[gi]=1;
-                    dPA += pa; dvSum += dv;
-                    groups.push_back(std::move(g));
+                    LnsGroup g; g.idx=pick; g.tgt=tgt;
+                    plans.push_back(std::move(g));
                 }
             };
             Cell* best2L = bestCellOf(2);
-            tryForm(4, best4);
-            tryForm(2, best2L);
-            if(groups.empty()){
-                for(FF* m : members) legalizer->UpdateRows(m);  // restore region
-                dry++; continue;
+            planForm(4, best4);
+            planForm(2, best2L);
+            if(plans.empty()){ dry++; continue; }
+            // free ONLY grouped members
+            for(size_t i=0;i<members.size();i++){
+                if(!inGroup[i]) continue;
+                FF* m = members[i]; Coor p=m->getNewCoor();
+                legalizer->FreeRect(p, m->getCell()->getW(), m->getCell()->getH());
+                legalizer->RemoveNodeByFFPtr(m);
             }
+            // place + deferred-bank each planned group; dropped groups restore their members
+            std::vector<BinDensityTable::Rect> oldRects;
+            std::vector<LnsGroup> groups;
+            double dPA = 0; int dvSum = 0;
+            for(auto& g : plans){
+                double cx=0, cy=0, pa=wcost(g.tgt);
+                std::vector<FF*> grp;
+                for(int gi : g.idx){ FF* f=members[gi]; grp.push_back(f);
+                    Coor p=f->getNewCoor(); cx+=p.x; cy+=p.y; pa-=wcost(f->getCell()); }
+                Coor place = legalizer->FindPlace(Coor(cx/grp.size(), cy/grp.size()), g.tgt);
+                if(place.x==DBL_MAX){
+                    for(int gi : g.idx){ legalizer->UpdateRows(members[gi]); inGroup[gi]=0; }
+                    continue;
+                }
+                g.place = place;
+                g.dv = binTable.estimateViolationDelta(grp, place, g.tgt);
+                g.nf = bankFF_deferred(place, g.tgt, grp, g.undo);
+                legalizer->UpdateRows(g.nf);                    // occupy for later FindPlace
+                dPA += pa; dvSum += g.dv;
+                groups.push_back(std::move(g));
+            }
+            if(groups.empty()){ dry++; continue; }
             // ---- price the bundle on the folded oracle ----
             double newTNS = curTNS;
             for(auto& g : groups) newTNS = incrAccurateRecomputeFF(g.nf);
@@ -5037,18 +5050,19 @@ void Manager::oracleRebankRefine(){
                     g.nf->setIsLegalize(true);
                 }
                 binTable.applyMutation(oldRects, newRects);
-                for(size_t i=0;i<members.size();i++)            // ungrouped members return as-is
-                    if(!inGroup[i]) legalizer->UpdateRows(members[i]);
                 curTNS = newTNS;
                 roundAcc++; lnsAccepted++; dry=0;
             } else {
-                // reject: LIFO rollback — de-occupy nf, rollback bank, restore members
+                // reject: LIFO rollback — de-occupy nf, rollback bank, restore
+                // ONLY the grouped members (ungrouped were never touched)
                 for(auto it2 = groups.rbegin(); it2 != groups.rend(); ++it2){
                     legalizer->FreeRect(it2->place, it2->tgt->getW(), it2->tgt->getH());
                     legalizer->RemoveNodeByFFPtr(it2->nf);
                     rollbackBank(it2->undo);
                 }
-                for(FF* m : members){ incrAccurateRecomputeFF(m); legalizer->UpdateRows(m); }
+                for(auto& g : groups)
+                    for(int gi : g.idx){ FF* m=members[gi];
+                        incrAccurateRecomputeFF(m); legalizer->UpdateRows(m); }
                 incrTNS_ = curTNS;                              // pin (determinism)
                 dry++;
             }
