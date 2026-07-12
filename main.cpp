@@ -128,6 +128,31 @@ int main(int argc, char *argv[]){
                       << " oracleCost=" << std::fixed << mgr.oracleCostSnapshot() << " file=" << f << "\n";
         };
         ckpt("start", -1);
+        // ADAPT_STACK=1: single-axis stacking rule (four_rulings + tns_share_axis).
+        // Measure tns_share at refinement entry with the validated base-state axis;
+        // if share >= ADAPT_STACK_TH (default 0.05) and the stack knobs are not on,
+        // re-exec self with them enabled (front end costs 21-36s; ON-cases only).
+        // Pre-banking / parse-state measurement was empirically vetoed (hc02 inverts).
+        if(std::getenv("ADAPT_STACK") && std::atoi(std::getenv("ADAPT_STACK"))
+           && !std::getenv("ADAPT_RESTARTED")){
+            mgr.incrAccurateBuild();
+            double cost = mgr.oracleCostSnapshot();
+            double share = (cost > 0) ? (mgr.alpha * mgr.incrTNS_ / cost) : 0.0;
+            double th = 0.05;
+            if(const char* e = std::getenv("ADAPT_STACK_TH")) th = std::atof(e);
+            bool on = share >= th;
+            std::cerr << "[ADAPT] stack=" << (on ? "on" : "off")
+                      << " tns_share=" << share << " th=" << th << "\n";
+            if(on){
+                setenv("COSTCOMPARE_DOWNSTREAM", "1", 1);
+                setenv("DP_SLOT_INTRA_ONLY", "0", 1);
+                setenv("DP_SLOT_ORACLE", "1", 1);
+                setenv("ADAPT_RESTARTED", "1", 1);
+                std::cerr << "[ADAPT] axis fired -> restarting flow with stack enabled\n";
+                execv("/proc/self/exe", argv);
+                std::cerr << "[ADAPT] execv failed; continuing without stack\n";
+            }
+        }
         for(int alt = 0; alt < altRounds; alt++){
             if(std::getenv("RELOC") && std::atoi(std::getenv("RELOC"))){
                 STAGE("refreshArr(pre-reloc)", mgr.refreshArrivalCorrections());
