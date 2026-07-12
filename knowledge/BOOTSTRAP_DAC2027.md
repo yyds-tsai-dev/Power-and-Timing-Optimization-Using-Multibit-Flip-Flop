@@ -6,8 +6,9 @@
 ParamMgr/oracle 家族);server B(NVL4 msedalab)擁有翻案實驗/分析 + 圍欄內實作
 (oracleRebankRefine、postLGResynth、DetailPlacement)。圍欄協議見 four_rulings。
 
-## 讀取順序(2026-07-12 刷新)
+## 讀取順序(2026-07-13 刷新)
 
+0. **`knowledge/HANDOFF_B_20260713.md`** — **此刻在飛什麼**(v3 儀式執行中、GPU 實驗鏈、背景任務續看方式)。新 session 先讀這份。
 1. `knowledge/reports/2026-07-12_revival_finale.md` — **當前狀態總表**(墳場 8/8
    終審、v3 頭牌配置、四實作驗收、待辦交接清單)
 2. `knowledge/reports/2026-07-12_four_rulings.md` — 現行裁決(單軸疊加規則、
