@@ -153,6 +153,20 @@ void Manager::preLegalize(){
 
 void Manager::banking(){
     binTable.invalidate();
+    // ADAPT probe: tns_share at banking entry (pre-banking; feeds the CCDOWN axis).
+    // Print-only under ADAPT_PROBE=1; decision wiring lands with the v3 batch.
+    if(std::getenv("ADAPT_PROBE") && std::atoi(std::getenv("ADAPT_PROBE"))){
+        double tns = 0, pw = 0, ar = 0;
+        for(auto& kv : FF_Map){
+            FF* phys = kv.second;
+            for(FF* cf : phys->getClusterFF()){ double sl = cf->getSlack(); if(sl < 0) tns += -sl; }
+            pw += phys->getCell()->getGatePower();
+            ar += (double)phys->getCell()->getW() * phys->getCell()->getH();
+        }
+        double cost = alpha * tns + beta * pw + gamma * ar;
+        std::cerr << "[ADAPTPROBE] stage=preBanking tns_share=" << (cost > 0 ? alpha * tns / cost : 0)
+                  << " aTNS=" << alpha * tns << " cost=" << cost << "\n";
+    }
     Banking banking(*this);
     banking.run();
 }
