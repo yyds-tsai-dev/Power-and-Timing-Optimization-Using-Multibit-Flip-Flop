@@ -3,7 +3,16 @@
 **接手者:先讀 BOOTSTRAP_DAC2027.md(B 已刷新),再讀本檔(A 側在途狀態),再讀
 2026-07-12_four_rulings.md(現行裁決)。**
 
-## 1|conv-term:程式碼已寫、驗收跑到後段、**尚未 commit**
+## 0|🚩 最高優先:HEAD 漂移根因——v3 儀式前必辦
+
+conv-term 驗收發現:**同 binary(HEAD)無 CONV 基線比 v2-interim sweep 高
+tc1 +434,343 / tc3 +346,737(v2 config,EVAL_ANCHOR=1)**。interim 用 P1b/1bis
+時點 binary;其後 commit(嫌疑:R1/PLR c2e2490、R2c' dc423ef、LNS cf7675f)的
+byte-exact 只驗過 flag-off——**某變更在 EVAL_ANCHOR=1 路徑漏 gate**。
+根因程序:tc1 v2-config 395s/跑,對 e7df424→HEAD 逐 commit 找第一個偏離
+734,266,279 的點,通知該側修 gate。**此前 v3 凍結,對外數字以 v2-interim 為準。**
+
+## 1|conv-term:已 commit(驗收全綠;CONV_RATE=1e-6 = 生產值)
 
 - **在途編輯在 A 機 worktree 的 src/Manager.cpp(未 commit!)**。快照雙保險:
   scratchpad `conv/Manager.cpp.convterm_wip` + 專案根 `Manager.cpp.convterm_wip_20260712`。
@@ -13,8 +22,13 @@
   hc02 純定點腿 3600s 保險絲觸發時仍 +0.5–0.9/round 改善(→ **v3 的 fuse 要拉高
   或靠 rate-exit**);tc3 rate 腿 1432s 收官;兩條 fixpoint 腿 2130s/1164s;
   D 階段(CONV_RATE 1e-6/1e-5)寫此檔時仍在跑(workflow wf_2955eaf0-5ec)。
-- **接手動作**:等 workflow 完/讀其 output → 核對六關驗收 → commit(訊息含驗收數字)
-  → byte-exact off 複驗。
+- 驗收(13/13 過三檢):byte-exact off ✓×2;tc1 精確中性(byte-identical);
+  tc3 同基線 −25,325;**CONV_RATE=1e-6 = 建議生產值**(107% 定點紅利、−16% 牆鐘);
+  1e-5 = 快檔(65%、−45~49%)。
+- **fuse 政策**:v2 config 下 tc3/hc04 到 3600s 仍 −150~−250/round(move space 被
+  EVAL_ANCHOR+INTRA+ALLFF 放大,7/11 的 3080s 收斂證據過時)→ **v3 用 CONV_RATE=1e-6,
+  fuse 維持 3× 保險**。
+- 缺的三條同 binary 基線(tc2/hc04/hc02 base)腳本備妥 scratchpad conv/,跑掉補全。
 
 ## 2|A 側未清償義務(four_rulings §2):tns_share 軸實作
 
