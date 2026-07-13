@@ -64,7 +64,7 @@ rowed 的」,不是「這個 FF 存在」。EJECT revertAll 的 failure path 有
 1. byte-exact off:tc2 ✅(06:03 批次);**全七案 ✅(build 不變性套件,
    HEAD binary b78d5473 gate-off 七案全部逐位同儀式 rep1)**
 2. determinism:buggy 版 ×3 逐位同(病也病得決定性);**修復版 K=6 ×2
-   【待填】**
+   全逐位同 ✅(chain4,15:53)**
 3. 七案 gate(0.5% 規則):修前那輪作廢;**修復版 gate 待排**(建議 K=6,
    在 K6 determinism 綠後)
 4. v4 疊加測試:R1(`REBANK_MODES=15`)+ LNS_SPLIT 同開,排 v4 驗證輪。
