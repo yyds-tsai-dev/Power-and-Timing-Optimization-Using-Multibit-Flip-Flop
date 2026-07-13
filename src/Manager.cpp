@@ -4932,9 +4932,12 @@ void Manager::oracleRebankRefine(){
     int    lnsRounds = []{ const char* e=std::getenv("LNS_ROUNDS");   return e?std::atoi(e):4;     }();
     long   lnsPat    = []{ const char* e=std::getenv("LNS_PATIENCE"); return e?std::atol(e):50L;   }();
     double lnsMargin = []{ const char* e=std::getenv("LNS_MARGIN");   return e?std::atof(e):0.0;   }();
+    // v1.5: bit-splitting destroy — regroup the region's LOGICAL bits across FF
+    // boundaries (debankWithUndo composition; see plan_lns_destroy_repair.md §2).
+    const bool lnsSplit = []{ const char* e=std::getenv("LNS_SPLIT"); return e && std::atoi(e)!=0; }();
     auto l0 = std::chrono::high_resolution_clock::now();
     auto lElapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-l0).count(); };
-    long lnsRegions=0, lnsAccepted=0;
+    long lnsRegions=0, lnsAccepted=0, lnsScreenPass=0, lnsExactRej=0;
 
     for(int lr=0; lr<lnsRounds && lElapsed()<lnsTime; lr++){
         // seeds: physical FFs carrying committed negative slack, worst first
@@ -4986,6 +4989,220 @@ void Manager::oracleRebankRefine(){
                 for(FF* m : members){ for(FF* cf : m->getClusterFF())
                     if(rbBitHeadroom(*this, cf) < hrFloor){ poor=true; break; } if(poor) break; }
                 if(poor){ dry++; continue; }
+            }
+            // ================= LNS v1.5: bit-split destroy =================
+            // Regroup the region's LOGICAL bits across FF boundaries: debank the
+            // multi-bit members into 1b pieces, re-bank planned 4b/2b groups that
+            // may MIX bits of different original FFs, place leftovers near their
+            // driver pins. Screen with ONE side-effect-free evalRemapDelta over
+            // the overridden bits; exact phase reuses the EJECT machinery; revert
+            // dissolves the new banks and re-banks each original member from its
+            // bits' current physicals (EJECT revertAll generalization).
+            if(lnsSplit){
+                Cell* oneB  = bestCellOf(1);
+                Cell* b2L   = bestCellOf(2);
+                if(!oneB || (!best4 && !b2L)){ dry++; continue; }
+                // timing-ideal site of one bit = its driver pin position (EJECT idiom)
+                auto idealOf = [&](FF* cf)->Coor{
+                    PrevInstance pi = cf->getPrevInstance();
+                    if(pi.instance){
+                        if(pi.cellType==CellType::IO) return pi.instance->getCoor();
+                        if(pi.cellType==CellType::GATE) return pi.instance->getCoor()+pi.instance->getPinCoor(pi.pinName);
+                        FF* pf=static_cast<FF*>(pi.instance);
+                        if(pf && pf->getPhysicalFF())
+                            return pf->getPhysicalFF()->getNewCoor()+pf->getPhysicalFF()->getPinCoor("Q"+pf->getPhysicalPinName());
+                    }
+                    return cf->getPhysicalFF()->getNewCoor();
+                };
+                // pool: members are distance-sorted (deterministic), bits in slot order
+                std::vector<FF*> pool; std::vector<int> owner;
+                for(size_t mi=0; mi<members.size(); mi++)
+                    for(FF* cf : members[mi]->getClusterFF()){ pool.push_back(cf); owner.push_back((int)mi); }
+                int nb=(int)pool.size();
+                if(nb<2){ dry++; continue; }
+                std::vector<Coor> wish(nb);
+                for(int i=0;i<nb;i++) wish[i]=idealOf(pool[i]);
+                // greedy regrouping by wish-site proximity (dist, then pool index — deterministic)
+                std::vector<int> grpOf(nb,-1);
+                struct SGroup { std::vector<int> b; Cell* tgt; Coor site; };
+                std::vector<SGroup> sgs;
+                auto formGroups = [&](int sz, Cell* tgt){
+                    if(!tgt) return;
+                    for(int i=0;i<nb;i++){
+                        if(grpOf[i]>=0) continue;
+                        std::vector<std::pair<double,int>> nd;
+                        for(int j=0;j<nb;j++) if(j!=i && grpOf[j]<0)
+                            nd.push_back({std::abs(wish[j].x-wish[i].x)+std::abs(wish[j].y-wish[i].y), j});
+                        if((int)nd.size() < sz-1) continue;
+                        std::sort(nd.begin(), nd.end());
+                        SGroup g; g.b.push_back(i);
+                        for(int k=0;k<sz-1;k++) g.b.push_back(nd[k].second);
+                        for(int bi : g.b) grpOf[bi]=(int)sgs.size();
+                        g.tgt=tgt; sgs.push_back(std::move(g));
+                    }
+                };
+                formGroups(4, best4);
+                formGroups(2, b2L);
+                // structural test: skip regions whose plan reproduces the existing banking
+                bool structural=false;
+                for(auto& g : sgs){
+                    int ow = owner[g.b[0]]; bool mixed=false;
+                    for(int bi : g.b) if(owner[bi]!=ow){ mixed=true; break; }
+                    if(mixed || (int)g.b.size()!=members[ow]->getCell()->getBits()
+                             || g.tgt!=members[ow]->getCell()){ structural=true; break; }
+                }
+                if(!structural)
+                    for(int i=0;i<nb;i++)
+                        if(grpOf[i]<0 && members[owner[i]]->getCell()->getBits()>1){ structural=true; break; }
+                if(!structural){ dry++; continue; }
+                // ---- screening: one remap pricing over the overridden bits only ----
+                // (untouched 1b leftover members stay put and are NOT overridden)
+                std::vector<FF*> ovB; std::vector<Coor> nD, nQ; std::vector<double> nQpd;
+                double planPA=0;
+                for(auto& g : sgs){
+                    double cx=0, cy=0;
+                    for(int bi : g.b){ cx+=wish[bi].x; cy+=wish[bi].y; }
+                    g.site = Coor(cx/g.b.size(), cy/g.b.size());
+                    planPA += wcost(g.tgt);
+                    for(size_t s=0;s<g.b.size();s++){
+                        std::string suf = std::to_string(s);
+                        ovB.push_back(pool[g.b[s]]);
+                        nD.push_back(g.site + g.tgt->getPinCoor("D"+suf));
+                        nQ.push_back(g.site + g.tgt->getPinCoor("Q"+suf));
+                        nQpd.push_back(g.tgt->getQpinDelay());
+                    }
+                }
+                for(int i=0;i<nb;i++){
+                    if(grpOf[i]>=0) continue;
+                    if(members[owner[i]]->getCell()->getBits()==1) continue;   // stays put
+                    planPA += wcost(oneB);
+                    ovB.push_back(pool[i]);
+                    nD.push_back(wish[i] + oneB->getPinCoor("D"));
+                    nQ.push_back(wish[i] + oneB->getPinCoor("Q"));
+                    nQpd.push_back(oneB->getQpinDelay());
+                }
+                for(size_t mi=0;mi<members.size();mi++){
+                    bool tch = members[mi]->getCell()->getBits()>1;
+                    if(!tch) for(auto& g : sgs){ for(int bi : g.b) if(owner[bi]==(int)mi){ tch=true; break; } if(tch) break; }
+                    if(tch) planPA -= wcost(members[mi]->getCell());
+                }
+                double estT = evalRemapDelta(ovB, nD, nQ, nQpd);
+                if(alpha*estT + planPA >= -lnsMargin){ dry++; continue; }
+                lnsScreenPass++;
+                // ---- exact phase (EJECT machinery) ----
+                double tnsBefore = curTNS;
+                int violBefore = binTable.totalViolations();
+                struct MemSnap { Cell* cell; Coor pos; std::vector<FF*> bits; bool touched; };
+                std::vector<MemSnap> snaps(members.size());
+                for(size_t mi=0;mi<members.size();mi++){
+                    snaps[mi].cell=members[mi]->getCell(); snaps[mi].pos=members[mi]->getNewCoor();
+                    snaps[mi].bits.assign(members[mi]->getClusterFF().begin(), members[mi]->getClusterFF().end());
+                    snaps[mi].touched = members[mi]->getCell()->getBits()>1;
+                }
+                for(auto& g : sgs) for(int bi : g.b) snaps[owner[bi]].touched=true;
+                // ROW DISCIPLINE: only entities actually occupying legalizer rows may
+                // ever be FreeRect'd. Debanked/dissolved pieces live at pin-preserving
+                // coords whose rects can SPILL OUTSIDE the freed footprint — freeing
+                // those rects donates NEIGHBORS' occupied space to FindPlace and the
+                // output goes illegal (root cause of the 06:03 smoke score=0).
+                std::vector<char> memberFreed(members.size(),0);   // 1b member row state given up
+                std::vector<FF*>  placedLeft;                      // leftovers we rowed
+                // 1) debank every multi-bit member (debankWithUndo frees ITS rect+node;
+                //    pieces at bit-preserving coords, in binTable, NOT in rows)
+                for(size_t mi=0;mi<members.size();mi++)
+                    if(snaps[mi].cell->getBits()>1){ debankWithUndo(members[mi]); memberFreed[mi]=1; }
+                // 2) bank planned groups (mixing pieces across original members)
+                bool placedOK=true;
+                std::vector<FF*> banked; banked.reserve(sgs.size());
+                for(auto& g : sgs){
+                    std::vector<FF*> piecesG;
+                    for(size_t s=0;s<g.b.size();s++){
+                        FF* p = pool[g.b[s]]->getPhysicalFF();
+                        int ow = owner[g.b[s]];
+                        if(!memberFreed[ow] && p==members[ow]){
+                            // original 1b member joining a group: give up its row state
+                            legalizer->FreeRect(p->getNewCoor(), p->getCell()->getW(), p->getCell()->getH());
+                            legalizer->RemoveNodeByFFPtr(p);
+                            memberFreed[ow]=1;
+                        }
+                        piecesG.push_back(p);
+                    }
+                    Coor pl = legalizer->FindPlace(g.site, g.tgt);
+                    if(pl.x==DBL_MAX){ placedOK=false; break; }
+                    FF* nf = bankFF(pl, g.tgt, piecesG);            // binTable hooked
+                    nf->setNewCoor(pl); nf->setCoor(pl); nf->setIsLegalize(true);
+                    legalizer->UpdateRows(nf);
+                    banked.push_back(nf);
+                }
+                // 3) place leftovers of debanked members near their driver pins
+                if(placedOK) for(int i=0;i<nb;i++){
+                    if(grpOf[i]>=0) continue;
+                    if(snaps[owner[i]].cell->getBits()==1) continue;
+                    FF* nf = pool[i]->getPhysicalFF();
+                    Coor init = nf->getNewCoor();
+                    Coor pl = legalizer->FindPlace(wish[i], nf->getCell());
+                    if(pl.x==DBL_MAX){ placedOK=false; break; }
+                    nf->setNewCoor(pl); nf->setCoor(pl); nf->setIsLegalize(true);
+                    legalizer->UpdateRows(nf);
+                    placedLeft.push_back(nf);
+                    binTable.applyMutation({{init.x,init.y,nf->getCell()->getW(),nf->getCell()->getH()}},
+                                           {{pl.x,pl.y,nf->getCell()->getW(),nf->getCell()->getH()}});
+                }
+                // universal revert, row-disciplined: release exactly the rects we
+                // rowed (banked groups via debankWithUndo, placed leftovers, still-
+                // rowed 1b members), never touch unrowed pieces, then re-bank each
+                // touched member from its bits' CURRENT physicals.
+                auto revertRegion = [&](){
+                    for(auto it2=banked.rbegin(); it2!=banked.rend(); ++it2) debankWithUndo(*it2);
+                    for(auto it2=placedLeft.rbegin(); it2!=placedLeft.rend(); ++it2){
+                        legalizer->FreeRect((*it2)->getNewCoor(), (*it2)->getCell()->getW(), (*it2)->getCell()->getH());
+                        legalizer->RemoveNodeByFFPtr(*it2);
+                    }
+                    for(size_t mi=0;mi<members.size();mi++){
+                        if(!snaps[mi].touched) continue;
+                        if(!memberFreed[mi]){                       // 1b member still rowed
+                            legalizer->FreeRect(members[mi]->getNewCoor(), snaps[mi].cell->getW(), snaps[mi].cell->getH());
+                            legalizer->RemoveNodeByFFPtr(members[mi]);
+                            memberFreed[mi]=1;
+                        }
+                        std::unordered_set<FF*> ph;
+                        for(FF* cf : snaps[mi].bits) ph.insert(cf->getPhysicalFF());
+                        std::vector<FF*> pieces(ph.begin(), ph.end());
+                        std::sort(pieces.begin(), pieces.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+                        FF* restored = bankFF(snaps[mi].pos, snaps[mi].cell, pieces);
+                        restored->setNewCoor(snaps[mi].pos); restored->setCoor(snaps[mi].pos);
+                        restored->setIsLegalize(true);
+                        legalizer->UpdateRows(restored);
+                        incrAccurateRecomputeFF(restored);
+                    }
+                    incrTNS_ = tnsBefore; curTNS = tnsBefore;       // pin (determinism)
+                };
+                if(!placedOK){
+                    revertRegion(); lnsExactRej++;
+                    for(FF* m : members) consumed.insert(m);        // pointers may be recycled
+                    dry++; continue;
+                }
+                // ---- exact pricing of the realized regroup ----
+                std::unordered_set<FF*> phS;
+                for(int i=0;i<nb;i++) phS.insert(pool[i]->getPhysicalFF());
+                std::vector<FF*> pieces(phS.begin(), phS.end());
+                std::sort(pieces.begin(), pieces.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
+                double newTNS=curTNS;
+                for(FF* p : pieces) newTNS = incrAccurateRecomputeFF(p);
+                double paNow=0; for(FF* p : pieces) paNow += wcost(p->getCell());
+                double paOld=0; for(auto& s : snaps) paOld += wcost(s.cell);
+                int dViol = binTable.totalViolations() - violBefore;
+                double delta = alpha*(newTNS - tnsBefore) + (paNow - paOld) + lambda*dViol;
+                if(delta < -lnsMargin){
+                    curTNS = newTNS;                                // caches already folded
+                    for(FF* m : members) consumed.insert(m);
+                    roundAcc++; lnsAccepted++; dry=0;
+                } else {
+                    revertRegion(); lnsExactRej++;
+                    for(FF* m : members) consumed.insert(m);
+                    dry++;
+                }
+                continue;                                           // v1 path not taken
             }
             // ---- plan FIRST (pure arithmetic), then free ONLY grouped members ----
             // (v1 bug fixed: freeing the whole region let group FindPlace claim an
@@ -5087,6 +5304,8 @@ void Manager::oracleRebankRefine(){
         if(roundAcc==0) break;
     }
     std::cerr << "[LNS] total accepted=" << lnsAccepted << " regions=" << lnsRegions
+              << (lnsSplit ? " screenPass=" : "") << (lnsSplit ? std::to_string(lnsScreenPass) : "")
+              << (lnsSplit ? " exactRej=" : "")   << (lnsSplit ? std::to_string(lnsExactRej) : "")
               << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << lElapsed() << "s\n";
 }
 
