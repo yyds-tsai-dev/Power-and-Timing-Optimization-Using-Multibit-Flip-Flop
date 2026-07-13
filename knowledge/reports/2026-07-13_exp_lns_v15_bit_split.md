@@ -58,7 +58,8 @@ rowed 的」,不是「這個 FF 存在」。EJECT revertAll 的 failure path 有
 
 ## 5. 驗收狀態(house 標準)
 
-1. byte-exact off:tc2 ✅(06:03 批次);**全七案 build 不變性套件執行中【待填】**
+1. byte-exact off:tc2 ✅(06:03 批次);**全七案 ✅(build 不變性套件,
+   HEAD binary b78d5473 gate-off 七案全部逐位同儀式 rep1)**
 2. determinism:buggy 版 ×3 逐位同(病也病得決定性);**修復版 K=6 ×2
    【待填】**
 3. 七案 gate(0.5% 規則):修前那輪作廢;**修復版 gate 待排**(建議 K=6,
