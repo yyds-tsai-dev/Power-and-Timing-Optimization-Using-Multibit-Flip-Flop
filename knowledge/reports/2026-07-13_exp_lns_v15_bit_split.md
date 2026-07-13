@@ -53,8 +53,11 @@ rowed 的」,不是「這個 FF 存在」。EJECT revertAll 的 failure path 有
   漂移(tc3 +0.0003%)。非法性已除,漂移是固有成本;緩解 = `LNS_MARGIN`
   收緊篩選(tc3 放行 28 全空手 = 篩選過鬆的證據;篩選未計 FindPlace 位移,
   與 EJECT 同款樂觀偏差)。
-- INCR_VALIDATE 的 diff 行出現在 RELOC/BIT 階段(LNS 前)——是否為
-  EVAL_ANCHOR 既有基線【對照組 chain4 執行中,待填】。
+- INCR_VALIDATE 的 diff 行:**對照組(無 LNS,同凍結 env)同樣出現 44 條
+  nonzero-diff → 判定為 EVAL_ANCHOR 既有基線行為(anchor 語義 vs full
+  recompute 的系統性偏移),非 v1.5 快取 bug**。v1.5 oracle 紀律無罪。
+  (後續若要讓 INCR_VALIDATE 在 anchor 模式下可用,需 anchor-aware 的
+  對照邏輯——獨立小項,不阻塞。)
 
 ## 5. 驗收狀態(house 標準)
 
