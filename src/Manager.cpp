@@ -4935,9 +4935,12 @@ void Manager::oracleRebankRefine(){
     // v1.5: bit-splitting destroy — regroup the region's LOGICAL bits across FF
     // boundaries (debankWithUndo composition; see plan_lns_destroy_repair.md §2).
     const bool lnsSplit = []{ const char* e=std::getenv("LNS_SPLIT"); return e && std::atoi(e)!=0; }();
+    // v2 Phase B: probe stage — price at REAL FindPlace sites before any debank;
+    // reject is a pure UpdateRows restore (name-clean, zero churn). plan_lns_v2.md §2.
+    const bool lnsProbe = []{ const char* e=std::getenv("LNS_PROBE"); return e && std::atoi(e)!=0; }();
     auto l0 = std::chrono::high_resolution_clock::now();
     auto lElapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-l0).count(); };
-    long lnsRegions=0, lnsAccepted=0, lnsScreenPass=0, lnsExactRej=0;
+    long lnsRegions=0, lnsAccepted=0, lnsScreenPass=0, lnsExactRej=0, lnsProbeRej=0;
 
     for(int lr=0; lr<lnsRounds && lElapsed()<lnsTime; lr++){
         // seeds: physical FFs carrying committed negative slack, worst first
@@ -5089,6 +5092,52 @@ void Manager::oracleRebankRefine(){
                 double estT = evalRemapDelta(ovB, nD, nQ, nQpd);
                 if(alpha*estT + planPA >= -lnsMargin){ dry++; continue; }
                 lnsScreenPass++;
+                // ---- v2 Phase B probe stage (LNS_PROBE=1): real-site pricing,
+                //      name-clean reject. FreeRect/RemoveNode touch only row
+                //      state; FindPlace is a pure query; UpdateRows restores the
+                //      exact prior rows (v1 restore pattern, byte-clean).
+                if(lnsProbe){
+                    for(FF* m : members){
+                        legalizer->FreeRect(m->getNewCoor(), m->getCell()->getW(), m->getCell()->getH());
+                        legalizer->RemoveNodeByFFPtr(m);
+                    }
+                    bool probeOK=true;
+                    std::vector<Coor> gSite(sgs.size());
+                    for(size_t gi=0; gi<sgs.size() && probeOK; gi++){
+                        Coor pl = legalizer->FindPlace(sgs[gi].site, sgs[gi].tgt);
+                        if(pl.x==DBL_MAX) probeOK=false; else gSite[gi]=pl;
+                    }
+                    std::vector<Coor> lSite(nb);
+                    if(probeOK) for(int i=0;i<nb && probeOK;i++){
+                        if(grpOf[i]>=0) continue;
+                        if(members[owner[i]]->getCell()->getBits()==1) continue;
+                        Coor pl = legalizer->FindPlace(wish[i], oneB);
+                        if(pl.x==DBL_MAX) probeOK=false; else lSite[i]=pl;
+                    }
+                    double est2 = 1e30;
+                    if(probeOK){
+                        size_t k=0;
+                        for(size_t gi=0; gi<sgs.size(); gi++)
+                            for(size_t s=0;s<sgs[gi].b.size();s++,k++){
+                                std::string suf = std::to_string(s);
+                                nD[k]=gSite[gi]+sgs[gi].tgt->getPinCoor("D"+suf);
+                                nQ[k]=gSite[gi]+sgs[gi].tgt->getPinCoor("Q"+suf);
+                            }
+                        for(int i=0;i<nb;i++){
+                            if(grpOf[i]>=0) continue;
+                            if(members[owner[i]]->getCell()->getBits()==1) continue;
+                            nD[k]=lSite[i]+oneB->getPinCoor("D");
+                            nQ[k]=lSite[i]+oneB->getPinCoor("Q"); k++;
+                        }
+                        est2 = alpha*evalRemapDelta(ovB, nD, nQ, nQpd) + planPA;
+                    }
+                    for(FF* m : members) legalizer->UpdateRows(m);      // exact restore
+                    if(!probeOK || est2 >= -lnsMargin){ lnsProbeRej++; dry++; continue; }
+                    // carry the real sites into the exact phase as starting points
+                    for(size_t gi=0; gi<sgs.size(); gi++) sgs[gi].site = gSite[gi];
+                    for(int i=0;i<nb;i++)
+                        if(grpOf[i]<0 && members[owner[i]]->getCell()->getBits()>1) wish[i]=lSite[i];
+                }
                 // ---- exact phase (EJECT machinery) ----
                 double tnsBefore = curTNS;
                 int violBefore = binTable.totalViolations();
@@ -5305,6 +5354,7 @@ void Manager::oracleRebankRefine(){
     }
     std::cerr << "[LNS] total accepted=" << lnsAccepted << " regions=" << lnsRegions
               << (lnsSplit ? " screenPass=" : "") << (lnsSplit ? std::to_string(lnsScreenPass) : "")
+              << (lnsProbe ? " probeRej=" : "")   << (lnsProbe ? std::to_string(lnsProbeRej) : "")
               << (lnsSplit ? " exactRej=" : "")   << (lnsSplit ? std::to_string(lnsExactRej) : "")
               << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << lElapsed() << "s\n";
 }
