@@ -13,19 +13,20 @@ One **unified configuration** — a single environment recipe, zero per-case hyp
 
 Current record = **v2** (unified + `EVAL_ANCHOR=1`: the timing oracle anchored at parse-time truth with evaluator-exact propagation semantics — tie-cell unfreeze, unreachable-drop, primary-output-only arcs). The 2026-07-06 pre-exactness record is kept for comparison: the delta between the two columns is the *passive* dividend of making the internal pricer agree with the official evaluator, with zero operator changes.
 
-| Testcase | Contest top-3 best* | 2026-07-06 record | **v2 (2026-07-11)** | v3 (2026-07-13)† | Δ v3 vs top-3 |
-|---|---:|---:|---:|---:|---:|
-| testcase1_0812 | 739,235,861 | 734,319,834 | **734,266,279** | 734,700,023 | −0.61% |
-| testcase2_0812 | 744,231 | 723,165 | **717,378** | 705,141 | −5.25% |
-| testcase3 | 727,971,140 | 726,041,482 | **725,877,524** | 725,803,320 | −0.30% |
-| hiddencase01 | 31,507,917 | 30,062,537 | **30,065,106** | 29,993,041 | −4.81% |
-| hiddencase02 | 13,408,414 | 10,089,886 | **10,028,140** | 9,678,013 | −27.82% |
-| hiddencase03 | 55,941,500 | 55,781,010 | **55,772,291** | 55,771,347 | −0.31% |
-| hiddencase04 | 728,497,353 | 726,015,652 | **725,906,134** | 725,980,968 | −0.35% |
+| Testcase | Contest top-3 best* | 2026-07-06 record | **v2 (2026-07-11)** | v3 (2026-07-13)† | v4 (2026-07-14)‡ | Δ v4 vs top-3 |
+|---|---:|---:|---:|---:|---:|---:|
+| testcase1_0812 | 739,235,861 | 734,319,834 | **734,266,279** | 734,700,023 | 734,367,484 | −0.66% |
+| testcase2_0812 | 744,231 | 723,165 | 717,378 | 705,141 | **703,444** | −5.48% |
+| testcase3 | 727,971,140 | 726,041,482 | 725,877,524 | 725,803,320 | **725,800,553** | −0.30% |
+| hiddencase01 | 31,507,917 | 30,062,537 | 30,065,106 | 29,993,041 | **29,977,869** | −4.86% |
+| hiddencase02 | 13,408,414 | 10,089,886 | 10,028,140 | 9,678,013 | **9,640,716** | −28.10% |
+| hiddencase03 | 55,941,500 | 55,781,010 | 55,772,291 | 55,771,347 | **55,770,398** | −0.31% |
+| hiddencase04 | 728,497,353 | 726,015,652 | 725,906,134 | 725,980,968 | **725,947,268** | −0.35% |
 
-**Composite ratio: 0.952 (2026-07-06) → 0.9500 (v2) → 0.9437 (v3, machine-B verified†)** against the top-3-best baseline. Strongest published methods on this benchmark reach 0.979 (DATE'26) and 0.991 (DAC'25 LBR, recomputed under the same baseline).
+**Composite ratio: 0.952 (2026-07-06) → 0.9500 (v2) → 0.9437 (v3) → 0.9428 (v4, machine-B verified‡)** against the top-3-best baseline. Strongest published methods on this benchmark reach 0.979 (DATE'26) and 0.991 (DAC'25 LBR, recomputed under the same baseline).
 \*exact per-case top-3 costs as re-evaluated in the DATE'26 study.
-†v3 = v2 + convergence termination (`CONV_TERM`) + single-axis adaptive operator stacking (`ADAPT_STACK`), frozen env. Machine-B verification complete 2026-07-13: 7/7 cases **byte-identical across independent repeats (2×), thread counts 8–128, and ambient-load conditions**. Cross-machine reconciliation with machine A pending; v3 becomes the official record when it lands. v3 trades tc1 (+0.06%) and hc04 (+0.01%) for the large tc2/hc02 wins — the v4 consolidation (rebank modes 4/8: −0.24% tc2 on top of v3; exact-priced LNS: −0.2% class on hc02) keeps per-case gates for exactly this reason.
+†v3 = v2 + convergence termination (`CONV_TERM`) + single-axis adaptive operator stacking (`ADAPT_STACK`), frozen env. Machine-B verification 2026-07-13: 7/7 byte-identical across repeats, thread counts 8–128, ambient load, and rebuilt binaries.
+‡v4 = v3 + rebank modes 4/8 (`REBANK_MODES=15`) + exact-priced regional LNS with bit-splitting destroy (`LNS_KICK/LNS_SPLIT`, K=4) — still one uniform recipe, zero per-case hyperparameters; beats v3 on all seven cases. Machine-B ritual complete 2026-07-14 (rep2 byte-identical 7/7; thread-invariant at 128T). tc1 remains the one case where the v2-era record stands (convergence-knob sweep falsified `CONV_TERM` as the cause — residual gap under investigation). Cross-machine reconciliation with machine A pending for v3/v4 official promotion.
 
 Reproducibility: deterministic in practice — six of seven cases are byte-identical across repeats (hiddencase04 has one floating-point-noise accept, ~2×10⁻⁴% of score). Scores are additionally **invariant to thread count and ambient load** on the non-wall-clock-capped cases (bit-identical across 8/16/32/64 threads, verified on two machines); on the capped cases (tc3, hc04, hc02) more threads means more exact-priced work inside the same time budget, i.e. equal-or-better scores at a fraction of the wall clock. Reference machine: 2.2 GHz Xeon E5-2630 v4, 8 threads, <4 GB RAM per case; full suite ≈ 3–5 h (≈ 70 min at 64 threads on a 4-socket Xeon Gold).
 

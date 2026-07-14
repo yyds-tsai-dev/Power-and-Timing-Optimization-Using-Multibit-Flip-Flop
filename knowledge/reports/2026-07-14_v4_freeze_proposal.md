@@ -1,5 +1,12 @@
 # v4 凍結提案(2026-07-14 03:40,server B;數據獨立重算驗證)
 
+> **⚡ 13:15 生效確認**:v4 儀式 B 側完成——rep2(sequential T64)**七案全部
+> 逐位同 rep1(=chain7 W1)** → 免 rep3;W1 det×2 四發全逐位;v4@T128
+> 三案(tc3/hc03/hc04)逐位同 T64。**本提案生效,README v4 欄已上。**
+> chain9 加測定案:LNS_TIME 無關(patience ~5s 收斂)、K=2 無效、
+> tc1 conv knobs 全等分(CR 3e-7/1e-7/off 同分 734,366,919.81)→
+> conv-term 非 tc1 殘餘差距主因,+100k gap 另查(ADAPT_STACK 嫌疑)。
+
 **Type**: proposal(chain7 K=4 矩陣收全;所有數字經第二計算通道從原始 log
 重算核對,零出入)
 
