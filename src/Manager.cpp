@@ -5381,6 +5381,11 @@ void Manager::oracleEjectRefine(){
     double timeBudget = []{ const char* e=std::getenv("EJECT_TIME");    return e?std::atof(e):120.0; }();
     double margin     = []{ const char* e=std::getenv("EJECT_MARGIN");  return e?std::atof(e):0.0;   }();
     long   patience   = []{ const char* e=std::getenv("EJECT_PATIENCE");return e?std::atol(e):300L;  }();
+    // EJECT_ROWFIX=1: row-disciplined revert — FreeRect/RemoveNode only pieces
+    // that actually occupy rows. Same latent-bug family as the LNS v1.5 06:03
+    // illegality (FreeRect on never-rowed pieces donates neighbors' space);
+    // fires only on FindPlace-failure paths. Default off, byte-exact.
+    const bool rowFix = []{ const char* e=std::getenv("EJECT_ROWFIX"); return e && std::atoi(e)!=0; }();
     bool incr = std::getenv("INCR_RELOC") && std::atoi(std::getenv("INCR_RELOC"));
     if(!incr){ std::cerr << "[EJECT] skipped (needs INCR_RELOC=1)\n"; return; }
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -5476,6 +5481,7 @@ void Manager::oracleEjectRefine(){
         Coor oldPos = A->getNewCoor();
         Cell* oldCell = A->getCell();
         std::vector<FF*> bits(A->getClusterFF().begin(), A->getClusterFF().end());
+        std::unordered_set<FF*> rowedNew;        // pieces this candidate placed into rows
 
         // universal revert: gather the bits' CURRENT physicals (any mix of pieces),
         // free them, and re-bank the original cell at its old position. bankFF's own
@@ -5486,6 +5492,7 @@ void Manager::oracleEjectRefine(){
             std::vector<FF*> pieces(phSet.begin(), phSet.end());
             std::sort(pieces.begin(), pieces.end(), [](FF* a, FF* b){ return a->getInstanceName() < b->getInstanceName(); });
             for(FF* p : pieces){
+                if(rowFix && !rowedNew.count(p)) continue;   // never rowed: no rect to free
                 legalizer->FreeRect(p->getNewCoor(), p->getCell()->getW(), p->getCell()->getH());
                 legalizer->RemoveNodeByFFPtr(p);
             }
@@ -5506,6 +5513,7 @@ void Manager::oracleEjectRefine(){
                 if(p.x==DBL_MAX){ placedOK=false; break; }
                 nf->setNewCoor(p); nf->setCoor(p); nf->setIsLegalize(true);
                 legalizer->UpdateRows(nf);
+                rowedNew.insert(nf);
                 binTable.applyMutation({{init.x,init.y,nf->getCell()->getW(),nf->getCell()->getH()}},
                                        {{p.x,p.y,nf->getCell()->getW(),nf->getCell()->getH()}});
             }
@@ -5519,6 +5527,7 @@ void Manager::oracleEjectRefine(){
                 FF* nf2 = bankFF(p, c2, pairv);        // binTable hooked (singles at current coords -> 2b at p)
                 nf2->setNewCoor(p); nf2->setCoor(p); nf2->setIsLegalize(true);
                 legalizer->UpdateRows(nf2);
+                rowedNew.insert(nf2);
             }
         }
         if(!placedOK){ revertAll(); dry++; used[c.i]=1; continue; }
