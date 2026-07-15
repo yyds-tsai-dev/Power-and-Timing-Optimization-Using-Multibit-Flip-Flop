@@ -5513,7 +5513,7 @@ void Manager::oracleEjectRefine(){
                 if(p.x==DBL_MAX){ placedOK=false; break; }
                 nf->setNewCoor(p); nf->setCoor(p); nf->setIsLegalize(true);
                 legalizer->UpdateRows(nf);
-                rowedNew.insert(nf);
+                if(rowFix) rowedNew.insert(nf);      // gate-guarded: off = zero allocation delta
                 binTable.applyMutation({{init.x,init.y,nf->getCell()->getW(),nf->getCell()->getH()}},
                                        {{p.x,p.y,nf->getCell()->getW(),nf->getCell()->getH()}});
             }
@@ -5527,7 +5527,7 @@ void Manager::oracleEjectRefine(){
                 FF* nf2 = bankFF(p, c2, pairv);        // binTable hooked (singles at current coords -> 2b at p)
                 nf2->setNewCoor(p); nf2->setCoor(p); nf2->setIsLegalize(true);
                 legalizer->UpdateRows(nf2);
-                rowedNew.insert(nf2);
+                if(rowFix) rowedNew.insert(nf2);     // gate-guarded: off = zero allocation delta
             }
         }
         if(!placedOK){ revertAll(); dry++; used[c.i]=1; continue; }
