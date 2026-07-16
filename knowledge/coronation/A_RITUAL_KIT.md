@@ -41,6 +41,15 @@ docs——**用當前 HEAD build 即可**,凍結 env 下行為與凍結期 binar
 全 checker 綠。跨機不一致 = conv-term 覆蓋不全的 bug,回報修復(這正是
 DAC 稿 determinism 主張的實驗本體)。
 
+## ⚠️ 加冕前必跑:tc1 record 出處一發(2026-07-16 新增)
+
+B 側調查(`reports/2026-07-16_diagnosis_tc1_v2_record_provenance.md`)發現
+**tc1 的 v2 record 734,266,279 在 B 機任何歷史 binary(含 1bis commit 本尊)
++ 任何 env 組合下都無法重現**(B 得 734,700,499)。請 A 用當前 HEAD binary
+跑一發 `v2 env + tc1`(README 配方):
+- 得 **734.70M** → record 是當年 WIP 樹的工件,README 加星,結案;
+- 得 **734.27M** → **tc1 跨機分歧,加冕流程暫停,先解此案**。
+
 ## 加冕通過後
 
 1. B 彙整跨機一致性表 → v3 report。
