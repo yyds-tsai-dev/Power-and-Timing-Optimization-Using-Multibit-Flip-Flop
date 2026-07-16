@@ -4938,11 +4938,37 @@ void Manager::oracleRebankRefine(){
     // v2 Phase B: probe stage — price at REAL FindPlace sites before any debank;
     // reject is a pure UpdateRows restore (name-clean, zero churn). plan_lns_v2.md §2.
     const bool lnsProbe = []{ const char* e=std::getenv("LNS_PROBE"); return e && std::atoi(e)!=0; }();
+    // v2 Phase C2: power-harvest lens (LNS_LENS=pa) — seed HEALTHY small-cell
+    // neighborhoods (every bit: Q-side branch headroom >= LNS_PA_HR and D slack
+    // >= 0) ranked by per-bit power waste, instead of TNS hotspots. The 2g thesis
+    // (headroom buys displacement, consolidation buys power) on the v1.5
+    // transaction machinery. Unset = TNS lens, byte-exact (no allocations off).
+    const char* lensEnv = std::getenv("LNS_LENS");
+    const bool lensPA = lensEnv && lensEnv[0]=='p' && lensEnv[1]=='a' && lensEnv[2]==0;
+    const double paHrMin = []{ const char* e=std::getenv("LNS_PA_HR"); return e?std::atof(e):2.0; }();
     auto l0 = std::chrono::high_resolution_clock::now();
     auto lElapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-l0).count(); };
     long lnsRegions=0, lnsAccepted=0, lnsScreenPass=0, lnsExactRej=0, lnsProbeRej=0;
 
     for(int lr=0; lr<lnsRounds && lElapsed()<lnsTime; lr++){
+        std::vector<std::pair<double,FF*>> seeds;
+        if(lensPA){
+            // power-harvest seeds: movable sub-4b physicals whose EVERY bit can
+            // afford displacement (headroom + slack), ranked by per-bit wcost
+            // (most power-wasteful first; name tiebreak — FF_Map order killed)
+            for(auto& kv : FF_Map){
+                FF* f=kv.second; if(!f || f->getFixed()) continue;
+                int b=f->getCell()->getBits(); if(b>=4) continue;
+                bool ok=true;
+                for(FF* cf : f->getClusterFF())
+                    if(rbBitHeadroom(*this, cf) < paHrMin || incrFFSlack(cf) < 0){ ok=false; break; }
+                if(!ok) continue;
+                seeds.push_back({wcost(f->getCell())/b, f});
+            }
+            std::sort(seeds.begin(), seeds.end(), [](const std::pair<double,FF*>& a, const std::pair<double,FF*>& b){
+                if(a.first!=b.first) return a.first>b.first;
+                return a.second->getInstanceName() < b.second->getInstanceName(); });
+        } else {
         // seeds: physical FFs carrying committed negative slack, worst first
         std::unordered_map<FF*, double> physBad;
         for(auto& kv : incrFFNeg_){
@@ -4950,12 +4976,12 @@ void Manager::oracleRebankRefine(){
             FF* ph = kv.first->getPhysicalFF();
             if(ph && !ph->getFixed()) physBad[ph] += kv.second;
         }
-        std::vector<std::pair<double,FF*>> seeds;
         seeds.reserve(physBad.size());
         for(auto& kv : physBad) seeds.push_back({kv.second, kv.first});
         std::sort(seeds.begin(), seeds.end(), [](const std::pair<double,FF*>& a, const std::pair<double,FF*>& b){
             if(a.first!=b.first) return a.first>b.first;
             return a.second->getInstanceName() < b.second->getInstanceName(); });
+        }
 
         std::vector<FF*> all;
         for(auto& kv : FF_Map){ FF* f=kv.second; if(f && !f->getFixed()) all.push_back(f); }
@@ -4982,6 +5008,13 @@ void Manager::oracleRebankRefine(){
             for(auto& q : nr){
                 FF* f = all[q.second];
                 if(consumed.count(f)) continue;
+                if(lensPA){
+                    // harvest regions stay pure: sub-4b members that can afford it
+                    bool ok = f->getCell()->getBits()<4;
+                    if(ok) for(FF* cf : f->getClusterFF())
+                        if(rbBitHeadroom(*this, cf) < paHrMin || incrFFSlack(cf) < 0){ ok=false; break; }
+                    if(!ok) continue;
+                }
                 members.push_back(f);
                 if((int)members.size()>=regionK) break;
             }
