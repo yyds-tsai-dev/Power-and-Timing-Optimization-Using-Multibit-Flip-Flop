@@ -5057,7 +5057,12 @@ void Manager::oracleRebankRefine(){
                 int nb=(int)pool.size();
                 if(nb<2){ dry++; continue; }
                 std::vector<Coor> wish(nb);
-                for(int i=0;i<nb;i++) wish[i]=idealOf(pool[i]);
+                // pa lens: minimal-displacement harvest — group by CURRENT
+                // positions (2g: consolidation pays via dPA, not relocation;
+                // driver-wish centroids scatter healthy bits and alpha*dTNS
+                // eats the saving — measured 0-accept flop, 2026-07-17)
+                for(int i=0;i<nb;i++)
+                    wish[i] = lensPA ? pool[i]->getPhysicalFF()->getNewCoor() : idealOf(pool[i]);
                 // greedy regrouping by wish-site proximity (dist, then pool index — deterministic)
                 std::vector<int> grpOf(nb,-1);
                 struct SGroup { std::vector<int> b; Cell* tgt; Coor site; };
