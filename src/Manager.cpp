@@ -4946,6 +4946,11 @@ void Manager::oracleRebankRefine(){
     const char* lensEnv = std::getenv("LNS_LENS");
     const bool lensPA = lensEnv && lensEnv[0]=='p' && lensEnv[1]=='a' && lensEnv[2]==0;
     const double paHrMin = []{ const char* e=std::getenv("LNS_PA_HR"); return e?std::atof(e):2.0; }();
+    // v2 Phase D: economics-driven grouping (LNS_MATCH=1) — enumerate anchored
+    // quads/pairs, price each with the group-move oracle + pro-rata PA share,
+    // take the best DISJOINT set (value-sorted, negatives only). Replaces
+    // nearest-greedy; targets the ~5% exact-phase hit rate. Off = byte-exact.
+    const bool lnsMatch = []{ const char* e=std::getenv("LNS_MATCH"); return e && std::atoi(e)!=0; }();
     auto l0 = std::chrono::high_resolution_clock::now();
     auto lElapsed = [&]{ return std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-l0).count(); };
     long lnsRegions=0, lnsAccepted=0, lnsScreenPass=0, lnsExactRej=0, lnsProbeRej=0;
@@ -5082,8 +5087,60 @@ void Manager::oracleRebankRefine(){
                         g.tgt=tgt; sgs.push_back(std::move(g));
                     }
                 };
+                if(lnsMatch){
+                    // Phase D: enumerate anchored candidates, oracle-price each,
+                    // pick best disjoint set. Slot order = sorted pool indices
+                    // (matches screening suffix walk and bankFF flatten order).
+                    struct MCand { double val; int sz; int b0,b1,b2,b3; Cell* tgt; };
+                    std::vector<MCand> mc;
+                    auto prorata = [&](int bi){ FF* m=members[owner[bi]];
+                        return wcost(m->getCell())/m->getCell()->getBits(); };
+                    auto consider = [&](std::vector<int> idx, Cell* tgt){
+                        if(!tgt) return;
+                        std::sort(idx.begin(), idx.end());
+                        for(auto& c : mc)
+                            if(c.tgt==tgt && c.sz==(int)idx.size() && c.b0==idx[0] && c.b1==idx[1]
+                               && (c.sz<3 || c.b2==idx[2]) && (c.sz<4 || c.b3==idx[3])) return;
+                        double cx=0, cy=0;
+                        std::vector<FF*> gb; gb.reserve(idx.size());
+                        for(int bi : idx){ cx+=wish[bi].x; cy+=wish[bi].y; gb.push_back(pool[bi]); }
+                        Coor site(cx/idx.size(), cy/idx.size());
+                        double pa = wcost(tgt);
+                        for(int bi : idx) pa -= prorata(bi);
+                        double dt = evalGroupMoveDelta(gb, site, tgt);
+                        MCand c; c.val = alpha*dt + pa; c.sz=(int)idx.size(); c.tgt=tgt;
+                        c.b0=idx[0]; c.b1=idx[1]; c.b2=c.sz>2?idx[2]:-1; c.b3=c.sz>3?idx[3]:-1;
+                        mc.push_back(c);
+                    };
+                    for(int i=0;i<nb;i++){
+                        std::vector<std::pair<double,int>> nd;
+                        for(int j=0;j<nb;j++) if(j!=i)
+                            nd.push_back({std::abs(wish[j].x-wish[i].x)+std::abs(wish[j].y-wish[i].y), j});
+                        std::sort(nd.begin(), nd.end());
+                        if(b2L && nd.size()>=1) consider({i, nd[0].second}, b2L);
+                        if(b2L && nd.size()>=2) consider({i, nd[1].second}, b2L);
+                        if(best4 && nd.size()>=3) consider({i, nd[0].second, nd[1].second, nd[2].second}, best4);
+                        if(best4 && nd.size()>=4) consider({i, nd[0].second, nd[1].second, nd[3].second}, best4);
+                    }
+                    std::sort(mc.begin(), mc.end(), [](const MCand& a, const MCand& b){
+                        if(a.val!=b.val) return a.val<b.val;
+                        if(a.b0!=b.b0) return a.b0<b.b0;
+                        if(a.b1!=b.b1) return a.b1<b.b1;
+                        if(a.b2!=b.b2) return a.b2<b.b2;
+                        return a.sz<b.sz; });
+                    for(auto& c : mc){
+                        if(c.val >= 0) break;                       // negatives only
+                        int ids[4]={c.b0,c.b1,c.b2,c.b3}; bool ok=true;
+                        for(int k=0;k<c.sz;k++) if(grpOf[ids[k]]>=0){ ok=false; break; }
+                        if(!ok) continue;
+                        SGroup g; g.tgt=c.tgt;
+                        for(int k=0;k<c.sz;k++){ g.b.push_back(ids[k]); grpOf[ids[k]]=(int)sgs.size(); }
+                        sgs.push_back(std::move(g));
+                    }
+                } else {
                 formGroups(4, best4);
                 formGroups(2, b2L);
+                }
                 // structural test: skip regions whose plan reproduces the existing banking
                 bool structural=false;
                 for(auto& g : sgs){
