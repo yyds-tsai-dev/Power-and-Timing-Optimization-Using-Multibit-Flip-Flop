@@ -3388,7 +3388,23 @@ double Manager::getCostDiff(Coor newbankCoor, Cell* bankCellType, std::vector<FF
 
 // ==================== Timing-Driven Relocation ====================
 
+// ==================== STAGE_CONV (gated): provable-no-op stage skipping ====================
+// A stage whose previous invocation committed ZERO changes, re-entered while the
+// global mutation counter is unchanged since that invocation, is a provable no-op
+// (deterministic rescan of an identical committed state) — skip it. Harvests the
+// ALT_ROUNDS ladder adaptively per case and removes converged-stage spin.
+// Default off, byte-exact: off-path adds no allocations (function statics are
+// static storage; see memory server-b-byte-exact-pointer-hash-trap).
+static long g_sconvVer = 0;
+static bool sconvOn(){
+    static int v = -1;
+    if(v < 0){ const char* e = std::getenv("STAGE_CONV"); v = (e && std::atoi(e)!=0) ? 1 : 0; }
+    return v == 1;
+}
+
 void Manager::timingDrivenRelocation(){
+    static long scVer = -1, scWork = -1;
+    if(sconvOn() && scVer == g_sconvVer && scWork == 0){ std::cerr << "[SCONV] skip reloc\n"; return; }
     static const int maxCandidates = []{
         const char* e = std::getenv("RELOC_K");
         return e ? std::atoi(e) : 200;
@@ -3539,6 +3555,7 @@ void Manager::timingDrivenRelocation(){
     std::cerr << "[RELOC] tried=" << tried << " moved=" << moved
               << " finalTNS=" << std::fixed << baseTNS
               << " elapsed=" << elapsed() << "s\n";
+    if(sconvOn()){ scWork = (moved>0)?1:0; if(scWork) ++g_sconvVer; scVer = g_sconvVer; }
 }
 
 // ==================== Critical-Path FF-Swap Refinement (NTU thesis 3.3 step1) ====================
@@ -3558,6 +3575,8 @@ namespace {
     typedef bgi_cs::rtree<CSPointID, bgi_cs::quadratic<16>> CSRTree;
 }
 void Manager::criticalPathSwapRefine(){
+    static long scVer = -1, scWork = -1;
+    if(sconvOn() && scVer == g_sconvVer && scWork == 0){ std::cerr << "[SCONV] skip critSwap\n"; return; }
     int    K          = []{ const char* e=std::getenv("CRIT_SWAP_K");      return e?std::atoi(e):8;   }();
     int    maxRounds  = []{ const char* e=std::getenv("CRIT_SWAP_ROUNDS"); return e?std::atoi(e):4;   }();
     double timeBudget = []{ const char* e=std::getenv("CRIT_SWAP_TIME");   return e?std::atof(e):150.0;}();
@@ -3678,6 +3697,7 @@ void Manager::criticalPathSwapRefine(){
         if(roundSwaps == 0) break;
     }
     std::cerr << "[CRIT_SWAP] totalSwaps=" << totalSwaps << "\n";
+    if(sconvOn()){ scWork = (totalSwaps>0)?1:0; if(scWork) ++g_sconvVer; scVer = g_sconvVer; }
 }
 
 // ==================== Side-effect-free bit-swap ΔTNS (parallel dynasearch oracle) ====================
@@ -3974,6 +3994,8 @@ double Manager::evalGroupMoveDelta(const std::vector<FF*>& bits, const Coor& pla
 // the incremental engine. Attacks the merge-PAIRING limiter that position refine
 // cannot (the ~755K post-hoc ceiling). Requires INCR engine (always builds it).
 void Manager::bitRepairRefine(){
+    static long scVer = -1, scWork = -1;
+    if(sconvOn() && scVer == g_sconvVer && scWork == 0){ std::cerr << "[SCONV] skip bitRepair\n"; return; }
     int    K         = []{ const char* e=std::getenv("BIT_REPAIR_K");      return e?std::atoi(e):8;   }();
     int    maxRounds = []{ const char* e=std::getenv("BIT_REPAIR_ROUNDS"); return e?std::atoi(e):20;  }();
     double timeBudget= []{ const char* e=std::getenv("BIT_REPAIR_TIME");   return e?std::atof(e):400.0;}();
@@ -4530,6 +4552,7 @@ void Manager::bitRepairRefine(){
         std::cerr << "[CONV] done exit=" << convExit << " wall=" << std::fixed << elapsed() << "s\n";
     }
     std::cerr << "[BIT_REPAIR] totalSwaps=" << total << " finalTNS=" << std::fixed << baseAcc << "\n";
+    if(sconvOn()){ scWork = (total>0)?1:0; if(scWork) ++g_sconvVer; scVer = g_sconvVer; }
 }
 
 // ==================== Evaluator-Guided Refinement (EGR) ====================
@@ -4656,6 +4679,8 @@ static double rbBitHeadroom(Manager& mgr, FF* cf){
 // REBANK_HR_FLOOR (default 0 = off) rejects candidates whose bits' minimum
 // branch headroom is below the floor (four-rulings item 4 requirement).
 void Manager::oracleRebankRefine(){
+    static long scVer = -1, scWork = -1;
+    if(sconvOn() && scVer == g_sconvVer && scWork == 0){ std::cerr << "[SCONV] skip rebank\n"; return; }
     double timeBudget = []{ const char* e=std::getenv("REBANK_TIME");   return e?std::atof(e):120.0; }();
     int    K          = []{ const char* e=std::getenv("REBANK_K");      return e?std::atoi(e):8;     }();
     int    maxRounds  = []{ const char* e=std::getenv("REBANK_ROUNDS"); return e?std::atoi(e):10;    }();
@@ -4926,7 +4951,10 @@ void Manager::oracleRebankRefine(){
     // only on strict net improvement. Bit-splitting destroy (debankWithUndo
     // composition) is v1.5 — see the plan. Default off; byte-exact when off.
     const bool lnsKick = []{ const char* e=std::getenv("LNS_KICK"); return e && std::atoi(e)!=0; }();
-    if(!lnsKick) return;
+    if(!lnsKick){
+        if(sconvOn()){ scWork = (accTotal>0)?1:0; if(scWork) ++g_sconvVer; scVer = g_sconvVer; }
+        return;
+    }
     double lnsTime   = []{ const char* e=std::getenv("LNS_TIME");     return e?std::atof(e):120.0; }();
     int    regionK   = []{ const char* e=std::getenv("LNS_REGION_K"); return e?std::atoi(e):10;    }();
     int    lnsRounds = []{ const char* e=std::getenv("LNS_ROUNDS");   return e?std::atoi(e):4;     }();
@@ -5452,6 +5480,7 @@ void Manager::oracleRebankRefine(){
               << (lnsProbe ? " probeRej=" : "")   << (lnsProbe ? std::to_string(lnsProbeRej) : "")
               << (lnsSplit ? " exactRej=" : "")   << (lnsSplit ? std::to_string(lnsExactRej) : "")
               << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << lElapsed() << "s\n";
+    if(sconvOn()){ scWork = (accTotal+lnsAccepted>0)?1:0; if(scWork) ++g_sconvVer; scVer = g_sconvVer; }
 }
 
 // Oracle-maintained official-cost snapshot (for EVAL_CHECKPOINT): alpha*incrTNS_
@@ -5473,6 +5502,8 @@ double Manager::oracleCostSnapshot(){
 // debank/relegalize/revert machinery with monotone full-objective accept.
 // Gate: ORACLE_EJECT=1 (requires INCR_RELOC=1). Default off, byte-exact.
 void Manager::oracleEjectRefine(){
+    static long scVer = -1, scWork = -1;
+    if(sconvOn() && scVer == g_sconvVer && scWork == 0){ std::cerr << "[SCONV] skip eject\n"; return; }
     double timeBudget = []{ const char* e=std::getenv("EJECT_TIME");    return e?std::atof(e):120.0; }();
     double margin     = []{ const char* e=std::getenv("EJECT_MARGIN");  return e?std::atof(e):0.0;   }();
     long   patience   = []{ const char* e=std::getenv("EJECT_PATIENCE");return e?std::atol(e):300L;  }();
@@ -5646,6 +5677,7 @@ void Manager::oracleEjectRefine(){
     }
     std::cerr << "[EJECT] cands=" << M << " tried=" << tried << " accepted=" << accepted
               << " TNS=" << std::fixed << incrTNS_ << " elapsed=" << elapsed() << "s\n";
+    if(sconvOn()){ scWork = (accepted>0)?1:0; if(scWork) ++g_sconvVer; scVer = g_sconvVer; }
 }
 
 // ==================== Bin-Density Repair Refinement ====================
