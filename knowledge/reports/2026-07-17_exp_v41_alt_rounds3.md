@@ -44,5 +44,13 @@ v4.1 tc1 = 734,281,585,距不可重現的 v2-era 數字(734,266,279,見
 `LNS_LENS=pa` v1(driver-wish 質心分組):四案 0 accepts
 (lens-off byte-exact PASS、無回歸)。診斷:健康 bits 被拉離現位,
 α·dTNS 吃掉 dPA 節省。**v2 迭代已落庫(ccbf57cd):pa 鏡頭 wish 改現位
-(最小位移收割)+ PROBE real-site 定價**,re-smoke 執行中,結果補記於此:
-【PA2 待填】
+(最小位移收割)+ PROBE real-site 定價**。re-smoke 結果(PA2):
+**仍 0 accepts,但失敗形狀給出機理定讞**——
+- hc01:screenPass=0(v4.1 基線已被 R1+LNS 收乾,零位移也無 planPA 利潤);
+- tc2/hc02/hc03:stage-1 過 ~30 區(零位移估計 planPA<0,肉存在!)
+  但 **probe 真實落點定價 100% 拒**——四個散落 1b rect 釋放後不構成
+  連續空間,FindPlace 把 4b 推遠,α·dTNS 吃光節省。
+**結案:2g 收割空間存在,但 LNS 搬家合併拿不到;需要 DP 級推擠壓實
+(Phase D 領域)。C2 兩輪皆潔淨(lens-off byte-exact PASS),不再迭代。**
+副觀察:pa2 零 accepts 仍有漂移(hc02 +40k/31 次 probe 循環)——PROBE
+的 row-state 非中立在規模下不可忽視,再添一條不進凍結配方的理由。
