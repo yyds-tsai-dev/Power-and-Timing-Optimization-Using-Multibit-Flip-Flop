@@ -225,3 +225,12 @@
   | hc04 | 726,154,906 | 726,015,652 | −139,254 |
 - **Why it works**: EJECT is rebanking's inverse — splits MBFFs whose merges are mispriced (4b→4×1b, 4b→2×2b). The general remap oracle (`evalRemapDelta`, per-bit hypothetical D/Q/Qpd) screens splits with pieces at timing-ideal sites in parallel; the exact phase debanks, places via FindPlace, prices α·ΔTNS + lib ΔP/ΔA + real bin Δ, accepts monotonically; a universal revert (re-bank the bits' current physicals at the old site) is safe from any mid-trial state. Biggest wins land exactly on the cases whose other operators had converged (tc1 −447K) — a genuinely new move class, not more budget.
 - **Production recipe**: unified config + `ORACLE_EJECT=1 EJECT_TIME=180`. Paper (ASP-DAC) numbers stay frozen at 0.953 by decision; EJECT belongs to thesis + TCAD extension.
+
+## 2026-07-14~18:v4 → v4.2(R1+LNS+AR 階梯;B 側)
+- v4 = v3 + REBANK_MODES=15 + LNS_KICK/SPLIT K=4:0.9437→0.9428,七案勝 v3
+- v4.1 = +ALT_ROUNDS=3:0.9424;v4.2 = +ALT_ROUNDS=8 STAGE_CONV=1:**0.9422**
+- per-case(v4.2):tc1 734,252,912 / tc2 702,880 / tc3 725,793,476 /
+  hc01 29,933,156 / hc02 9,615,767 / hc03 55,769,897 / hc04 725,923,744
+- **vs NTU 官方 7/7 全勝(composite 0.9408)**;vs top-3 0.9422;
+  儀式 rep2 7/7 逐位(v4、v4.1、v4.2 各自完成)
+- 主表 `reports/2026-07-22_ch7_master_table.md`;凍結 `2026-07-18_v42_freeze.md`
