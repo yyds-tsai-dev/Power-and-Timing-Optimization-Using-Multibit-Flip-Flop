@@ -1,4 +1,11 @@
-# v3 加冕包 — A 側執行套件(B 備,2026-07-13)
+# v3→v4.2 加冕包 — A 側執行套件(B 備;2026-07-22 升級至 v4.2)
+
+> **2026-07-22 更新**:腳本 env 與參考分數已升至 **v4.2**(v3 env +
+> `REBANK_MODES=15 LNS_KICK=1 LNS_SPLIT=1 LNS_REGION_K=4 LNS_TIME=120
+> ALT_ROUNDS=8 STAGE_CONV=1`)。B 側 v4.2 驗證:七案 gate 全勝 + rep2
+> 7/7 逐位(`reports/2026-07-18_v42_freeze.md`)。一發跑完同時完成
+> v4.2 跨機對帳;若要對 v3 版本鏈逐級對帳,自行改 env 重跑即可
+> (v3 參考分數見 git 歷史版本的本檔)。
 
 **B 側已完賽**:rep1 + rep2 **七案全部逐位相同**(比「3× 內部穩定」更強,
 故 rep3 依裁定免跑;證據 `reports/2026-07-13_exp_v3_ritual_b_side.md`)。
